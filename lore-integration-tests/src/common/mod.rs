@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub(crate) mod oidc;
+
 #[cfg(all(test, feature = "integration_tests"))]
 pub(crate) mod aws_common {
     use std::error::Error;

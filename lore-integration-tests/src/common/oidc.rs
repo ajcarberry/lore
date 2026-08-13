@@ -380,6 +380,61 @@ pub(crate) mod oidc_common {
             Ok(serde_json::from_value(tokens)?)
         }
 
+        /// Play the browser for one authorization-code flow: follow the `authorization_url`
+        /// a client handed to `open::that`, and return the URL the provider would then have
+        /// redirected to.
+        ///
+        /// Everything the exchange needs — client id, scope, redirect URI, `state`,
+        /// `nonce`, and the PKCE challenge — is read out of the URL, because that is all a
+        /// browser is given. The returned target carries the `code` and echoes the `state`,
+        /// which is what a client's loopback listener receives.
+        pub async fn follow_authorization_url(
+            &self,
+            user: &TestUser,
+            authorization_url: &str,
+        ) -> Result<String, Box<dyn Error + 'static>> {
+            let url = reqwest::Url::parse(authorization_url)?;
+            let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            let parameter = |name: &str| -> Result<String, Box<dyn Error + 'static>> {
+                query.get(name).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("Authorization URL carries no {name}: {authorization_url}")
+                        .into()
+                })
+            };
+
+            let redirect_uri = parameter("redirect_uri")?;
+            let state = parameter("state")?;
+            let session_cookie = self.login(user).await?;
+
+            let authorize_body = json!({
+                "clientID": parameter("client_id")?,
+                "scope": parameter("scope")?,
+                "callbackURL": &redirect_uri,
+                "nonce": parameter("nonce")?,
+                "codeChallenge": parameter("code_challenge")?,
+                "codeChallengeMethod": parameter("code_challenge_method")?,
+            });
+            let response = self
+                .client
+                .post(self.url("/api/oidc/authorize"))
+                .header(reqwest::header::COOKIE, &session_cookie)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(serde_json::to_vec(&authorize_body)?)
+                .send()
+                .await?;
+            let authorization = Self::json_or_error("/api/oidc/authorize", response).await?;
+            let code = authorization["code"].as_str().ok_or_else(|| {
+                anyhow::anyhow!("Authorize returned no code, got: {authorization}")
+            })?;
+
+            let mut redirect = reqwest::Url::parse(&redirect_uri)?;
+            redirect
+                .query_pairs_mut()
+                .append_pair("code", code)
+                .append_pair("state", &state);
+            Ok(redirect.into())
+        }
+
         /// Begin an RFC 8628 device authorization, the way a headless client does.
         ///
         /// This is the first leg of `lore login --no-browser`: no session is involved

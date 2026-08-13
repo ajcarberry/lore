@@ -12,6 +12,7 @@ use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
 use lore_transport::Authentication;
 use lore_transport::AuthenticationToken;
+use lore_transport::LoginFlow;
 use lore_transport::auth::authentication;
 use tokio::time::sleep;
 use url::Url;
@@ -278,10 +279,18 @@ pub async fn interactive(
     let client_state = Uuid::new_v4().to_string();
     lore_debug!("ClientState {}", client_state);
 
-    // 2. Start auth session via the Authentication implementation
+    // 2. Start auth session via the Authentication implementation. `--no-browser` is what
+    //    the implementation needs to select a ceremony that can complete without one: the
+    //    OIDC implementation runs the device authorization grant instead of a loopback
+    //    redirect. An implementation with one ceremony ignores it.
+    let flow = if no_browser {
+        LoginFlow::NoBrowser
+    } else {
+        LoginFlow::Browser
+    };
     lore_debug!("Authenticating using {auth_url}");
     let session = auth_impl
-        .start_auth_session(&auth_url, &client_state, &correlation_id)
+        .start_auth_session(&auth_url, &client_state, flow, &correlation_id)
         .await
         .forward::<InteractiveLoginError>("starting auth session")?;
 
@@ -311,16 +320,15 @@ pub async fn interactive(
     .await?;
 
     // 4. Verify the given remote can be trusted with this JWT.
-    let decoded_token = insecure_decode_token(&authn.token).internal("decoding token")?;
-    verify_jwt_usage_for_remote(&decoded_token.claims, &domain_from_url_or_url(&remote_url))
-        .forward::<InteractiveLoginError>("verifying JWT usage for remote")?;
+    let acceptable_root_domains =
+        acceptable_root_domains(&authn, &domain_from_url_or_url(&remote_url))?;
 
     lore_debug!("Auth successful");
     token_store::store_user_token(
         auth_url.as_str(),
         authn.user_id.as_str(),
         authn.token.as_str(),
-        decoded_token.claims.acceptable_root_domains(),
+        acceptable_root_domains,
     )
     .await
     .forward::<InteractiveLoginError>("storing user token")?;
@@ -343,6 +351,40 @@ pub async fn interactive(
     };
 
     Ok(user_info)
+}
+
+/// The domains a freshly obtained token may be sent to, which is what the credential store
+/// records alongside it and what [`verify_jwt_usage_for_remote`] later enforces.
+///
+/// [`AuthenticationToken::acceptable_root_domains`] is authoritative when the
+/// implementation filled it in, because only the implementation knows how its own tokens'
+/// audience semantics work. An OpenID Connect provider issues `aud` as a client id and
+/// `iss` as a URL, neither of which is a domain any remote could match, so deriving the set
+/// from the JWT would make every OIDC login refuse its own token. What the implementation
+/// cannot know is the remote the login was performed against; this layer adds it, so the
+/// rule for such a token is: usable at the remote you logged in to, and at its issuer,
+/// nowhere else.
+///
+/// `ucs-auth` returns an empty vector and keeps the JWT-derived behavior exactly: its auth
+/// service issues `aud` as a list of root domains, so the token itself says where it may go.
+fn acceptable_root_domains(
+    authn: &AuthenticationToken,
+    remote_domain: &str,
+) -> Result<Vec<String>, InteractiveLoginError> {
+    if authn.acceptable_root_domains.is_empty() {
+        let decoded_token = insecure_decode_token(&authn.token).internal("decoding token")?;
+        verify_jwt_usage_for_remote(&decoded_token.claims, remote_domain)
+            .forward::<InteractiveLoginError>("verifying JWT usage for remote")?;
+        return Ok(decoded_token.claims.acceptable_root_domains());
+    }
+
+    // The remote is added rather than checked for, so the guard holds for it by
+    // construction instead of by a check that could disagree with what gets stored.
+    let mut domains = authn.acceptable_root_domains.clone();
+    if !domains.iter().any(|domain| domain == remote_domain) {
+        domains.push(remote_domain.to_string());
+    }
+    Ok(domains)
 }
 
 async fn poll_interactive_session(

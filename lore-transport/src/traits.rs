@@ -331,6 +331,25 @@ pub trait Environment: Send + Sync {
     async fn get(&self) -> Result<EnvironmentConfig, ProtocolError>;
 }
 
+/// What the host starting an interactive login can do, which decides the
+/// ceremony an `Authentication` implementation runs.
+///
+/// This is the caller's capability, not a preference: it comes from
+/// `lore login --no-browser`, whose whole meaning is "there is no browser on
+/// this host". An implementation with one ceremony ignores it -- `ucs-auth`
+/// does -- and an implementation with two selects between them, as the OIDC one
+/// selects the authorization code flow or the device authorization grant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoginFlow {
+    /// A browser can be opened on this host, so a redirect back to it can
+    /// complete the login.
+    #[default]
+    Browser,
+    /// No browser on this host: the login has to be completed on another
+    /// device.
+    NoBrowser,
+}
+
 /// Client-side authentication and authorization protocol trait.
 ///
 /// Covers the full auth lifecycle: obtaining authentication tokens (via
@@ -344,6 +363,7 @@ pub trait Authentication: Send + Sync {
         &self,
         auth_url: &str,
         client_state: &str,
+        flow: LoginFlow,
         correlation_id: &str,
     ) -> Result<AuthSession, ProtocolError>;
 

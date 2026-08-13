@@ -14,6 +14,7 @@ use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
 use crate::error::ProtocolError;
 use crate::grpc::CorrelationInterceptor;
 use crate::traits::Authentication;
+use crate::traits::LoginFlow;
 use crate::types::*;
 
 /// Strips the custom scheme from an auth URL and returns an HTTPS URL
@@ -83,10 +84,14 @@ pub struct UcsAuthentication;
 
 #[async_trait]
 impl Authentication for UcsAuthentication {
+    /// UCS Auth has one ceremony -- the auth service hands back a login URL and
+    /// the caller either opens it or prints it -- so `flow` selects nothing here
+    /// and is ignored.
     async fn start_auth_session(
         &self,
         auth_url: &str,
         client_state: &str,
+        _flow: LoginFlow,
         _correlation_id: &str,
     ) -> Result<AuthSession, ProtocolError> {
         let mut client = connect_client(auth_url).await?;

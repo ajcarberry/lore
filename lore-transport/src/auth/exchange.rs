@@ -27,6 +27,7 @@ use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 
 use crate::auth::authentication;
+use crate::types::AuthorizationToken;
 
 #[error_set]
 pub enum ExchangeError {
@@ -60,6 +61,45 @@ pub fn is_expired(expires: u64) -> bool {
         .unwrap_or_default()
         .as_millis();
     current_time >= expires
+}
+
+/// The domains an authz token obtained via exchange may be sent to, recorded alongside it
+/// in the token store and later enforced by [`verify_jwt_usage_for_remote`].
+///
+/// Always re-deriving this from the JWT's own claims breaks OpenID Connect: an OIDC ID
+/// token's `aud` is a client id and `iss` an issuer URL, neither of which is the
+/// repository's domain, so the JWT-derived set can never include it and every exchange
+/// would be rejected even though login already stored the correct domains for this
+/// backend. `AuthorizationToken::acceptable_root_domains` is authoritative when the
+/// `Authentication` implementation filled it in, for the same reason it already is at
+/// login (`lore-revision/src/auth/login.rs`): only the implementation knows its own
+/// tokens' audience semantics. `ucs-auth` returns empty and keeps the JWT-derived
+/// behavior exactly.
+fn acceptable_root_domains(
+    authz: &AuthorizationToken,
+    recipient_domain: &str,
+) -> Result<Vec<String>, ExchangeError> {
+    if authz.acceptable_root_domains.is_empty() {
+        let decoded_token = insecure_decode_token(&authz.token)
+            .internal("Could not decode token")
+            .map_err(ExchangeError::from)?;
+        verify_jwt_usage_for_remote(&decoded_token.claims, recipient_domain).map_err(|err| {
+            lore_warn!("{err}");
+            ExchangeError::internal_with_context(
+                err,
+                "The token is not suitable for what you intend to do",
+            )
+        })?;
+        return Ok(decoded_token.claims.acceptable_root_domains());
+    }
+
+    // The remote is added rather than checked for, so the guard holds for it by
+    // construction instead of by a check that could disagree with what gets stored.
+    let mut domains = authz.acceptable_root_domains.clone();
+    if !domains.iter().any(|domain| domain == recipient_domain) {
+        domains.push(recipient_domain.to_string());
+    }
+    Ok(domains)
 }
 
 /// Exchanges an authentication token for a repository-scoped authorization
@@ -182,20 +222,11 @@ pub async fn exchange(
             }
         })?;
 
-    let token = authz.token;
-    if token.is_empty() {
+    if authz.token.is_empty() {
         return Err(ExchangeError::internal("Empty token response"));
     }
-    let decoded_token = insecure_decode_token(&token)
-        .internal("Could not decode token")
-        .map_err(ExchangeError::from)?;
-    verify_jwt_usage_for_remote(&decoded_token.claims, &recipient_domain).map_err(|err| {
-        lore_warn!("{err}");
-        ExchangeError::internal_with_context(
-            err,
-            "The token is not suitable for what you intend to do",
-        )
-    })?;
+    let domains = acceptable_root_domains(&authz, &recipient_domain)?;
+    let token = authz.token;
 
     lore_trace!(
         "Authorization with user token successful in {} ms",
@@ -206,16 +237,11 @@ pub async fn exchange(
 
     cache.insert(cache_key, token.clone());
 
-    let _ = token_store::store_user_token(
-        &token_store_key,
-        identity,
-        &token,
-        decoded_token.claims.acceptable_root_domains(),
-    )
-    .await
-    .map_err(|err| {
-        lore_warn!("Failed to store token: {err}");
-    });
+    let _ = token_store::store_user_token(&token_store_key, identity, &token, domains)
+        .await
+        .map_err(|err| {
+            lore_warn!("Failed to store token: {err}");
+        });
 
     Ok(token)
 }
@@ -340,20 +366,11 @@ pub async fn exchange_custom_resource(
             }
         })?;
 
-    let token = authz.token;
-    if token.is_empty() {
+    if authz.token.is_empty() {
         return Err(ExchangeError::internal("Empty token response"));
     }
-    let decoded_token = insecure_decode_token(&token)
-        .internal("Could not decode token")
-        .map_err(ExchangeError::from)?;
-    verify_jwt_usage_for_remote(&decoded_token.claims, &recipient_domain).map_err(|err| {
-        lore_warn!("{err}");
-        ExchangeError::internal_with_context(
-            err,
-            "The token is not suitable for what you intend to do",
-        )
-    })?;
+    let domains = acceptable_root_domains(&authz, &recipient_domain)?;
+    let token = authz.token;
 
     lore_trace!(
         "Authorization with user token successful in {} ms",
@@ -364,16 +381,11 @@ pub async fn exchange_custom_resource(
 
     cache.insert(cache_key, token.clone());
 
-    let _ = token_store::store_user_token(
-        &token_store_key,
-        identity,
-        &token,
-        decoded_token.claims.acceptable_root_domains(),
-    )
-    .await
-    .map_err(|err| {
-        lore_warn!("Failed to store token: {err}");
-    });
+    let _ = token_store::store_user_token(&token_store_key, identity, &token, domains)
+        .await
+        .map_err(|err| {
+            lore_warn!("Failed to store token: {err}");
+        });
 
     Ok(token)
 }
@@ -616,4 +628,92 @@ async fn auth_exchange_custom_resource_for_identity(
         authorization_token,
         identity.to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A JWT with the given claims and a signature nothing checks -- the shape the client
+    /// reads, since the server owns verification. Mirrors `oidc.rs`'s test helper of the
+    /// same name.
+    fn unsigned_jwt(claims: &str) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+            URL_SAFE_NO_PAD.encode(claims),
+            URL_SAFE_NO_PAD.encode("not-a-signature"),
+        )
+    }
+
+    fn authz_token(acceptable_root_domains: Vec<String>, jwt: &str) -> AuthorizationToken {
+        AuthorizationToken {
+            token: jwt.to_string(),
+            expires_ms: 0,
+            acceptable_root_domains,
+        }
+    }
+
+    /// A ucs-auth-shaped response supplies no domains of its own (`acceptable_root_domains`
+    /// empty), so the guard must fall back to the JWT-derived set exactly as it did before
+    /// OIDC existed.
+    #[test]
+    fn ucs_auth_shaped_token_keeps_jwt_derived_domains() {
+        let jwt = unsigned_jwt(
+            r#"{"iss":"auth.example.com","sub":"user-1","exp":9999999999,"aud":["repo.example.com"]}"#,
+        );
+        let authz = authz_token(vec![], &jwt);
+
+        let domains = acceptable_root_domains(&authz, "repo.example.com").unwrap();
+
+        assert_eq!(
+            domains,
+            vec![
+                "auth.example.com".to_string(),
+                "repo.example.com".to_string(),
+            ]
+        );
+    }
+
+    /// The gap this fix closes: an OIDC ID token's own claims (`aud` = client id, `iss` =
+    /// issuer URL) can never name the repository's domain, so the JWT-derived fallback
+    /// rejects a login-time-authorized token on every repository operation. A non-empty
+    /// `AuthorizationToken::acceptable_root_domains` from the backend must be authoritative
+    /// instead, exactly as it already is for login (`lore-revision/src/auth/login.rs`).
+    #[test]
+    fn oidc_shaped_token_survives_the_exchange_path() {
+        // `aud` is a client id and `iss` a URL: neither names "repo.example.com", so the
+        // JWT-derived fallback alone would reject this token outright.
+        let jwt = unsigned_jwt(
+            r#"{"iss":"https://id.example.com","sub":"user-1","exp":9999999999,"aud":["lore-cli"]}"#,
+        );
+        let authz = authz_token(vec!["id.example.com".to_string()], &jwt);
+
+        let domains = acceptable_root_domains(&authz, "repo.example.com").unwrap();
+
+        assert!(domains.contains(&"id.example.com".to_string()));
+        assert!(domains.contains(&"repo.example.com".to_string()));
+    }
+
+    /// The remote is added rather than checked for, so an authoritative set that already
+    /// names the remote is not duplicated.
+    #[test]
+    fn authoritative_domains_already_containing_the_remote_are_not_duplicated() {
+        let jwt = unsigned_jwt(
+            r#"{"iss":"https://id.example.com","sub":"user-1","exp":9999999999,"aud":["lore-cli"]}"#,
+        );
+        let authz = authz_token(
+            vec!["id.example.com".to_string(), "repo.example.com".to_string()],
+            &jwt,
+        );
+
+        let domains = acceptable_root_domains(&authz, "repo.example.com").unwrap();
+
+        assert_eq!(
+            domains,
+            vec!["id.example.com".to_string(), "repo.example.com".to_string(),]
+        );
+    }
 }

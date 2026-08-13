@@ -1,206 +1,115 @@
 # Secure a Lore server with OpenID Connect
 
-Reach for this guide once you have a Lore server running and want to stop it accepting
-anonymous requests. It assumes a working [local deployment](deploy-local-lore-server.md)
-and access to an OpenID Connect provider — any conformant one works; this guide uses
-[PocketID](https://github.com/pocket-id/pocket-id) as the worked example because it's
-self-hosted, PKCE-only, and quick to stand up alongside Lore.
+A Lore server with no authentication configured serves anyone who can reach the port: every identity is anonymous, and every repository is readable and writable. Pointing the server at an OpenID Connect provider replaces that with the directory you already run.
+
+In this guide, you'll register Lore as a client with your provider, turn on authentication in the server config, and log in with `lore login`, so that only your provider's users can reach your repositories. Any conformant provider works; the examples use [PocketID](https://github.com/pocket-id/pocket-id), which is self-hosted and quick to stand up alongside Lore.
 
 ## Prerequisites
 
-- A running `loreserver` you can restart and reconfigure. See
-  [Deploy a local Lore Server](deploy-local-lore-server.md).
+- A running `loreserver` you can restart and reconfigure. See [Deploy a local Lore Server](deploy-local-lore-server.md).
 - The `lore` CLI on your PATH. See [Install the Lore CLI](install-lore-cli.md).
-- An OpenID Connect provider reachable from both the server and your workstation, with
-  admin access to register a client.
+- An OpenID Connect provider reachable from both the server and your workstation, with admin access to register a client.
 
 ## Steps
 
-1. **Register a public client for Lore with your provider.**
+1. **Register a public client for Lore.**
 
-   Lore is a native CLI, not a web app, so it registers as a public client using PKCE —
-   no client secret to store or leak. In PocketID's admin UI, create an OIDC client with:
+    Lore is a native CLI, not a web app, so it registers as a public client using PKCE — there's no client secret to store or leak. In PocketID's admin UI, create an OIDC client with:
 
-   - **Public client** enabled (no client secret).
-   - **PKCE** enabled.
-   - A callback address of `http://127.0.0.1:*/callback` (PocketID accepts a wildcard
-     port; other providers may need you to register a fixed port or a range) — this is
-     where the browser login flow's loopback listener receives the redirect.
+    - **Public client** enabled, with no client secret.
+    - **PKCE** enabled.
+    - A callback address of `http://127.0.0.1:*/callback`, where the browser login flow's loopback listener receives the redirect. PocketID accepts a wildcard port; other providers may need a fixed port or a range.
 
-   Note the client id and your provider's issuer address; you'll need both in the next
-   step.
+    Set the access-token lifetime in minutes rather than hours. Lore holds no revocation list — a verified token works until it expires — so a short lifetime bounds how long a revoked user keeps access. Clients refresh without prompting, so it costs users nothing.
 
-2. **Add the OIDC block to the server config.**
+    Note the client id and your provider's issuer address for the next step.
 
-   Add a `[server.auth.oidc]` block to your server's `local.toml`:
+2. **Turn on authentication in the server config.**
 
-   ```toml
-   [server.auth.oidc]
-   issuer = "https://id.example.com"
-   client_id = "lore"
-   authorize_all_repositories = true
-   ```
+    Add a `[server.auth.oidc]` block to the server's `local.toml`:
 
-   `issuer` must match the value your provider publishes in its own tokens' `iss` claim,
-   byte for byte — the server checks this at startup against the provider's discovery
-   document and refuses to start on a mismatch.
+    ```toml
+    [server.auth.oidc]
+    issuer = "https://id.example.com"
+    client_id = "lore"
+    authorize_all_repositories = true
+    ```
 
-   > [!IMPORTANT]
-   > `authorize_all_repositories = true` isn't a formality — it's the whole
-   > authorization model this mode offers. Any identity your provider admits can read
-   > and write **every** repository on this server: there is no per-repository
-   > distinction, no read-only identity, and no administrative separation. If different
-   > repositories need different audiences, run one server per trust boundary, or wait
-   > for per-repository authorization from provider claims (a tracked follow-up, not yet
-   > implemented). Because the consequence is this broad, the setting has no default —
-   > omitting it, or setting it to `false`, fails startup validation rather than granting
-   > or refusing everything without saying so.
+    `issuer` must match the value your provider publishes in its own tokens' `iss` claim, byte for byte. The server checks it against the provider's discovery document at startup and refuses to start on a mismatch.
 
-   See the [server config reference](../reference/lore-server-config.md#authentication)
-   for the full field list.
+    > [!IMPORTANT]
+    > `authorize_all_repositories = true` is the whole authorization model this mode offers: any identity your provider admits can read and write **every** repository on the server — no per-repository distinction, no read-only identity, no administrative separation. Run one server per trust boundary when repositories need different audiences. The setting has no default, so omitting it or setting it to `false` fails startup rather than deciding for you.
 
-3. **Restart the server and confirm it now requires a token.**
+3. **Bind tokens to this deployment.**
 
-   ```bash
-   ~/.local/bin/loreserver --config /opt/loreserver/config
-   ```
+    By default the token's `aud` claim names the client id, which identifies the application rather than the server: every deployment behind the same issuer and client id accepts every other one's tokens, and they share one credential-store bucket, so logging in to one evicts the other's token. Setting `resource` to this deployment's own address ends both. The server then requires an [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) access token whose `aud` names that value, and the client asks the provider for one using [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource indicators:
 
-   From another terminal, any repository operation against the server now fails until
-   you log in:
+    ```toml
+    [server.auth.oidc]
+    issuer = "https://id.example.com"
+    client_id = "lore"
+    authorize_all_repositories = true
+    resource = "https://lore-prod.example.com"
+    ```
 
-   ```bash
-   lore --repository ./my-repo status --remote
-   ```
+    Use it wherever your provider supports it, and treat it as required where a deployment shares an issuer with another Lore server. The value must be an absolute URI with no fragment — a bare hostname such as `lore-prod.example.com` is rejected at startup — and it's an identifier, so the server never dials it.
 
-   This should fail with an authentication error. If it succeeds, the server isn't
-   picking up the config change — check the config path and restart again.
+    > [!IMPORTANT]
+    > Your provider must implement both RFCs, and one that doesn't won't tell you so — it accepts the request and mints an ordinary token whose `aud` names the client id. Lore checks the token it gets back and fails the login with a message naming what the provider didn't do. **PocketID 2.6.2 ignores the parameter** (verified 2026-08-13): leave `resource` unset there, and register a distinct client id per deployment instead to restore the audience distinction. Keycloak, Entra ID, and Auth0 support resource indicators or an equivalent audience parameter; test a login outside production first.
 
-4. **Log in.**
+    The server advertises `resource` to clients on its own. If you write `environment.endpoint.auth_url` by hand, carry the parameter yourself, or clients won't ask for a resource-bound token and every request is refused. See the [server config reference](../reference/lore-server-config.md#authentication) for the encoded form.
 
-   On a machine with a browser, `lore login` opens your provider's login page:
+4. **Restart the server and confirm it now requires a token.**
 
-   ```bash
-   lore login lore://your-server.example.com:41337/
-   ```
+    ```bash
+    ~/.local/bin/loreserver --config /opt/loreserver/config
+    ```
 
-   On a headless host, print a code to approve from any other device instead:
+    From another terminal, any operation against the server should now fail with an authentication error:
 
-   ```bash
-   lore login lore://your-server.example.com:41337/ --no-browser
-   ```
+    ```bash
+    lore repository list lore://your-server.example.com:41337
+    ```
 
-   > [!WARNING]
-   > The device flow's weak point is the human, not the protocol: its whole premise —
-   > approve on one device something started on another — is also what a phishing
-   > message needs. Only approve a code you retrieved yourself from a `lore login
-   > --no-browser` you ran yourself, and check that the code Lore prints matches what
-   > your provider's approval page shows before confirming.
+    If it succeeds instead, the server isn't picking up the config change — check the config path and restart again.
 
-   Either way, Lore stores the resulting token in the encrypted credential store and
-   refreshes it as it expires without prompting — day-to-day commands don't ask you to
-   log in again until the provider revokes the session.
+5. **Log in.**
 
-5. **Confirm who you're logged in as.**
+    On a machine with a browser, `lore login` opens your provider's login page:
 
-   ```bash
-   lore auth info
-   ```
+    ```bash
+    lore login lore://your-server.example.com:41337/
+    ```
 
-   Prints the identity your provider's token carries. `logout` and `clear` remove
-   stored tokens the same way they do for any other authentication scheme:
+    On a headless host, print a code to approve from any other device instead:
 
-   ```bash
-   lore auth logout
-   ```
+    ```bash
+    lore login lore://your-server.example.com:41337/ --no-browser
+    ```
+
+    > [!WARNING]
+    > The device flow's weak point is the human, not the protocol: approving on one device something started on another is also what a phishing message needs. Only approve a code you retrieved yourself from a `lore login --no-browser` you ran yourself, and check that it matches the code on your provider's approval page.
+
+    Either way, Lore stores the token in the encrypted credential store and refreshes it as it expires, so day-to-day commands don't ask you to log in again until the provider revokes the session.
+
+6. **Confirm who you're logged in as.**
+
+    ```bash
+    lore auth info
+    ```
+
+    This prints the identity your provider's token carries. `lore auth logout` and `lore auth clear` remove stored tokens the same way they do for any other authentication scheme.
 
 ## Result
 
-Every repository operation on the server — gRPC, HTTP, and QUIC alike — now requires a
-valid, unexpired token from your configured issuer. The `/health_check` endpoint stays
-open, and any client that hasn't logged in gets a clean authentication failure instead
-of a response.
+Every repository operation on the server — gRPC, HTTP, and QUIC alike — now requires a valid, unexpired token from your configured issuer. The `/health_check` endpoint stays open, and a client that hasn't logged in gets a clean authentication failure.
 
-## Bind tokens to this deployment (recommended)
-
-By default the server pins the token's `aud` claim to the **client id**. That identifies
-the application, not the server — so every Lore deployment registered behind the same
-issuer and client id accepts every other one's tokens. Two consequences follow: a token
-harvested from users of one deployment opens the others, and a client's credential store
-keys on `(auth_url, identity)`, so deployments sharing an issuer share a bucket and
-logging in to one evicts the other's token.
-
-Setting `resource` fixes both. The server then requires an
-[RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) JWT access token whose `aud` names
-**this deployment**, and the client asks the provider for one using
-[RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource indicators:
-
-```toml
-[server.auth.oidc]
-issuer = "https://id.example.com"
-client_id = "lore"
-authorize_all_repositories = true
-resource = "https://lore-prod.example.com"
-```
-
-**Use it whenever your provider supports it**, and treat it as required for any
-deployment that shares an issuer with another Lore server. The value must be an absolute
-URI with no fragment (RFC 8707 §2) — a bare hostname such as `lore-prod.example.com` is
-rejected at startup. Use the deployment's own address; it's an identifier, so the server
-never dials it.
-
-The server advertises the value automatically, so clients need no configuration. If you
-set `environment.endpoint.auth_url` by hand, carry the parameter yourself, or clients
-won't ask for a resource-bound token and every request will be refused:
-
-```toml
-[environment.endpoint]
-auth_url = "oidc+https://id.example.com?client_id=lore&resource=https%3A%2F%2Flore-prod.example.com"
-```
-
-> [!IMPORTANT]
-> **Your provider must implement RFC 8707 and RFC 9068**, and a provider that doesn't
-> won't tell you so. RFC 8707 obliges nobody to announce that they ignore the parameter,
-> so a non-supporting provider accepts the request, returns `200`, and mints an ordinary
-> client-audienced token. Lore checks the token it gets back for exactly this reason and
-> fails the login with a message naming what the provider didn't do — rather than letting
-> you log in successfully and then have every operation refused.
->
-> **PocketID 2.6.2 doesn't support RFC 8707** (verified 2026-08-13): it silently ignores
-> the parameter. Leave `resource` unset there. Keycloak, Entra ID, and Auth0 support
-> resource indicators or an equivalent audience parameter; check your provider's
-> documentation before turning this on, and test a login in a non-production deployment
-> first.
-
-What this does and doesn't buy you: it ends cross-deployment token interchange and
-untargeted replay, because a token minted for one deployment names it and no other
-server accepts it. It does **not** stop a targeted attack — someone who stands up a
-server advertising *your* resource identifier and persuades a user to log in to it still
-receives a token your server would accept. What bounds that one is that the user chose
-the remote.
-
-## Keep token lifetimes short
-
-Lore holds no revocation list and no session state: a verified token is accepted until
-it expires. Revoking a user at the provider therefore takes effect when their current
-token runs out, not immediately.
-
-Configure short access-token lifetimes at your provider — minutes rather than hours —
-and let the refresh grant keep sessions alive. Clients refresh silently, so a short
-lifetime costs users nothing and bounds how long a revoked identity keeps working. This
-matters most in resource mode, where the access token is the credential being presented.
-
-## A known limitation: `lore user info`
-
-An OIDC provider owns identity resolution, and this integration reads no directory
-beyond what a token itself carries. Looking up another user's display name (`lore user
-info`) against an OIDC-secured server reports that the provider exposes no such lookup,
-rather than resolving one — this is expected, not a bug.
+> [!NOTE]
+> Your provider owns identity resolution, and this integration reads no directory beyond what a token carries. You can only look up your own identity: passing a user id to `lore auth info` against an OIDC-secured server reports that the provider exposes no such lookup.
 
 ## See also
 
-- [Lore Server config reference](../reference/lore-server-config.md#authentication) —
-  every `[server.auth]` and `[server.auth.oidc]` field.
-- [Lore CLI command reference](../reference/lore-cli-commands.md) — the full `lore auth`
-  subcommand surface.
-- [Deploy a local Lore Server](deploy-local-lore-server.md) — get a server running before
-  securing it.
+- [Lore Server config reference](../reference/lore-server-config.md#authentication) — every `[server.auth]` and `[server.auth.oidc]` field.
+- [Lore CLI command reference](../reference/lore-cli-commands.md) — the full `lore auth` subcommand surface.
+- [OIDC authentication proposal](../proposals/2026-08-13-oidc-authentication.md) — the design, its threat model, and what resource binding does and doesn't prevent.
+- [Deploy a local Lore Server](deploy-local-lore-server.md) — get a server running before securing it.

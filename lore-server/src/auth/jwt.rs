@@ -78,15 +78,26 @@ pub struct AuthorizationToken {
     pub idp: String,
 }
 
-/// The third and final claim shape `verify_token_internal` tries, reached only
-/// after both `AuthorizationToken` and `JWTUserInfo` fail to deserialize.
-/// Unlike those two, it demands only what RFC 7519 and OpenID Connect Core
-/// guarantee — `iss`, `sub`, `aud`, `exp`, `iat` — so a conformant ID token
-/// from any standard provider satisfies it, with `name`, `preferred_username`,
-/// and `email` accepted when present but never required.
+/// The claim shape a provider-issued token is read into, in either OIDC mode.
+///
+/// It demands only what RFC 7519 and OpenID Connect Core guarantee — `iss`,
+/// `sub`, `aud`, `exp`, `iat` — so a conformant ID token from any standard
+/// provider satisfies it, with `name`, `preferred_username`, and `email`
+/// accepted when present but never required.
+///
+/// The same shape serves an [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068)
+/// JWT access token, because its §2.2 required set is this one plus `client_id`
+/// and `jti`. Neither of those is deserialized, and their absence is not a
+/// rejection: §2.2 binds the *authorization server* issuing the token, while §4
+/// — the resource server's own validation list — names neither, and Lore reads
+/// neither. There is no replay cache for `jti` to key (this design holds no
+/// per-request state at all), and the client id stopped being pinned the moment
+/// `aud` began naming the resource server instead. What separates the two modes
+/// is therefore not the claims but the two checks around them: the `typ` header
+/// and what `aud` is pinned to.
 #[serde_as]
 #[derive(Debug, Deserialize, Clone, PartialEq)]
-struct OidcIdTokenClaims {
+struct OidcTokenClaims {
     #[serde(rename = "sub")]
     user_id: String,
     #[serde(rename = "iss")]
@@ -104,17 +115,17 @@ struct OidcIdTokenClaims {
     email: Option<String>,
 }
 
-impl From<OidcIdTokenClaims> for AuthorizationToken {
-    /// Maps a minimal ID token onto the shape the rest of the server reads.
-    /// `idp` is the issuer, and the display fields fall back to `sub` when the
-    /// provider did not send them — the same substitution the LEP specifies
-    /// for the client's `JWTUserInfo` equivalent. `resources` is always the
-    /// all-repositories wildcard: this conversion is reachable only from a
-    /// [`JwtVerifierMode::Oidc`] verifier, whose configuration
+impl From<OidcTokenClaims> for AuthorizationToken {
+    /// Maps a minimal provider-issued token onto the shape the rest of the
+    /// server reads. `idp` is the issuer, and the display fields fall back to
+    /// `sub` when the provider did not send them — the same substitution the
+    /// LEP specifies for the client's `JWTUserInfo` equivalent. `resources` is
+    /// always the all-repositories wildcard: this conversion is reachable only
+    /// from a [`JwtVerifierMode::Oidc`] verifier, whose configuration
     /// (`authorize_all_repositories`) is what the wildcard records, and only
     /// for a token that already cleared signature, issuer, audience, and
     /// expiry checks.
-    fn from(claims: OidcIdTokenClaims) -> Self {
+    fn from(claims: OidcTokenClaims) -> Self {
         let display_name = claims.name.unwrap_or_else(|| claims.user_id.clone());
         let preferred_username = claims
             .preferred_username
@@ -150,6 +161,8 @@ pub enum JwtVerifierError {
     ValidationFailed(#[from] jsonwebtoken::errors::Error),
     #[error("JWT authorization failed")]
     NotAuthorized,
+    #[error("JWT is not an RFC 9068 access token")]
+    NotAnAccessToken,
 }
 
 /// Which claim shapes `verify_token_internal` accepts, and whether a
@@ -163,8 +176,8 @@ pub enum JwtVerifierError {
 /// trusted issuer but happens to omit `env`/`name`/`preferred_username` keeps
 /// being refused exactly as it is today — it is never granted every
 /// repository on the strength of an omitted claim. Only a verifier built from
-/// a configured `[server.auth.oidc]` block, via [`JwtVerifier::oidc`], is
-/// `Oidc` mode.
+/// a configured `[server.auth.oidc]` block, via [`JwtVerifier::oidc`] or
+/// [`JwtVerifier::oidc_resource`], is `Oidc` mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum JwtVerifierMode {
     /// Only Lore's own claim shapes (`AuthorizationToken`, `JWTUserInfo`)
@@ -172,10 +185,34 @@ pub enum JwtVerifierMode {
     /// existed, and the default.
     #[default]
     LoreClaims,
-    /// `[server.auth.oidc]`'s authn-only mode: after both Lore-shaped decodes
-    /// fail, a conformant ID token verifies too, and is granted the
-    /// all-repositories wildcard resource on success.
-    Oidc,
+    /// `[server.auth.oidc]`'s authn-only mode. Which credential the provider
+    /// is expected to have issued is the payload, because it decides both what
+    /// shape verifies and what `aud` is pinned to; everything downstream of a
+    /// successful verification — the all-repositories wildcard — is the same
+    /// either way.
+    Oidc(OidcAcceptance),
+}
+
+/// Which of the provider's two tokens a `[server.auth.oidc]` deployment accepts.
+///
+/// The distinction is `[server.auth.oidc].resource`, and it is the whole of the
+/// opt-in: absent, the deployment behaves exactly as it did before resource
+/// indicators existed; present, it is strict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OidcAcceptance {
+    /// No `resource` configured: a conformant OpenID Connect ID token, whose
+    /// `aud` is pinned to the client id. This is an authentication assertion
+    /// presented as a bearer credential, so `aud` names the client rather than
+    /// the server — which is why two deployments sharing an issuer and a client
+    /// id accept each other's tokens (LEP Security Considerations, residual
+    /// risk #1).
+    IdToken,
+    /// `resource` configured: an [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068)
+    /// JWT access token, whose `aud` is pinned to the resource identifier this
+    /// deployment configured. ID tokens are refused outright in this mode —
+    /// accepting both would leave the weaker credential as a way around the
+    /// stronger one, which is the entire point of turning it on.
+    AccessToken,
 }
 
 #[derive(Clone)]
@@ -202,8 +239,9 @@ impl JwtVerifier {
         }
     }
 
-    /// `[server.auth.oidc]`'s authn-only mode. What `build_jwt_verifier`
-    /// builds when the operator configured that block.
+    /// `[server.auth.oidc]`'s authn-only mode, accepting an ID token. What
+    /// `build_jwt_verifier` builds when the operator configured that block
+    /// without a `resource`. `jwt_audience` is the client id.
     pub fn oidc(
         jwk_service: Arc<dyn JWKService>,
         jwt_issuer: Option<String>,
@@ -213,7 +251,23 @@ impl JwtVerifier {
             jwk_service,
             jwt_issuer,
             jwt_audience,
-            mode: JwtVerifierMode::Oidc,
+            mode: JwtVerifierMode::Oidc(OidcAcceptance::IdToken),
+        }
+    }
+
+    /// `[server.auth.oidc]`'s resource-bound mode: an RFC 9068 JWT access token
+    /// and nothing else. What `build_jwt_verifier` builds when the operator
+    /// configured a `resource`, which is also what `jwt_audience` is pinned to.
+    pub fn oidc_resource(
+        jwk_service: Arc<dyn JWKService>,
+        jwt_issuer: Option<String>,
+        jwt_audience: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            jwk_service,
+            jwt_issuer,
+            jwt_audience,
+            mode: JwtVerifierMode::Oidc(OidcAcceptance::AccessToken),
         }
     }
 }
@@ -230,6 +284,17 @@ fn key_may_be_stale(error: &JwtVerifierError) -> bool {
         jsonwebtoken::errors::ErrorKind::InvalidSignature
             | jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
     ))
+}
+
+/// Whether a `typ` header declares an RFC 9068 JWT access token.
+///
+/// §2.1 registers the `application/at+jwt` media type and recommends omitting
+/// the `application/` prefix, and §4 step 1 accepts either spelling. The
+/// comparison is case-insensitive because `typ` is a media type, and media
+/// types are (RFC 9110 §8.3.1); a provider that spells it `AT+JWT` is
+/// conformant and refusing it would be a bug in this server, not in the token.
+fn is_jwt_access_token_type(typ: &str) -> bool {
+    typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
 }
 
 /// Log a claim-decode failure at the level its kind deserves, and carry it on.
@@ -328,6 +393,15 @@ impl JwtVerifier {
 
         debug!("Decoding JWT token");
 
+        // Resource-bound mode accepts one credential and stops. Lore's own claim
+        // shapes and the ID-token shape are all refused below, at the `typ`
+        // check, because leaving any of them reachable would leave a weaker
+        // credential as a way around the stronger one — which is the whole
+        // reason an operator configured `resource`.
+        if self.mode == JwtVerifierMode::Oidc(OidcAcceptance::AccessToken) {
+            return self.verify_access_token(token, key, &validation);
+        }
+
         if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {
             debug!(
                 sub = %token_data.claims.user_id,
@@ -360,14 +434,57 @@ impl JwtVerifier {
             // `[server.auth.jwk]`-only verifier stops here, exactly as it does
             // today. In OIDC mode a conformant ID token satisfies this third
             // shape instead, carrying none of `env`/`name`/`preferred_username`
-            // — see `OidcIdTokenClaims`.
-            Err(_) if self.mode == JwtVerifierMode::Oidc => {
-                decode::<OidcIdTokenClaims>(token, key, &validation)
+            // — see `OidcTokenClaims`.
+            Err(_) if matches!(self.mode, JwtVerifierMode::Oidc(_)) => {
+                decode::<OidcTokenClaims>(token, key, &validation)
                     .map_err(decode_failure)
                     .map(|token_data| token_data.claims.into())
             }
             Err(error) => Err(decode_failure(error)),
         }
+    }
+
+    /// RFC 9068 §4's validation list, which is what `[server.auth.oidc].resource`
+    /// buys. Every step is here or in the `Validation` the caller assembled:
+    ///
+    /// 1. the `typ` header names a JWT access token — checked below, and the
+    ///    only step with no equivalent in the ID-token path;
+    /// 2. decryption — N/A: this design negotiates no encryption, so an
+    ///    encrypted token is simply one that does not decode;
+    /// 3. `iss` matches the configured issuer exactly — `validation`'s issuer;
+    /// 4. `aud` contains an identifier this server expects for itself —
+    ///    `validation`'s audience, which in this mode is the configured
+    ///    `resource` rather than the client id. **This is the step that makes
+    ///    the mode worth having**: a token minted for another deployment behind
+    ///    the same provider names that deployment, and fails here;
+    /// 5. the signature verifies under an algorithm that is not `none` — the
+    ///    algorithm comes from the key, never from the header, and
+    ///    `OidcJwkService` has already refused every symmetric one;
+    /// 6. `exp` has not passed — `validation.validate_exp`.
+    fn verify_access_token(
+        &self,
+        token: &str,
+        key: &DecodingKey,
+        validation: &Validation,
+    ) -> Result<AuthorizationToken, JwtVerifierError> {
+        // Step 1. Deliberately before the signature check: a token that is not
+        // claiming to be an access token is not one this mode has any business
+        // decoding, whoever signed it. It is also not a failure a key rotation
+        // could ever explain, so — like an expired token or a wrong audience —
+        // it never reaches `refresh_key` and cannot be used to drive outbound
+        // requests (`key_may_be_stale` matches no such variant).
+        let header = decode_header(token).map_err(JwtVerifierError::ValidationFailed)?;
+        if !header.typ.as_deref().is_some_and(is_jwt_access_token_type) {
+            debug!(
+                typ = ?header.typ,
+                "Refusing a token that does not declare the RFC 9068 media type"
+            );
+            return Err(JwtVerifierError::NotAnAccessToken);
+        }
+
+        decode::<OidcTokenClaims>(token, key, validation)
+            .map_err(decode_failure)
+            .map(|token_data| token_data.claims.into())
     }
 }
 
@@ -1312,6 +1429,306 @@ mod tests {
                          env/name/preferred_username, however well it verifies otherwise",
                 );
                 assert!(matches!(error, JwtVerifierError::ValidationFailed(_)));
+            }
+        }
+
+        /// `[server.auth.oidc].resource`: the deployment names itself, the
+        /// provider audience-restricts an RFC 9068 access token to that name
+        /// (RFC 8707 §2), and the server accepts nothing else. What this buys
+        /// is stated precisely in the LEP: two deployments sharing an issuer
+        /// and a client id stop accepting each other's tokens, because `aud`
+        /// now identifies the resource server rather than the client.
+        mod resource_mode {
+            use super::*;
+
+            const RESOURCE: &str = "https://lore.example.com";
+            const OTHER_RESOURCE: &str = "https://lore.other.example.com";
+            const CLIENT_ID: &str = "lore";
+
+            fn resource_verifier() -> JwtVerifier {
+                let mut service = MockTestJWKService::new();
+                service.expect_get_key().returning(|_| {
+                    Ok((
+                        DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                        AGREED_UPON_ALGORITHM,
+                    ))
+                });
+                service.expect_refresh_key().returning(|_| Ok(None));
+
+                JwtVerifier::oidc_resource(
+                    Arc::new(service),
+                    Some("https://id.example.com".to_string()),
+                    Some(vec![RESOURCE.to_string()]),
+                )
+            }
+
+            /// RFC 9068 §2.2's required claim set, audience-restricted to this
+            /// deployment's resource identifier.
+            fn access_token_claims() -> serde_json::Value {
+                json!({
+                    "sub": "the-subject",
+                    "iss": "https://id.example.com",
+                    "aud": RESOURCE,
+                    "client_id": CLIENT_ID,
+                    "iat": 1,
+                    "jti": "the-token-id",
+                    "exp": SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .add(Duration::from_secs(5))
+                        .as_secs(),
+                })
+            }
+
+            /// `encode` writes `typ: "JWT"`, so the RFC 9068 media type has to
+            /// be set deliberately — which is the point of the header check.
+            fn encode_access_token(claims: &serde_json::Value, typ: Option<&str>) -> String {
+                let jwt_key = EncodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref());
+                let mut header = Header::new(AGREED_UPON_ALGORITHM);
+                header.kid = Some("the kid".into());
+                header.typ = typ.map(str::to_string);
+                encode(&header, claims, &jwt_key).unwrap()
+            }
+
+            /// **The headline case.** An ID token — or any token — whose `aud`
+            /// is the *client id* must be refused by a resource-mode server,
+            /// even though it is signed by the pinned issuer and unexpired.
+            /// This is what kills cross-deployment token interchange: a token
+            /// minted for a sibling Lore deployment behind the same provider
+            /// carries that deployment's `aud`, not this one's.
+            #[tokio::test]
+            async fn a_client_id_audience_token_is_rejected() {
+                let mut claims = access_token_claims();
+                claims["aud"] = json!(CLIENT_ID);
+                let encoded = encode_access_token(&claims, Some("at+jwt"));
+
+                resource_verifier().verify_token(&encoded).await.expect_err(
+                    "a token audienced to the client id authorizes every deployment \
+                     sharing that client — which is the risk resource mode removes",
+                );
+            }
+
+            /// The sibling-deployment case stated directly: correct `typ`,
+            /// correct issuer, valid signature, and an `aud` naming *another*
+            /// Lore server's resource identifier.
+            #[tokio::test]
+            async fn another_deployments_resource_audience_is_rejected() {
+                let mut claims = access_token_claims();
+                claims["aud"] = json!(OTHER_RESOURCE);
+                let encoded = encode_access_token(&claims, Some("at+jwt"));
+
+                resource_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect_err("a token minted for the deployment next door is not ours");
+            }
+
+            #[tokio::test]
+            async fn a_conformant_access_token_is_accepted_and_wildcarded() {
+                let encoded = encode_access_token(&access_token_claims(), Some("at+jwt"));
+
+                let token = resource_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect("an RFC 9068 access token for this resource is accepted");
+
+                assert_eq!(token.user_id, "the-subject");
+                assert_eq!(token.issuer, "https://id.example.com");
+                assert_eq!(token.idp, "https://id.example.com");
+                assert_eq!(token.audience, vec![RESOURCE.to_string()]);
+                let resources = token.resources.expect("wildcard resource is populated");
+                assert!(resources[0].is_wildcard_resource());
+            }
+
+            /// RFC 9068 §2.1 recommends omitting the `application/` prefix but
+            /// §4 step 1 accepts both spellings, and a media type is compared
+            /// case-insensitively.
+            #[tokio::test]
+            async fn both_spellings_of_the_media_type_are_accepted() {
+                for typ in [
+                    "at+jwt",
+                    "application/at+jwt",
+                    "AT+JWT",
+                    "Application/AT+JWT",
+                ] {
+                    let encoded = encode_access_token(&access_token_claims(), Some(typ));
+                    resource_verifier()
+                        .verify_token(&encoded)
+                        .await
+                        .unwrap_or_else(|e| panic!("typ '{typ}' must be accepted: {e}"));
+                }
+            }
+
+            /// RFC 9068 §4 step 1: "reject tokens carrying any other value".
+            /// `typ: "JWT"` is what every ordinary JWT — every ID token
+            /// included — carries, so this check is what makes ID-token
+            /// acceptance actually off rather than merely unadvertised.
+            #[tokio::test]
+            async fn a_plain_jwt_media_type_is_rejected() {
+                for typ in [Some("JWT"), Some("oauth-access-token"), Some(""), None] {
+                    let encoded = encode_access_token(&access_token_claims(), typ);
+                    if let Ok(accepted) = resource_verifier().verify_token(&encoded).await {
+                        panic!("typ {typ:?} was accepted, yielding {}", accepted.user_id);
+                    }
+                }
+            }
+
+            /// The other half of "ID-token acceptance is OFF": a conformant ID
+            /// token, correctly audienced to the client id and correctly
+            /// signed, is exactly what an attacker harvests by standing up a
+            /// look-alike deployment. In resource mode it verifies nothing.
+            #[tokio::test]
+            async fn an_id_token_is_rejected_in_resource_mode() {
+                let encoded = encode_jwt(&json!({
+                    "sub": "the-subject",
+                    "iss": "https://id.example.com",
+                    "aud": CLIENT_ID,
+                    "iat": 1,
+                    "exp": SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .add(Duration::from_secs(5))
+                        .as_secs(),
+                }));
+
+                resource_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect_err("the weaker credential is not a way around the stronger one");
+            }
+
+            /// Lore's own claim shapes are refused too, and for the same
+            /// reason: a `ucs-auth`-issued token carries `typ: "JWT"`, so it
+            /// never reaches a claim decode here however well it verifies
+            /// otherwise. Resource mode has exactly one door.
+            #[tokio::test]
+            async fn a_lore_shaped_token_is_rejected_in_resource_mode() {
+                let mut claims = access_token_claims();
+                claims["env"] = json!("the env");
+                claims["name"] = json!("the name");
+                claims["preferred_username"] = json!("pu");
+                let encoded = encode_jwt(&claims);
+
+                resource_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect_err("resource mode accepts the RFC 9068 shape and nothing else");
+            }
+
+            /// `sub` and `iat` are RFC 9068 §2.2 REQUIRED claims that Lore
+            /// actually consumes — `sub` is the identity every authenticated
+            /// path records — so their absence is a rejection rather than a
+            /// substitution.
+            #[tokio::test]
+            async fn a_token_missing_sub_or_iat_is_rejected() {
+                for claim in ["sub", "iat"] {
+                    let mut claims = access_token_claims();
+                    claims.as_object_mut().expect("claims object").remove(claim);
+                    let encoded = encode_access_token(&claims, Some("at+jwt"));
+
+                    if resource_verifier().verify_token(&encoded).await.is_ok() {
+                        panic!("a token without '{claim}' must be refused");
+                    }
+                }
+            }
+
+            /// `jti` and `client_id` are REQUIRED of the *authorization server*
+            /// by RFC 9068 §2.2, but §4 — the resource server's own validation
+            /// list — names neither, and Lore reads neither: it keeps no replay
+            /// cache for `jti` to key (LEP Non-Functional Considerations,
+            /// "Statelessness"), and it no longer pins the client id, because
+            /// `aud` names the resource server instead. Refusing a token whose
+            /// security properties are complete, over claims the server would
+            /// then discard, buys nothing and costs interoperability.
+            #[tokio::test]
+            async fn a_token_without_jti_or_client_id_is_still_accepted() {
+                let mut claims = access_token_claims();
+                let object = claims.as_object_mut().expect("claims object");
+                object.remove("jti");
+                object.remove("client_id");
+                let encoded = encode_access_token(&claims, Some("at+jwt"));
+
+                resource_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect("leniency on claims the resource server does not read");
+            }
+
+            #[tokio::test]
+            async fn wrong_issuer_and_expiry_are_still_rejected() {
+                let mut wrong_issuer = access_token_claims();
+                wrong_issuer["iss"] = json!("https://not-the-configured-issuer.invalid");
+                resource_verifier()
+                    .verify_token(&encode_access_token(&wrong_issuer, Some("at+jwt")))
+                    .await
+                    .expect_err("the issuer pin holds in resource mode too");
+
+                let mut expired = access_token_claims();
+                expired["exp"] = json!(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        - 3600
+                );
+                resource_verifier()
+                    .verify_token(&encode_access_token(&expired, Some("at+jwt")))
+                    .await
+                    .expect_err("the expiry check holds in resource mode too");
+            }
+
+            /// A `typ` this server does not accept is the token's own fault and
+            /// no key could ever rescue it, so — like an expired token or a
+            /// wrong audience — it must not be a way to drive outbound key
+            /// fetches.
+            #[tokio::test]
+            async fn a_wrong_media_type_never_asks_for_a_refresh() {
+                let service = Arc::new(RotatingJWKService::new(
+                    AGREED_UPON_SIGNING_SECRET,
+                    Some(AGREED_UPON_SIGNING_SECRET),
+                ));
+                let verifier = JwtVerifier::oidc_resource(
+                    service.clone(),
+                    Some("https://id.example.com".to_string()),
+                    Some(vec![RESOURCE.to_string()]),
+                );
+                let encoded = encode_access_token(&access_token_claims(), Some("JWT"));
+
+                verifier
+                    .verify_token(&encoded)
+                    .await
+                    .expect_err("the wrong media type stays rejected");
+                verifier
+                    .try_verify_token_cached(&encoded)
+                    .expect_err("and is rejected outright, not deferred");
+
+                assert_eq!(service.refreshes(), 0);
+            }
+
+            /// The regression guard in the other direction: turning resource
+            /// mode off leaves the ID-token mode exactly as it was, so the
+            /// opt-in really is one.
+            #[tokio::test]
+            async fn an_access_token_shape_still_verifies_in_id_token_mode() {
+                let mut service = MockTestJWKService::new();
+                service.expect_get_key().returning(|_| {
+                    Ok((
+                        DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                        AGREED_UPON_ALGORITHM,
+                    ))
+                });
+                let id_token_verifier = JwtVerifier::oidc(
+                    Arc::new(service),
+                    Some("https://id.example.com".to_string()),
+                    Some(vec![CLIENT_ID.to_string()]),
+                );
+                let mut claims = access_token_claims();
+                claims["aud"] = json!(CLIENT_ID);
+
+                id_token_verifier
+                    .verify_token(&encode_access_token(&claims, Some("at+jwt")))
+                    .await
+                    .expect("ID-token mode is unchanged: it never looked at typ");
             }
         }
 

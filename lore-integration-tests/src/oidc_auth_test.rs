@@ -295,6 +295,193 @@ mod oidc_auth_tests {
         Ok(())
     }
 
+    /// `[server.auth.oidc].resource` end to end, over the real HTTP plug point.
+    ///
+    /// **PocketID 2.6.2 does not implement RFC 8707** — verified against the live instance
+    /// on 2026-08-13: it answers `200` to a `resource` parameter on both the device
+    /// authorization and token requests, ignores it silently, and mints an access token
+    /// audienced to the client id with header `typ: "JWT"`. So the tokens here are minted
+    /// synthetically against a `file://` key set, which is the escape hatch the LEP keeps
+    /// for exactly this class of reason. The client half of resource mode is proven by the
+    /// `lore-transport` unit tests, and the diagnostic it raises against a
+    /// non-implementing provider is proven against live PocketID in `oidc_client_test.rs`.
+    mod resource_mode {
+        use jsonwebtoken::EncodingKey;
+        use jsonwebtoken::Header;
+        use lore_server::auth::jwk::OidcJwkService;
+
+        use super::*;
+
+        const ISSUER: &str = "https://id.example.com";
+        const RESOURCE: &str = "https://lore.example.com";
+        const OTHER_RESOURCE: &str = "https://lore.other.example.com";
+        const CLIENT_ID: &str = "lore";
+        const KID: &str = "resource-mode-test-key";
+
+        /// An Ed25519 signing key and the one-key JWKS that publishes its public half.
+        ///
+        /// Generated per test rather than embedded: a private key checked into a
+        /// repository is a private key, whatever it is for. EdDSA because it is in the
+        /// OIDC-mode algorithm allowlist and `ring` will generate one, where it will not
+        /// generate RSA.
+        fn signing_key_and_jwks() -> (EncodingKey, String) {
+            use base64::Engine;
+            use ring::signature::KeyPair;
+
+            let rng = ring::rand::SystemRandom::new();
+            let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+                .expect("generate an ed25519 key");
+            let key_pair =
+                ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("read it back");
+            let public = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(key_pair.public_key().as_ref());
+
+            let jwks = format!(
+                r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","use":"sig","alg":"EdDSA",
+                   "kid":"{KID}","x":"{public}"}}]}}"#
+            );
+            (EncodingKey::from_ed_der(pkcs8.as_ref()), jwks)
+        }
+
+        /// A verifier in resource-bound mode over a `file://` key set, assembled the way
+        /// `build_jwt_verifier` assembles one from `[server.auth.oidc]` with a `resource`:
+        /// the `OidcJwkService` wrapper that refuses symmetric algorithms, the issuer
+        /// pinned, and the audience pinned to the resource rather than the client id.
+        fn resource_mode_verifier(jwks: &str) -> (JwtVerifier, tempfile::NamedTempFile) {
+            use std::io::Write;
+
+            let mut file = tempfile::NamedTempFile::new().expect("temp jwks file");
+            file.write_all(jwks.as_bytes()).expect("write jwks");
+            let endpoint = reqwest::Url::from_file_path(file.path())
+                .expect("jwks path as a file url")
+                .to_string();
+
+            let jwk_service: Arc<dyn JWKService> = Arc::new(OidcJwkService::new(Arc::new(
+                JwkServiceImpl::new(JWKServiceSettings { endpoint }),
+            )));
+
+            (
+                JwtVerifier::oidc_resource(
+                    jwk_service,
+                    Some(ISSUER.to_string()),
+                    Some(vec![RESOURCE.to_string()]),
+                ),
+                file,
+            )
+        }
+
+        fn expires_in_an_hour() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs()
+                + 3600
+        }
+
+        /// A token signed by the test key, with a caller-chosen media type and audience —
+        /// the two things resource mode decides on.
+        fn mint(key: &EncodingKey, typ: &str, audience: &str) -> String {
+            let mut header = Header::new(jsonwebtoken::Algorithm::EdDSA);
+            header.kid = Some(KID.to_string());
+            header.typ = Some(typ.to_string());
+
+            jsonwebtoken::encode(
+                &header,
+                &serde_json::json!({
+                    "iss": ISSUER,
+                    "sub": "the-subject",
+                    "aud": audience,
+                    "client_id": CLIENT_ID,
+                    "iat": 1,
+                    "jti": "the-token-id",
+                    "exp": expires_in_an_hour(),
+                }),
+                key,
+            )
+            .expect("sign the test token")
+        }
+
+        async fn put_with(
+            base_url: &str,
+            token: &str,
+        ) -> Result<reqwest::StatusCode, Box<dyn Error>> {
+            Ok(reqwest::Client::new()
+                .put(put_content_url(base_url))
+                .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+                .body("a resource-mode request")
+                .send()
+                .await?
+                .status())
+        }
+
+        /// The whole point of the mode, over the wire: a token audienced to the *client
+        /// id* — which is every token an ID-token deployment behind the same provider
+        /// hands out, and every token a sibling Lore deployment's users hold — no longer
+        /// opens this server, while one audienced to this deployment does.
+        #[tokio::test]
+        async fn only_a_token_bound_to_this_deployment_is_admitted() -> TestResult {
+            let (key, jwks) = signing_key_and_jwks();
+            let (verifier, _jwks_file) = resource_mode_verifier(&jwks);
+            let (base_url, _shutdown) = start_http_server(Some(verifier)).await;
+
+            assert_eq!(
+                put_with(&base_url, &mint(&key, "at+jwt", RESOURCE)).await?,
+                reqwest::StatusCode::OK,
+                "an RFC 9068 access token bound to this deployment must be admitted"
+            );
+            assert_eq!(
+                put_with(&base_url, &mint(&key, "at+jwt", CLIENT_ID)).await?,
+                reqwest::StatusCode::FORBIDDEN,
+                "a token audienced to the client id must no longer open this server"
+            );
+            assert_eq!(
+                put_with(&base_url, &mint(&key, "at+jwt", OTHER_RESOURCE)).await?,
+                reqwest::StatusCode::FORBIDDEN,
+                "nor must one minted for the deployment next door"
+            );
+            Ok(())
+        }
+
+        /// ID-token acceptance is off, and the media type is what turns it off: `typ:
+        /// "JWT"` is what every ID token and every Lore-issued token carries.
+        #[tokio::test]
+        async fn a_token_without_the_rfc_9068_media_type_is_refused() -> TestResult {
+            let (key, jwks) = signing_key_and_jwks();
+            let (verifier, _jwks_file) = resource_mode_verifier(&jwks);
+            let (base_url, _shutdown) = start_http_server(Some(verifier)).await;
+
+            assert_eq!(
+                put_with(&base_url, &mint(&key, "JWT", RESOURCE)).await?,
+                reqwest::StatusCode::FORBIDDEN,
+                "a correctly-audienced token that is not an access token must be refused"
+            );
+            assert_eq!(
+                put_with(&base_url, &mint(&key, "application/at+jwt", RESOURCE)).await?,
+                reqwest::StatusCode::OK,
+                "both spellings of the media type are conformant (RFC 9068 §4 step 1)"
+            );
+            Ok(())
+        }
+
+        /// A token signed by a key the published set does not contain stays refused, so
+        /// the media type and audience checks are additions to verification rather than a
+        /// path around it.
+        #[tokio::test]
+        async fn a_token_from_an_unknown_key_is_still_refused() -> TestResult {
+            let (_key, jwks) = signing_key_and_jwks();
+            let (other_key, _other_jwks) = signing_key_and_jwks();
+            let (verifier, _jwks_file) = resource_mode_verifier(&jwks);
+            let (base_url, _shutdown) = start_http_server(Some(verifier)).await;
+
+            assert_eq!(
+                put_with(&base_url, &mint(&other_key, "at+jwt", RESOURCE)).await?,
+                reqwest::StatusCode::FORBIDDEN,
+                "a perfectly-shaped token signed by nobody the server trusts is still no"
+            );
+            Ok(())
+        }
+    }
+
     /// Quick regression: an unconfigured server (`jwt_verifier: None`) must keep behaving
     /// exactly as it does today, on the same route the tests above exercise.
     #[tokio::test]

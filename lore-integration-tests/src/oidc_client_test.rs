@@ -341,4 +341,63 @@ mod oidc_client_tests {
             .await
             .expect("The passed-through token did not verify against the issuer's JWKS");
     }
+
+    /// **PocketID 2.6.2 does not implement RFC 8707**, and this is the test that pins that
+    /// finding to the provider rather than to a comment.
+    ///
+    /// The parameter is sent on every leg of the grant, and PocketID answers `200` to all
+    /// of them, ignores it, and mints an access token audienced to the client id with
+    /// header `typ: "JWT"` — no `invalid_target`, no warning, nothing in the response that
+    /// says the request was not honored. That silence is the reason the client checks the
+    /// token it got back rather than trusting the flow's success: without the check, a
+    /// login against a resource-mode server would complete, store a credential, print a
+    /// user name, and then have every single repository operation refused with the cause
+    /// nowhere in sight.
+    ///
+    /// So this asserts the failure is the *right* failure — raised at login, naming what
+    /// the provider did not do. If PocketID gains RFC 8707 support, this test starts
+    /// failing and should become the end-to-end success case.
+    ///
+    /// Requires the compose stack (see above).
+    #[tokio::test]
+    async fn a_provider_without_resource_indicator_support_fails_the_login_by_name() {
+        let (fixture, user, _) = setup().await.expect("PocketID fixture setup failed");
+        let auth = OidcAuthentication::default();
+        let auth_url = format!(
+            "oidc+{}?client_id={CLIENT_ID}&resource=https%3A%2F%2Flore.example.com",
+            fixture.issuer().trim_end_matches('/')
+        );
+
+        let session = auth
+            .start_auth_session(&auth_url, "client-state", LoginFlow::Browser, "")
+            .await
+            .expect("The login should start: the parameter only matters at the token endpoint");
+
+        // The authorization URL really does carry it, so the provider had every chance.
+        assert!(
+            session.login_url.contains("resource="),
+            "The authorization request dropped the resource indicator: {}",
+            session.login_url
+        );
+
+        let redirect = fixture
+            .follow_authorization_url(&user, &session.login_url)
+            .await
+            .expect("The consent leg should complete");
+        deliver(&redirect)
+            .await
+            .expect("The listener should answer the redirect");
+
+        let error = auth
+            .poll_auth_session(&auth_url, "client-state", &session.session_code, "")
+            .await
+            .expect_err("A token the server will refuse must not be reported as a login");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("at+jwt") || message.contains("resource"),
+            "The failure has to name what the provider did not do, or an operator has \
+             nothing to act on; got: {message}"
+        );
+    }
 }

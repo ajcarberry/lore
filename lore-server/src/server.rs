@@ -68,6 +68,7 @@ use crate::auth::jwk::JWKService;
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwk::OidcJwkService;
 use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::OidcAcceptance;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -437,7 +438,7 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
         return Ok(None);
     };
 
-    let (jwt_issuer, jwt_audience, jwk_settings, oidc_mode) = match auth.oidc.as_ref() {
+    let (jwt_issuer, jwt_audience, jwk_settings, acceptance) = match auth.oidc.as_ref() {
         Some(oidc) => {
             let issuer = oidc.issuer.clone();
             let document =
@@ -451,12 +452,26 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
                     endpoint: document.jwks_uri,
                 });
             let jwt_issuer = auth.jwt_issuer.clone().or(Some(oidc.issuer.clone()));
-            let jwt_audience = auth
-                .jwt_audience
-                .clone()
-                .or_else(|| Some(vec![oidc.client_id.clone()]));
 
-            (jwt_issuer, jwt_audience, jwk_settings, true)
+            // The audience pin *is* the mode. Without a `resource` the server
+            // pins the client id and reads an ID token, which cannot tell two
+            // deployments behind one provider apart; with one it pins this
+            // deployment's own identifier, and a sibling's token stops
+            // verifying. An explicit `jwt_audience` still wins, per the LEP's
+            // rule that a setting written down beats a derived one.
+            let acceptance = match oidc.resource.as_ref() {
+                Some(_) => OidcAcceptance::AccessToken,
+                None => OidcAcceptance::IdToken,
+            };
+            let jwt_audience = auth.jwt_audience.clone().or_else(|| {
+                Some(vec![
+                    oidc.resource
+                        .clone()
+                        .unwrap_or_else(|| oidc.client_id.clone()),
+                ])
+            });
+
+            (jwt_issuer, jwt_audience, jwk_settings, Some(acceptance))
         }
         None => {
             let Some(jwk) = auth.jwk.as_ref() else {
@@ -466,7 +481,7 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
                 auth.jwt_issuer.clone(),
                 auth.jwt_audience.clone(),
                 jwk.clone(),
-                false,
+                None,
             )
         }
     };
@@ -475,16 +490,18 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
     jwk_service
         .fetch_new_keys(None /* fetch all keys */)
         .await?;
-    let jwk_service: Arc<dyn JWKService> = if oidc_mode {
+    let jwk_service: Arc<dyn JWKService> = if acceptance.is_some() {
         Arc::new(OidcJwkService::new(Arc::new(jwk_service)))
     } else {
         Arc::new(jwk_service)
     };
 
-    Ok(Some(if oidc_mode {
-        JwtVerifier::oidc(jwk_service, jwt_issuer, jwt_audience)
-    } else {
-        JwtVerifier::new(jwk_service, jwt_issuer, jwt_audience)
+    Ok(Some(match acceptance {
+        Some(OidcAcceptance::AccessToken) => {
+            JwtVerifier::oidc_resource(jwk_service, jwt_issuer, jwt_audience)
+        }
+        Some(OidcAcceptance::IdToken) => JwtVerifier::oidc(jwk_service, jwt_issuer, jwt_audience),
+        None => JwtVerifier::new(jwk_service, jwt_issuer, jwt_audience),
     }))
 }
 
@@ -493,6 +510,14 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
 /// provider" section: `oidc+{scheme}://{issuer-without-scheme}?client_id=...`,
 /// with the issuer's own path preserved so stripping the `oidc+` prefix
 /// recovers the issuer string unchanged. An explicit `auth_url` always wins.
+///
+/// A configured `resource` is advertised alongside the client id, and doing so
+/// is what makes resource mode work at all rather than merely be strict: it is
+/// the only way the client learns to send the RFC 8707 `resource` parameter on
+/// its grant requests, and therefore the only way the provider knows to
+/// audience-restrict the token this server will demand. An operator who writes
+/// `auth_url` out by hand has to carry the parameter themselves, which the
+/// configuration reference says.
 fn derive_oidc_auth_url(oidc: &crate::settings::OidcSettings) -> Option<String> {
     let issuer_url = reqwest::Url::parse(&oidc.issuer).ok()?;
     let scheme = match issuer_url.scheme() {
@@ -506,9 +531,19 @@ fn derive_oidc_auth_url(oidc: &crate::settings::OidcSettings) -> Option<String> 
         derived.push_str(&format!(":{port}"));
     }
     derived.push_str(issuer_url.path().trim_end_matches('/'));
-    derived.push_str(&format!("?client_id={}", oidc.client_id));
 
-    Some(derived)
+    // Percent-encoded because a resource indicator is an absolute URI, whose
+    // own `:` and `/` would otherwise land in this query string raw.
+    let mut derived = reqwest::Url::parse(&derived).ok()?;
+    {
+        let mut query = derived.query_pairs_mut();
+        query.append_pair("client_id", &oidc.client_id);
+        if let Some(resource) = oidc.resource.as_deref() {
+            query.append_pair("resource", resource);
+        }
+    }
+
+    Some(derived.into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2254,6 +2289,14 @@ mod tests {
                 issuer: issuer.to_string(),
                 client_id: "lore".to_string(),
                 authorize_all_repositories: true,
+                resource: None,
+            }
+        }
+
+        fn oidc_with_resource(issuer: &str, resource: &str) -> OidcSettings {
+            OidcSettings {
+                resource: Some(resource.to_string()),
+                ..oidc(issuer)
             }
         }
 
@@ -2289,6 +2332,61 @@ mod tests {
             let issuer_part = rest.split('?').next().expect("query separator");
             assert_eq!(issuer_part, "https://id.example.com/realms/studio");
         }
+
+        /// Advertising the resource is not cosmetic: it is the only channel by
+        /// which a client learns to send the RFC 8707 `resource` parameter, and
+        /// without that parameter the provider mints a token audienced to the
+        /// client id — which a resource-mode server then refuses. A derivation
+        /// that dropped it would leave every login succeeding and every request
+        /// denied.
+        #[test]
+        fn a_configured_resource_is_advertised() {
+            let derived = derive_oidc_auth_url(&oidc_with_resource(
+                "https://id.example.com",
+                "https://lore.example.com",
+            ))
+            .expect("derives");
+
+            let url = reqwest::Url::parse(&derived).expect("a URL");
+            let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(query.get("client_id").map(String::as_str), Some("lore"));
+            assert_eq!(
+                query.get("resource").map(String::as_str),
+                Some("https://lore.example.com"),
+                "the client cannot ask for a resource-bound token it was never told about"
+            );
+        }
+
+        /// A resource indicator is an absolute URI, so it carries `:` and `/`
+        /// that have to survive being a query parameter value.
+        #[test]
+        fn an_advertised_resource_is_percent_encoded() {
+            let derived = derive_oidc_auth_url(&oidc_with_resource(
+                "https://id.example.com",
+                "https://lore.example.com/team",
+            ))
+            .expect("derives");
+
+            assert!(
+                derived.contains("resource=https%3A%2F%2Flore.example.com%2Fteam"),
+                "the resource must be encoded, got: {derived}"
+            );
+        }
+
+        /// The issuer still has to come back byte for byte with a resource in
+        /// the query, because every issuer check downstream is a byte
+        /// comparison.
+        #[test]
+        fn a_resource_does_not_disturb_the_issuer() {
+            let derived = derive_oidc_auth_url(&oidc_with_resource(
+                "https://id.example.com/realms/studio",
+                "https://lore.example.com",
+            ))
+            .expect("derives");
+            let (_, rest) = derived.split_once('+').expect("oidc+ prefix");
+            let issuer_part = rest.split('?').next().expect("query separator");
+            assert_eq!(issuer_part, "https://id.example.com/realms/studio");
+        }
     }
 
     mod build_jwt_verifier {
@@ -2303,6 +2401,7 @@ mod tests {
 
         use super::super::build_jwt_verifier;
         use crate::auth::jwk::JWKServiceSettings;
+        use crate::auth::jwt::OidcAcceptance;
         use crate::settings::AuthSettings;
         use crate::settings::OidcSettings;
 
@@ -2359,6 +2458,7 @@ mod tests {
                 issuer: issuer.clone(),
                 client_id: "lore-client".to_string(),
                 authorize_all_repositories: true,
+                resource: None,
             };
             let auth = AuthSettings {
                 jwk: None,
@@ -2376,8 +2476,48 @@ mod tests {
             assert_eq!(verifier.jwt_audience, Some(vec!["lore-client".to_string()]));
             assert_eq!(
                 verifier.mode,
-                crate::auth::jwt::JwtVerifierMode::Oidc,
-                "a [server.auth.oidc]-derived verifier must be built in OIDC mode"
+                crate::auth::jwt::JwtVerifierMode::Oidc(crate::auth::jwt::OidcAcceptance::IdToken),
+                "a [server.auth.oidc] block without a resource accepts ID tokens"
+            );
+        }
+
+        /// The headline of the resource-bound mode, at the level the operator
+        /// actually configures: naming a `resource` moves the audience pin off
+        /// the client id and onto this deployment. Two Lore servers behind one
+        /// provider share a client id — that is the normal case, not a
+        /// misconfiguration — so while `aud` names the client, each accepts
+        /// tokens minted for the other. After this, neither does.
+        #[tokio::test]
+        async fn a_configured_resource_pins_the_audience_to_the_deployment() {
+            let (_address, issuer) =
+                spawn_discovery_and_jwks_server(&issuer_agnostic_rsa_jwks()).await;
+            let oidc = OidcSettings {
+                issuer: issuer.clone(),
+                client_id: "lore-client".to_string(),
+                authorize_all_repositories: true,
+                resource: Some("https://lore.example.com".to_string()),
+            };
+            let auth = AuthSettings {
+                jwk: None,
+                jwt_audience: None,
+                jwt_issuer: None,
+                oidc: Some(oidc),
+            };
+
+            let verifier = build_jwt_verifier(Some(&auth))
+                .await
+                .unwrap()
+                .expect("a resource-mode configuration builds a verifier");
+
+            assert_eq!(
+                verifier.jwt_audience,
+                Some(vec!["https://lore.example.com".to_string()]),
+                "the client id must no longer be an acceptable audience"
+            );
+            assert_eq!(
+                verifier.mode,
+                crate::auth::jwt::JwtVerifierMode::Oidc(OidcAcceptance::AccessToken),
+                "a configured resource requires an RFC 9068 access token"
             );
         }
 
@@ -2389,6 +2529,7 @@ mod tests {
                 issuer: issuer.clone(),
                 client_id: "lore-client".to_string(),
                 authorize_all_repositories: true,
+                resource: None,
             };
             let auth = AuthSettings {
                 jwk: None,

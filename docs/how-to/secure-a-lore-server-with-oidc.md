@@ -120,21 +120,74 @@ valid, unexpired token from your configured issuer. The `/health_check` endpoint
 open, and any client that hasn't logged in gets a clean authentication failure instead
 of a response.
 
-## Sharing one issuer across multiple Lore deployments
+## Bind tokens to this deployment (recommended)
 
-If several Lore servers register clients against the same issuer, add a `resource` query
-parameter when you set `environment.endpoint.auth_url` explicitly, so a client's
-credential store can tell the deployments apart even though they share an issuer and
-client id:
+By default the server pins the token's `aud` claim to the **client id**. That identifies
+the application, not the server — so every Lore deployment registered behind the same
+issuer and client id accepts every other one's tokens. Two consequences follow: a token
+harvested from users of one deployment opens the others, and a client's credential store
+keys on `(auth_url, identity)`, so deployments sharing an issuer share a bucket and
+logging in to one evicts the other's token.
+
+Setting `resource` fixes both. The server then requires an
+[RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) JWT access token whose `aud` names
+**this deployment**, and the client asks the provider for one using
+[RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource indicators:
+
+```toml
+[server.auth.oidc]
+issuer = "https://id.example.com"
+client_id = "lore"
+authorize_all_repositories = true
+resource = "https://lore-prod.example.com"
+```
+
+**Use it whenever your provider supports it**, and treat it as required for any
+deployment that shares an issuer with another Lore server. The value must be an absolute
+URI with no fragment (RFC 8707 §2) — a bare hostname such as `lore-prod.example.com` is
+rejected at startup. Use the deployment's own address; it's an identifier, so the server
+never dials it.
+
+The server advertises the value automatically, so clients need no configuration. If you
+set `environment.endpoint.auth_url` by hand, carry the parameter yourself, or clients
+won't ask for a resource-bound token and every request will be refused:
 
 ```toml
 [environment.endpoint]
-auth_url = "oidc+https://id.example.com?client_id=lore&resource=lore-prod.example.com"
+auth_url = "oidc+https://id.example.com?client_id=lore&resource=https%3A%2F%2Flore-prod.example.com"
 ```
 
-Without it, the server derives `auth_url` from the OIDC block automatically and you
-don't need to set this — only add `resource` once one issuer serves more than one Lore
-deployment.
+> [!IMPORTANT]
+> **Your provider must implement RFC 8707 and RFC 9068**, and a provider that doesn't
+> won't tell you so. RFC 8707 obliges nobody to announce that they ignore the parameter,
+> so a non-supporting provider accepts the request, returns `200`, and mints an ordinary
+> client-audienced token. Lore checks the token it gets back for exactly this reason and
+> fails the login with a message naming what the provider didn't do — rather than letting
+> you log in successfully and then have every operation refused.
+>
+> **PocketID 2.6.2 doesn't support RFC 8707** (verified 2026-08-13): it silently ignores
+> the parameter. Leave `resource` unset there. Keycloak, Entra ID, and Auth0 support
+> resource indicators or an equivalent audience parameter; check your provider's
+> documentation before turning this on, and test a login in a non-production deployment
+> first.
+
+What this does and doesn't buy you: it ends cross-deployment token interchange and
+untargeted replay, because a token minted for one deployment names it and no other
+server accepts it. It does **not** stop a targeted attack — someone who stands up a
+server advertising *your* resource identifier and persuades a user to log in to it still
+receives a token your server would accept. What bounds that one is that the user chose
+the remote.
+
+## Keep token lifetimes short
+
+Lore holds no revocation list and no session state: a verified token is accepted until
+it expires. Revoking a user at the provider therefore takes effect when their current
+token runs out, not immediately.
+
+Configure short access-token lifetimes at your provider — minutes rather than hours —
+and let the refresh grant keep sessions alive. Clients refresh silently, so a short
+lifetime costs users nothing and bounds how long a revoked identity keeps working. This
+matters most in resource mode, where the access token is the credential being presented.
 
 ## A known limitation: `lore user info`
 

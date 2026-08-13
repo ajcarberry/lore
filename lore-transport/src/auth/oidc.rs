@@ -378,12 +378,21 @@ fn authorization_code(
 // Tokens
 // ---------------------------------------------------------------------------
 
-/// A token endpoint success response. Only the ID token and the refresh token matter here:
-/// the ID token is the credential a Lore server verifies, and the refresh token is what
-/// keeps the session alive.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+/// A token endpoint success response.
+///
+/// Which of the two tokens becomes the credential depends on the deployment: without a
+/// resource indicator it is the ID token, the only token OpenID Connect guarantees is a
+/// verifiable JWT; with one it is the access token, which is the token RFC 8707 lets a
+/// client bind to a particular resource server. The refresh token keeps the session alive
+/// either way.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 struct TokenResponse {
     id_token: String,
+    /// REQUIRED of a successful response by RFC 6749 §5.1, but optional here so a
+    /// provider that omits it produces this module's own diagnostic rather than a
+    /// deserialization error naming a field the operator has never heard of.
+    #[serde(default)]
+    access_token: Option<String>,
     #[serde(default)]
     refresh_token: Option<String>,
 }
@@ -412,29 +421,202 @@ struct IdTokenClaims {
     preferred_username: Option<String>,
 }
 
-/// Reads an ID token's claims without verifying its signature.
+/// Reads a JWT's claims without verifying its signature.
 ///
 /// Verification is the server's job, against the issuer's published key set. What the
-/// client needs from the payload is the `nonce` it has to compare and the identity it has
-/// to display, and it has just received the token over TLS from the token endpoint it
-/// found through a pinned discovery document.
-fn id_token_claims(id_token: &str) -> Result<IdTokenClaims, ProtocolError> {
-    let header = jsonwebtoken::decode_header(id_token)
-        .map_err(|e| ProtocolError::internal(format!("ID token header is not readable: {e}")))?;
+/// client needs from a payload is the `nonce` it has to compare, the identity it has to
+/// display, and the expiry the credential store keys on -- and it has just received the
+/// token over TLS from the token endpoint it found through a pinned discovery document.
+fn decode_unverified<T: serde::de::DeserializeOwned>(
+    token: &str,
+) -> Result<T, jsonwebtoken::errors::Error> {
+    let header = jsonwebtoken::decode_header(token)?;
 
     let mut validation = jsonwebtoken::Validation::new(header.alg);
     validation.insecure_disable_signature_validation();
     validation.validate_aud = false;
     validation.validate_exp = false;
     validation.validate_nbf = false;
+    // Nothing here is a security check, so a shape that omits a claim this client does
+    // not read must not be rejected on `jsonwebtoken`'s default required set.
+    validation.required_spec_claims.clear();
 
-    jsonwebtoken::decode::<IdTokenClaims>(
-        id_token,
+    jsonwebtoken::decode::<T>(
+        token,
         &jsonwebtoken::DecodingKey::from_secret(&[]),
         &validation,
     )
     .map(|data| data.claims)
-    .map_err(|e| ProtocolError::internal(format!("ID token claims are not readable: {e}")))
+}
+
+/// Reads an ID token's claims without verifying its signature.
+fn id_token_claims(id_token: &str) -> Result<IdTokenClaims, ProtocolError> {
+    decode_unverified(id_token)
+        .map_err(|e| ProtocolError::internal(format!("ID token claims are not readable: {e}")))
+}
+
+/// The form fields of one request to the provider's token or device authorization
+/// endpoint.
+type GrantForm = Vec<(&'static str, String)>;
+
+/// Appends the RFC 8707 resource indicator, when the deployment advertises one.
+///
+/// §2 puts the parameter on the authorization request *and* on the token request of every
+/// grant type, and a provider audience-restricts what it mints from what the request
+/// carried — so a form that omits it gets a token this deployment will refuse. Every form
+/// this module builds ends here for that reason, which is what makes "all five request
+/// kinds" a property of the code rather than of five separate memories.
+fn with_resource(mut form: GrantForm, parts: &AuthUrlParts) -> GrantForm {
+    if let Some(resource) = &parts.resource {
+        form.push(("resource", resource.clone()));
+    }
+    form
+}
+
+/// The device authorization request (RFC 8628 §3.1).
+fn device_authorization_form(parts: &AuthUrlParts) -> GrantForm {
+    with_resource(
+        vec![
+            ("client_id", parts.client_id.clone()),
+            ("scope", SCOPES.to_string()),
+        ],
+        parts,
+    )
+}
+
+/// The authorization-code exchange (RFC 6749 §4.1.3, with RFC 7636 §4.5's verifier).
+fn authorization_code_form(session: &PkceSession, code: &str) -> GrantForm {
+    with_resource(
+        vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code.to_string()),
+            ("redirect_uri", session.redirect_uri.clone()),
+            ("client_id", session.parts.client_id.clone()),
+            ("code_verifier", session.verifier.clone()),
+        ],
+        &session.parts,
+    )
+}
+
+/// One poll of an approved device code (RFC 8628 §3.4).
+fn device_token_form(parts: &AuthUrlParts, device_code: &str) -> GrantForm {
+    with_resource(
+        vec![
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+            ),
+            ("device_code", device_code.to_string()),
+            ("client_id", parts.client_id.clone()),
+        ],
+        parts,
+    )
+}
+
+/// The refresh grant (RFC 6749 §6).
+fn refresh_form(parts: &AuthUrlParts, refresh_token: &str) -> GrantForm {
+    with_resource(
+        vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token.to_string()),
+            ("client_id", parts.client_id.clone()),
+        ],
+        parts,
+    )
+}
+
+/// `aud` is a set, and providers differ over whether they collapse a single-element one to
+/// a bare string (OpenID Connect Core §2). Both encodings have to read.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum Audience {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Audience {
+    fn contains(&self, value: &str) -> bool {
+        match self {
+            Audience::One(one) => one == value,
+            Audience::Many(many) => many.iter().any(|entry| entry == value),
+        }
+    }
+}
+
+/// The claims an access token has to carry for this client to be able to tell whether it
+/// is the credential the server asked for.
+#[derive(Clone, Debug, Deserialize)]
+struct AccessTokenClaims {
+    exp: u64,
+    #[serde(default)]
+    aud: Option<Audience>,
+}
+
+/// Picks the access token out of a token response and checks it is the one a
+/// resource-bound deployment asked for, returning it with its expiry.
+///
+/// **This is a diagnostic, not a security control.** The Lore server verifies the token
+/// itself, against the issuer's published key set, and its verdict is the only one that
+/// decides anything. What this catches is a failure that is otherwise silent and badly
+/// timed: RFC 8707 puts a provider under no obligation to announce that it does not
+/// implement resource indicators, and one that ignores the parameter answers with an
+/// ordinary client-audienced token and a `200`. Without the check, `lore login` succeeds,
+/// stores a credential, prints a user name -- and then every repository operation is
+/// refused, with the cause two layers away and nothing in the login transcript pointing at
+/// it. PocketID 2.6.2 behaves exactly this way, which is how this came to be written.
+fn resource_bound_credential(
+    tokens: &TokenResponse,
+    resource: &str,
+) -> Result<(String, u64), ProtocolError> {
+    let access_token = tokens
+        .access_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::internal(format!(
+                "this Lore server requires an access token bound to '{resource}' \
+                 (RFC 8707), but the provider's token response carried none"
+            ))
+        })?;
+
+    let header = jsonwebtoken::decode_header(access_token).map_err(|e| {
+        ProtocolError::internal(format!(
+            "this Lore server requires an RFC 9068 JWT access token bound to \
+             '{resource}', but the provider issued an access token that is not a JWT \
+             at all: {e}"
+        ))
+    })?;
+    if !header.typ.as_deref().is_some_and(|typ| {
+        typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
+    }) {
+        return Err(ProtocolError::internal(format!(
+            "the provider issued an access token typed '{}' rather than the RFC 9068 \
+             'at+jwt', so this Lore server will refuse it -- the provider does not \
+             implement RFC 9068 access tokens",
+            header.typ.as_deref().unwrap_or("(absent)")
+        )));
+    }
+
+    let claims: AccessTokenClaims = decode_unverified(access_token).map_err(|e| {
+        ProtocolError::internal(format!("access token claims are not readable: {e}"))
+    })?;
+
+    // The parameter was sent on every request of this grant; an `aud` that does not name
+    // the resource means the provider ignored it rather than refused it, which is the
+    // case worth naming out loud.
+    if !claims
+        .aud
+        .as_ref()
+        .is_some_and(|aud| aud.contains(resource))
+    {
+        return Err(ProtocolError::internal(format!(
+            "the provider issued an access token whose audience is not '{resource}', so \
+             this Lore server will refuse it -- the provider appears to ignore the \
+             RFC 8707 'resource' parameter"
+        )));
+    }
+
+    Ok((access_token.to_string(), claims.exp))
 }
 
 /// Turns a token response into an [`AuthenticationToken`].
@@ -442,10 +624,15 @@ fn id_token_claims(id_token: &str) -> Result<IdTokenClaims, ProtocolError> {
 /// `expected_nonce` is `Some` for a login, where the ID token has to be tied to the
 /// authorization request that produced it, and `None` for a refresh, where OpenID Connect
 /// Core §12.2 makes the claim optional.
+///
+/// The ID token is always the *identity*: it is the assertion carrying `nonce` and the
+/// display claims, and it is what is checked here. What changes under a resource indicator
+/// is only which token is the *credential* -- the thing stored, presented, and refreshed
+/// on expiry -- because that is what the server verifies.
 fn authentication_token(
     tokens: TokenResponse,
     expected_nonce: Option<&str>,
-    issuer_domain: &str,
+    parts: &AuthUrlParts,
 ) -> Result<AuthenticationToken, ProtocolError> {
     let claims = id_token_claims(&tokens.id_token)?;
 
@@ -457,8 +644,13 @@ fn authentication_token(
         ));
     }
 
+    let (token, expires) = match parts.resource.as_deref() {
+        Some(resource) => resource_bound_credential(&tokens, resource)?,
+        None => (tokens.id_token, claims.exp),
+    };
+
     Ok(AuthenticationToken {
-        token: tokens.id_token,
+        token,
         user_id: claims.sub.clone(),
         // `name` and `preferred_username` are optional claims delivered with the `profile`
         // scope. Falling back to `sub` keeps a login from failing over a display string.
@@ -467,11 +659,11 @@ fn authentication_token(
             .or(claims.preferred_username)
             .unwrap_or(claims.sub),
         // Claims count seconds since the epoch; every other Lore timestamp is milliseconds.
-        expires_ms: claims.exp.saturating_mul(1000),
+        expires_ms: expires.saturating_mul(1000),
         // The party that issued the token already has it, so it can always go back there.
         // The orchestration layer adds the remote the login was performed against -- the
         // only layer that knows it.
-        acceptable_root_domains: vec![issuer_domain.to_string()],
+        acceptable_root_domains: vec![parts.issuer_domain.clone()],
         refresh_token: tokens.refresh_token,
     })
 }
@@ -905,6 +1097,12 @@ impl OidcAuthentication {
         parts: AuthUrlParts,
         discovery: Discovery,
     ) -> Result<AuthSession, ProtocolError> {
+        // The provider has no headless ceremony to offer, and there is no fallback worth
+        // pretending about: printing the authorization URL for the user to open elsewhere
+        // cannot complete, because the redirect goes to a loopback listener on *this*
+        // host. Saying so immediately, naming the missing capability and the way around
+        // it, is the whole of the right answer -- the wrong one is a poll loop waiting for
+        // a redirect that can never arrive.
         let endpoint = discovery
             .device_authorization_endpoint
             .clone()
@@ -912,19 +1110,15 @@ impl OidcAuthentication {
                 ProtocolError::from(NotSupported {
                     operation: format!(
                         "login without a browser against {}: the provider advertises no \
-                     device_authorization_endpoint",
+                         device_authorization_endpoint, so the device authorization grant \
+                         (RFC 8628) is unavailable. Log in from a host with a browser, \
+                         without --no-browser",
                         parts.issuer
                     ),
                 })
             })?;
 
-        let mut form = vec![
-            ("client_id", parts.client_id.clone()),
-            ("scope", SCOPES.to_string()),
-        ];
-        if let Some(resource) = &parts.resource {
-            form.push(("resource", resource.clone()));
-        }
+        let form = device_authorization_form(&parts);
 
         let client = http_client().await?;
         let (status, body) = send(client.post(&endpoint).form(&form)).await?;
@@ -1006,21 +1200,12 @@ impl OidcAuthentication {
         session: PkceSession,
         code: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
-        let mut form = vec![
-            ("grant_type", "authorization_code".to_string()),
-            ("code", code.to_string()),
-            ("redirect_uri", session.redirect_uri.clone()),
-            ("client_id", session.parts.client_id.clone()),
-            ("code_verifier", session.verifier.clone()),
-        ];
-        if let Some(resource) = &session.parts.resource {
-            form.push(("resource", resource.clone()));
-        }
+        let form = authorization_code_form(&session, code);
 
         let tokens = self
             .post_token_request(&session.token_endpoint, &form)
             .await?;
-        authentication_token(tokens, Some(&session.nonce), &session.parts.issuer_domain)
+        authentication_token(tokens, Some(&session.nonce), &session.parts)
     }
 
     /// Posts to the token endpoint and reads a success response.
@@ -1056,7 +1241,7 @@ impl OidcAuthentication {
     ) -> Result<Option<AuthenticationToken>, ProtocolError> {
         // The provider's interval is authoritative, whatever period the caller's own
         // polling loop runs at, so a poll that is not due yet does not reach the network.
-        let (token_endpoint, client_id, issuer_domain) = {
+        let (token_endpoint, parts) = {
             let mut sessions = self.sessions.lock();
             let Some(PendingSession::Device(session)) = sessions.get_mut(session_code) else {
                 return Err(ProtocolError::internal(
@@ -1068,21 +1253,10 @@ impl OidcAuthentication {
                 return Ok(None);
             }
             session.schedule.mark(now);
-            (
-                session.token_endpoint.clone(),
-                session.parts.client_id.clone(),
-                session.parts.issuer_domain.clone(),
-            )
+            (session.token_endpoint.clone(), session.parts.clone())
         };
 
-        let form = [
-            (
-                "grant_type",
-                "urn:ietf:params:oauth:grant-type:device_code".to_string(),
-            ),
-            ("device_code", session_code.to_string()),
-            ("client_id", client_id),
-        ];
+        let form = device_token_form(&parts, session_code);
 
         let client = http_client().await?;
         let (status, body) = send(client.post(&token_endpoint).form(&form)).await?;
@@ -1101,7 +1275,7 @@ impl OidcAuthentication {
                 self.sessions.lock().remove(session_code);
                 // RFC 8628 carries no nonce: there is no authorization request for one to
                 // have travelled on. The device code itself is the binding.
-                Ok(Some(authentication_token(tokens, None, &issuer_domain)?))
+                Ok(Some(authentication_token(tokens, None, &parts)?))
             }
             Err(e) => {
                 self.sessions.lock().remove(session_code);
@@ -1115,6 +1289,10 @@ impl OidcAuthentication {
     /// There is nothing to exchange it with and nothing to mint: the server authorizes a
     /// verified token for every repository, from its own configuration. The call shape
     /// survives, which is the seam the per-repository follow-up works at.
+    ///
+    /// The token is whichever credential the deployment uses -- an ID token, or an
+    /// RFC 9068 access token where a resource is advertised. Both carry `sub` and `exp`,
+    /// which is all this reads.
     fn passthrough(
         &self,
         auth_url: &str,
@@ -1205,21 +1383,14 @@ impl Authentication for OidcAuthentication {
         let parts = parse_auth_url(auth_url)?;
         let discovery = self.discover(&parts).await?;
 
-        let mut form = vec![
-            ("grant_type", "refresh_token".to_string()),
-            ("refresh_token", refresh_token.to_string()),
-            ("client_id", parts.client_id.clone()),
-        ];
-        if let Some(resource) = &parts.resource {
-            form.push(("resource", resource.clone()));
-        }
+        let form = refresh_form(&parts, refresh_token);
 
         let tokens = self
             .post_token_request(&discovery.token_endpoint, &form)
             .await?;
         // OpenID Connect Core §12.2 makes `nonce` optional on a refreshed ID token, and the
         // original request's nonce did not outlive the process that sent it.
-        authentication_token(tokens, None, &parts.issuer_domain)
+        authentication_token(tokens, None, &parts)
     }
 
     async fn exchange_for_repository(
@@ -1286,9 +1457,14 @@ mod tests {
     /// A JWT with the given claims and a signature nothing checks -- which is exactly the
     /// shape the client reads, since the server owns verification.
     fn unsigned_jwt(claims: &str) -> String {
+        unsigned_jwt_typed("JWT", claims)
+    }
+
+    /// As [`unsigned_jwt`], with the `typ` header the resource-mode checks read.
+    fn unsigned_jwt_typed(typ: &str, claims: &str) -> String {
         format!(
             "{}.{}.{}",
-            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+            URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"RS256","typ":"{typ}"}}"#)),
             URL_SAFE_NO_PAD.encode(claims),
             URL_SAFE_NO_PAD.encode("not-a-signature"),
         )
@@ -1602,8 +1778,9 @@ mod tests {
         let tokens = TokenResponse {
             id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1000,"nonce":"another-nonce"}"#),
             refresh_token: None,
+            ..Default::default()
         };
-        authentication_token(tokens, Some("the-nonce"), "id.example.com")
+        authentication_token(tokens, Some("the-nonce"), &parts())
             .expect_err("a replayed token from another exchange must not be accepted");
     }
 
@@ -1612,8 +1789,9 @@ mod tests {
         let tokens = TokenResponse {
             id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#),
             refresh_token: None,
+            ..Default::default()
         };
-        authentication_token(tokens, Some("the-nonce"), "id.example.com")
+        authentication_token(tokens, Some("the-nonce"), &parts())
             .expect_err("a login's ID token has to echo the nonce that was sent");
     }
 
@@ -1625,8 +1803,9 @@ mod tests {
         let tokens = TokenResponse {
             id_token: id_token.clone(),
             refresh_token: Some("the-refresh-token".to_string()),
+            ..Default::default()
         };
-        let token = authentication_token(tokens, Some("the-nonce"), "id.example.com")
+        let token = authentication_token(tokens, Some("the-nonce"), &parts())
             .expect("the token should be accepted");
 
         assert_eq!(token.token, id_token, "the ID token is the credential");
@@ -1644,17 +1823,17 @@ mod tests {
         let tokens = TokenResponse {
             id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1,"preferred_username":"ada"}"#),
             refresh_token: None,
+            ..Default::default()
         };
-        let token =
-            authentication_token(tokens, None, "id.example.com").expect("should be accepted");
+        let token = authentication_token(tokens, None, &parts()).expect("should be accepted");
         assert_eq!(token.user_name, "ada");
 
         let tokens = TokenResponse {
             id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1}"#),
             refresh_token: None,
+            ..Default::default()
         };
-        let token =
-            authentication_token(tokens, None, "id.example.com").expect("should be accepted");
+        let token = authentication_token(tokens, None, &parts()).expect("should be accepted");
         assert_eq!(token.user_name, "user-1");
     }
 
@@ -1663,13 +1842,325 @@ mod tests {
         let tokens = TokenResponse {
             id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#),
             refresh_token: Some("rotated".to_string()),
+            ..Default::default()
         };
-        let token = authentication_token(tokens, None, "id.example.com")
-            .expect("refresh should be accepted");
+        let token =
+            authentication_token(tokens, None, &parts()).expect("refresh should be accepted");
         assert_eq!(token.user_id, "user-1");
     }
 
+    // -- Resource indicators (RFC 8707) and access tokens (RFC 9068) --------
+
+    /// A deployment that names itself gets the `resource` parameter on every grant
+    /// request and presents the access token the provider audience-restricted to it.
+    mod resource_mode {
+        use super::*;
+
+        const RESOURCE: &str = "https://lore.example.com";
+
+        fn resource_parts() -> AuthUrlParts {
+            AuthUrlParts {
+                resource: Some(RESOURCE.to_string()),
+                ..parts()
+            }
+        }
+
+        fn access_token(aud: &str) -> String {
+            unsigned_jwt_typed(
+                "at+jwt",
+                &format!(
+                    r#"{{"sub":"user-1","exp":2000,"aud":"{aud}","client_id":"lore","iat":1,"jti":"j"}}"#
+                ),
+            )
+        }
+
+        fn tokens_for(access_token: Option<String>) -> TokenResponse {
+            TokenResponse {
+                id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1000,"name":"Ada Lovelace"}"#),
+                access_token,
+                refresh_token: Some("the-refresh-token".to_string()),
+            }
+        }
+
+        // -- The parameter reaches all five request kinds -------------------
+
+        /// 1 of 5: the authorization request. Already covered by
+        /// `authorization_url_forwards_a_resource_indicator`; asserted here too so the
+        /// five kinds read as one set rather than being scattered.
+        #[test]
+        fn the_authorization_request_carries_the_resource() {
+            let url = authorization_url(
+                &discovery(),
+                &resource_parts(),
+                "http://127.0.0.1:49152/callback",
+                "s",
+                "n",
+                "c",
+            )
+            .expect("builds");
+            let url = Url::parse(&url).expect("a URL");
+            let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(query.get("resource").map(String::as_str), Some(RESOURCE));
+        }
+
+        /// A PKCE session standing in for one `start_pkce` produced, so the
+        /// authorization-code form can be built without a live provider.
+        fn pkce_session(parts: AuthUrlParts) -> PkceSession {
+            let (_sender, receiver) = oneshot::channel();
+            PkceSession {
+                parts,
+                token_endpoint: "https://id.example.com/token".to_string(),
+                verifier: "the-verifier".to_string(),
+                state: "the-state".to_string(),
+                nonce: "the-nonce".to_string(),
+                redirect_uri: "http://127.0.0.1:49152/callback".to_string(),
+                redirect: receiver,
+            }
+        }
+
+        fn sent_resource(form: &GrantForm) -> Option<&str> {
+            form.iter()
+                .find(|(key, _)| *key == "resource")
+                .map(|(_, value)| value.as_str())
+        }
+
+        /// Kinds 2 through 5 of the five: the authorization-code exchange, the device
+        /// authorization request, the device token poll, and the refresh grant. Every
+        /// form the module sends to a provider is built by one of these four functions,
+        /// so asserting over all of them is what makes "on every grant request" checked
+        /// rather than claimed. (Kind 1, the authorization request, is a URL rather than
+        /// a form and is asserted above.)
+        #[test]
+        fn every_grant_form_carries_the_resource() {
+            let parts = resource_parts();
+            let forms = [
+                authorization_code_form(&pkce_session(parts.clone()), "the-code"),
+                device_authorization_form(&parts),
+                device_token_form(&parts, "the-device-code"),
+                refresh_form(&parts, "the-refresh-token"),
+            ];
+
+            for form in &forms {
+                assert_eq!(
+                    sent_resource(form),
+                    Some(RESOURCE),
+                    "a grant request without the resource gets a token this server \
+                     refuses: {form:?}"
+                );
+            }
+        }
+
+        /// And none of them carries it when the deployment advertises none, which is what
+        /// keeps this opt-in from touching an existing deployment's requests at all.
+        #[test]
+        fn no_grant_form_carries_a_resource_when_none_is_advertised() {
+            let parts = parts();
+            let forms = [
+                authorization_code_form(&pkce_session(parts.clone()), "the-code"),
+                device_authorization_form(&parts),
+                device_token_form(&parts, "the-device-code"),
+                refresh_form(&parts, "the-refresh-token"),
+            ];
+
+            for form in &forms {
+                assert_eq!(sent_resource(form), None, "unchanged behavior: {form:?}");
+            }
+        }
+
+        /// The forms still carry what they carried before, so routing them through one
+        /// helper did not quietly drop a field.
+        #[test]
+        fn the_grant_forms_keep_their_own_parameters() {
+            let parts = resource_parts();
+            let code_form = authorization_code_form(&pkce_session(parts.clone()), "the-code");
+            assert!(code_form.contains(&("grant_type", "authorization_code".to_string())));
+            assert!(code_form.contains(&("code", "the-code".to_string())));
+            assert!(code_form.contains(&("code_verifier", "the-verifier".to_string())));
+            assert!(code_form.contains(&(
+                "redirect_uri",
+                "http://127.0.0.1:49152/callback".to_string()
+            )));
+
+            let device_form = device_token_form(&parts, "the-device-code");
+            assert!(device_form.contains(&(
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:device_code".to_string()
+            )));
+            assert!(device_form.contains(&("device_code", "the-device-code".to_string())));
+
+            assert!(
+                refresh_form(&parts, "rt").contains(&("grant_type", "refresh_token".to_string()))
+            );
+            assert!(device_authorization_form(&parts).contains(&("scope", SCOPES.to_string())));
+        }
+
+        // -- Which token is presented ---------------------------------------
+
+        /// The switch this mode exists for: the credential stored and presented becomes
+        /// the access token, and its expiry — not the ID token's — is what the credential
+        /// store counts down.
+        #[test]
+        fn the_access_token_becomes_the_credential() {
+            let access = access_token(RESOURCE);
+            let token =
+                authentication_token(tokens_for(Some(access.clone())), None, &resource_parts())
+                    .expect("a resource-bound access token is accepted");
+
+            assert_eq!(token.token, access, "the access token is the credential");
+            assert_eq!(
+                token.expires_ms, 2_000_000,
+                "the credential's own expiry governs refresh, not the ID token's"
+            );
+            // The ID token is still the identity assertion.
+            assert_eq!(token.user_id, "user-1");
+            assert_eq!(token.user_name, "Ada Lovelace");
+            assert_eq!(token.acceptable_root_domains, vec!["id.example.com"]);
+        }
+
+        /// And without a resource nothing moves: the ID token is still the credential.
+        #[test]
+        fn the_id_token_stays_the_credential_without_a_resource() {
+            let tokens = tokens_for(Some(access_token(RESOURCE)));
+            let id_token = tokens.id_token.clone();
+            let token = authentication_token(tokens, None, &parts()).expect("unchanged behavior");
+
+            assert_eq!(token.token, id_token);
+            assert_eq!(token.expires_ms, 1_000_000);
+        }
+
+        /// The nonce is checked against the ID token even when the access token is what
+        /// gets presented — the ID token is the only one that carries it.
+        #[test]
+        fn the_nonce_is_still_checked_against_the_id_token() {
+            let tokens = TokenResponse {
+                id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1000,"nonce":"another"}"#),
+                access_token: Some(access_token(RESOURCE)),
+                refresh_token: None,
+            };
+            authentication_token(tokens, Some("the-nonce"), &resource_parts())
+                .expect_err("a replayed identity assertion is refused whatever is presented");
+        }
+
+        // -- The provider that ignores the parameter ------------------------
+
+        /// PocketID 2.6.2's behavior, verified against the live instance on 2026-08-13:
+        /// `resource` is accepted with a `200` on both the device authorization and token
+        /// requests, silently ignored, and the access token comes back audienced to the
+        /// client id with `typ: "JWT"`. Failing here names the cause; not failing here
+        /// means a successful login followed by uniformly denied requests.
+        #[test]
+        fn a_provider_that_ignores_the_resource_parameter_is_named() {
+            let ignored = unsigned_jwt_typed(
+                "JWT",
+                r#"{"sub":"user-1","exp":2000,"aud":["lore"],"jti":"j"}"#,
+            );
+            let error = authentication_token(tokens_for(Some(ignored)), None, &resource_parts())
+                .expect_err("a client-audienced token is not what was asked for");
+
+            assert!(
+                error.to_string().contains("at+jwt"),
+                "the message has to name what the provider did not do, got: {error}"
+            );
+        }
+
+        /// A provider that implements RFC 9068 but not RFC 8707 gets its own message,
+        /// because the fix is a different one.
+        #[test]
+        fn an_access_token_for_another_audience_is_refused() {
+            let error = authentication_token(
+                tokens_for(Some(access_token("https://lore.other.example.com"))),
+                None,
+                &resource_parts(),
+            )
+            .expect_err("an access token audienced elsewhere will not verify");
+
+            assert!(
+                error.to_string().contains("resource"),
+                "the message has to name the resource parameter, got: {error}"
+            );
+        }
+
+        #[test]
+        fn a_missing_access_token_is_refused() {
+            let error = authentication_token(tokens_for(None), None, &resource_parts())
+                .expect_err("there is no credential to present");
+            assert!(error.to_string().contains("RFC 8707"), "got: {error}");
+        }
+
+        #[test]
+        fn an_opaque_access_token_is_refused() {
+            let tokens = tokens_for(Some("an-opaque-string".to_string()));
+            let error = authentication_token(tokens, None, &resource_parts())
+                .expect_err("an opaque access token cannot be an RFC 9068 one");
+            assert!(error.to_string().contains("not a JWT"), "got: {error}");
+        }
+
+        /// An array audience containing the resource is the encoding PocketID and others
+        /// use, so it has to satisfy the check as readily as the bare string.
+        #[test]
+        fn an_array_audience_containing_the_resource_is_accepted() {
+            let access = unsigned_jwt_typed(
+                "at+jwt",
+                &format!(r#"{{"sub":"u","exp":2000,"aud":["other","{RESOURCE}"]}}"#),
+            );
+            authentication_token(tokens_for(Some(access)), None, &resource_parts())
+                .expect("membership, not equality");
+        }
+
+        /// Both spellings of the RFC 9068 media type, case-insensitively — the same rule
+        /// the server applies, since the point of the client check is to predict the
+        /// server's verdict rather than to invent a stricter one.
+        #[test]
+        fn both_spellings_of_the_media_type_are_accepted() {
+            for typ in ["at+jwt", "application/at+jwt", "AT+JWT"] {
+                let access = unsigned_jwt_typed(
+                    typ,
+                    &format!(r#"{{"sub":"u","exp":2000,"aud":"{RESOURCE}"}}"#),
+                );
+                authentication_token(tokens_for(Some(access)), None, &resource_parts())
+                    .unwrap_or_else(|e| panic!("typ '{typ}' must be accepted: {e}"));
+            }
+        }
+    }
+
     // -- The device grant --------------------------------------------------
+
+    /// A provider with no device authorization endpoint has no headless ceremony, and
+    /// there is no fallback: the browser flow's redirect goes to a loopback listener on
+    /// this host, so printing its URL for another device cannot complete. The answer is
+    /// an immediate, typed refusal naming the missing capability — never a poll loop
+    /// waiting on a redirect that can never arrive.
+    #[tokio::test]
+    async fn no_browser_login_against_a_provider_without_the_device_grant_fails_cleanly() {
+        let auth = OidcAuthentication::default();
+        let discovery = parse_discovery(
+            r#"{"issuer":"https://id.example.com",
+                "authorization_endpoint":"https://id.example.com/authorize",
+                "token_endpoint":"https://id.example.com/token"}"#,
+            "https://id.example.com",
+        )
+        .expect("discovery should parse");
+        assert_eq!(discovery.device_authorization_endpoint, None);
+
+        let error = auth
+            .start_device(parts(), discovery)
+            .await
+            .expect_err("there is no headless ceremony to run");
+
+        assert!(
+            error.is_not_supported(),
+            "the CLI has to be able to tell this from a transport failure, got: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("device_authorization_endpoint"),
+            "the message must name the missing capability, got: {message}"
+        );
+        assert!(
+            message.contains("browser"),
+            "the message must say what to do instead, got: {message}"
+        );
+    }
 
     #[test]
     fn device_login_url_prefers_the_complete_verification_uri() {

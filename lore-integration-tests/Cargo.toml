@@ -39,5 +39,8 @@ lore-server = { workspace = true, features = ["integration_tests"] }
 uuid = { workspace = true }
 
 [features]
-integration_tests = []
+# `oidc_auth_test.rs` needs a raw tonic client to attach an arbitrary bearer token, which
+# no `Authentication` scheme implementation can do yet — so this feature now carries the
+# same optional deps `grpc_integration_tests` does, rather than requiring both features.
+integration_tests = ["dep:tokio-stream", "dep:tonic"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]

@@ -1,15 +1,14 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
-"""End-to-end coverage for OIDC-secured Lore servers (OBJ-2).
+"""End-to-end coverage for OIDC-secured Lore servers.
 
 Spawns a dedicated `loreserver` configured with `[server.auth.oidc]` against
 the shared PocketID fixture (`pocket_id.py`) on its own ports, then drives the
 real `lore` CLI through both login flows and a repository operation. This
-proves the whole chain end to end -- including the exchange-path fix in
+proves the whole chain end to end, including `exchange_for_repository` in
 `lore-transport/src/auth/exchange.rs`:
-`test_authenticated_repository_operation_succeeds` below is the test that
-fails without it, because it is the first op after login that calls
-`exchange_for_repository` rather than the login path P5 already fixed.
+`test_authenticated_repository_operation_succeeds` below is the first op
+after login to call it, rather than the login path.
 
 The PKCE browser flow opens a real browser, which this suite cannot drive.
 Its live-provider coverage lives in

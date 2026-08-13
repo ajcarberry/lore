@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # Must match the port published for `pocket-id` in lore-integration-tests/compose.yaml.
 POCKET_ID_URL = os.getenv("LORE_TEST_POCKET_ID_URL", "http://127.0.0.1:1411")
 
-# NOTE: this is just hardcoded in lore-integration-tests/compose.yaml as STATIC_API_KEY.
+# Hardcoded in lore-integration-tests/compose.yaml as STATIC_API_KEY.
 STATIC_API_KEY = "lorelocaltestapikeylorelocaltestapikey"
 
 # PocketID accepts a caller-chosen client id, so this stays stable across runs and
@@ -62,10 +62,6 @@ class PocketIdClient:
     def __init__(self, base_url: str = POCKET_ID_URL, api_key: str = STATIC_API_KEY):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-
-    # -----------------------------------------------------------------------
-    # Transport
-    # -----------------------------------------------------------------------
 
     def _request(
         self,
@@ -106,10 +102,6 @@ class PocketIdClient:
             raise PocketIdError(
                 f"{method} {path} failed with {e.code}: {detail}"
             ) from e
-
-    # -----------------------------------------------------------------------
-    # Readiness and provisioning
-    # -----------------------------------------------------------------------
 
     def wait_until_ready(self, retries: int = 30, delay: float = 1.0) -> None:
         """Poll /healthz until the container serves. Compose's healthcheck already
@@ -187,10 +179,6 @@ class PocketIdClient:
         )
         logger.info("Provisioned PocketID user %s (%s)", username, user["id"])
         return user
-
-    # -----------------------------------------------------------------------
-    # Login and token issuance
-    # -----------------------------------------------------------------------
 
     def login(self, user: dict) -> str:
         """Log `user` in without a passkey and return the session cookie header value.
@@ -289,10 +277,6 @@ class PocketIdClient:
             "/api/oidc/device/verify?code=" + urllib.parse.quote(user_code),
             headers={"Cookie": session_cookie},
         )
-
-    # -----------------------------------------------------------------------
-    # Verification
-    # -----------------------------------------------------------------------
 
     def validate_token(self, token: str, audience: str = TEST_CLIENT_ID) -> dict:
         """Verify a token's RS256 signature against the issuer's published JWKS and

@@ -279,10 +279,10 @@ pub async fn interactive(
     let client_state = Uuid::new_v4().to_string();
     lore_debug!("ClientState {}", client_state);
 
-    // 2. Start auth session via the Authentication implementation. `--no-browser` is what
-    //    the implementation needs to select a ceremony that can complete without one: the
-    //    OIDC implementation runs the device authorization grant instead of a loopback
-    //    redirect. An implementation with one ceremony ignores it.
+    // 2. Start auth session via the Authentication implementation. `--no-browser`
+    //    selects a login ceremony that can finish without one: the OIDC
+    //    implementation runs the device authorization grant instead of a loopback
+    //    redirect. An implementation with a single ceremony ignores it.
     let flow = if no_browser {
         LoginFlow::NoBrowser
     } else {
@@ -378,8 +378,8 @@ fn acceptable_root_domains(
         return Ok(decoded_token.claims.acceptable_root_domains());
     }
 
-    // The remote is added rather than checked for, so the guard holds for it by
-    // construction instead of by a check that could disagree with what gets stored.
+    // Added rather than checked for, so the invariant holds by construction and
+    // can't drift from what gets stored.
     let mut domains = authn.acceptable_root_domains.clone();
     if !domains.iter().any(|domain| domain == remote_domain) {
         domains.push(remote_domain.to_string());

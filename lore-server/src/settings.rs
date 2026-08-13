@@ -205,12 +205,11 @@ fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigErro
     Ok(())
 }
 
-/// `[server.auth.oidc]` offers exactly one authorization mode, and it is a coarse
-/// one: an operator has to write down that they want it. `authorize_all_repositories`
-/// has no default, so a configured block that omits it, or sets it to `false`, fails
-/// here rather than starting a server that verifies every token and then refuses
-/// every request (or, the other way, granting every repository to every
-/// authenticated identity on the strength of an omission).
+/// `[server.auth.oidc]` offers exactly one authorization mode: a verified token
+/// authorizes every repository on the server. `authorize_all_repositories` has
+/// no default, so a configured block that omits it, or sets it to `false`,
+/// fails here rather than starting a server that verifies every token and then
+/// refuses every request.
 fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> {
     let Some(oidc) = settings
         .server
@@ -754,8 +753,8 @@ mod tests {
             }
 
             /// RFC 8707 §2: "Its value MUST be an absolute URI". A bare hostname
-            /// is the mistake worth catching, because it is what an operator
-            /// writes when they read `resource` as "a name for this server".
+            /// is what an operator writes when they read `resource` as a name
+            /// for this server rather than a URI.
             #[test]
             fn a_relative_reference_is_rejected() {
                 for resource in ["lore.example.com", "/lore", ""] {
@@ -781,8 +780,6 @@ mod tests {
                     .expect("§2 permits a query component where it is necessary");
             }
 
-            /// And the rule is actually reached from a real configuration, not
-            /// only callable on its own.
             #[test]
             fn a_malformed_resource_fails_startup_validation() {
                 const CONFIG: &str = r#"

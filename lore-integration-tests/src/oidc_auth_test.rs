@@ -1,22 +1,21 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Red integration tests for OBJ-1 (secured server mode) and OBJ-4 (provider-in-the-loop
-//! proof) of `.claude/mission/spec.md`, written before the server-side implementation
-//! (P4) exists.
+//! Integration tests for OIDC-secured server mode, exercised against a real PocketID
+//! instance.
 //!
 //! A real `JwtVerifier` (`lore_server::auth::jwt`) is pointed at the PocketID instance in
 //! `lore-integration-tests/compose.yaml`, following the discovery document rather than a
 //! hardcoded JWKS path, and wired into an in-process gRPC or HTTP server the same way
-//! `storage_remote_test.rs` and `presign_test.rs` do for an unauthenticated one. No server
-//! config knob for OIDC exists yet, so the verifier is built by hand here; P4 is expected
-//! to make it possible to build the identical `JwtVerifier` from `[server.auth.oidc]`.
+//! `storage_remote_test.rs` and `presign_test.rs` do for an unauthenticated one. The
+//! verifier is built by hand here rather than through `build_jwt_verifier`
+//! (`lore-server/src/server.rs`), which builds the identical verifier from
+//! `[server.auth.oidc]`.
 //!
 //! Raw generated gRPC clients are needed to attach an arbitrary bearer token to a request,
-//! which the higher-level `lore::storage` API cannot do without a client-side OIDC
-//! `Authentication` implementation (P5, not built yet). That need pulls in the `tonic`
-//! crate, so `integration_tests` now activates the same optional `tonic`/`tokio-stream`
-//! dependencies `grpc_integration_tests` does (see `Cargo.toml`) — the whole matrix below
-//! runs under `integration_tests` alone.
+//! which the higher-level `lore::storage` API does not support directly. That need pulls
+//! in the `tonic` crate, so `integration_tests` now activates the same optional
+//! `tonic`/`tokio-stream` dependencies `grpc_integration_tests` does (see `Cargo.toml`) —
+//! the whole matrix below runs under `integration_tests` alone.
 
 #[cfg(all(test, feature = "integration_tests"))]
 mod oidc_auth_tests {
@@ -68,10 +67,8 @@ mod oidc_auth_tests {
         (backend_immutable, backend_mutable)
     }
 
-    /// A `JwtVerifier` pointed at PocketID's real JWKS, discovered rather than hardcoded —
-    /// the same discovery step P4's server start-up is expected to perform. There is no
-    /// `[server.auth.oidc]` config knob yet to build this from, so it is assembled by hand
-    /// from the pieces the LEP names: `issuer`, `jwks_uri`, and `client_id` as the audience.
+    /// A `JwtVerifier` pointed at PocketID's real JWKS, discovered rather than hardcoded,
+    /// assembled directly from `issuer`, `jwks_uri`, and `client_id` as the audience.
     async fn oidc_jwt_verifier(
         fixture: &oidc_common::OidcFixture,
         audience: &str,
@@ -88,8 +85,8 @@ mod oidc_auth_tests {
 
         // `[server.auth.oidc]`'s authn-only mode — the premise this whole matrix
         // tests against — is what `JwtVerifier::oidc` builds; `build_jwt_verifier`
-        // (P4, `lore-server/src/server.rs`) builds the identical verifier from
-        // real settings via the same constructor.
+        // (`lore-server/src/server.rs`) builds the identical verifier from real
+        // settings via the same constructor.
         Ok(JwtVerifier::oidc(
             jwk_service,
             Some(fixture.issuer().to_string()),
@@ -254,17 +251,12 @@ mod oidc_auth_tests {
         Ok(())
     }
 
-    /// EXPECTED RED. The accepted LEP's authn-only mode (`[server.auth.oidc]`'s
+    /// The accepted LEP's authn-only mode (`[server.auth.oidc]`'s
     /// `authorize_all_repositories`, required with no default) has `JwtVerifier` populate
     /// the existing `urc-*` wildcard resource onto the in-process `AuthorizationToken` once
-    /// a token verifies against the trusted issuer — `verify_authorization` itself does not
-    /// change. Today nothing populates it, and — a deeper reason the LEP's Motivation
-    /// names — the claim decode in `verify_token_internal` requires Lore-specific `env`,
-    /// `name`, and `preferred_username` fields a conformant ID token does not carry, so a
-    /// verified, correctly-audienced PocketID token is refused before the wildcard could
-    /// even be attached. This test asserts the desired end behavior only, not either
-    /// mechanism, so it stays meaningful however P4 implements the third claim decode and
-    /// the wildcard population.
+    /// a token verifies against the trusted issuer; `verify_authorization` itself does not
+    /// change. This test asserts only that end behavior, not the verification or
+    /// claim-decode mechanism that produces it.
     #[tokio::test]
     async fn http_valid_pocketid_token_is_accepted_for_repository_operations() -> TestResult {
         let fixture = oidc_common::setup().await?;
@@ -557,10 +549,10 @@ mod oidc_auth_tests {
     }
 
     /// A self-signed forgery naming a key id PocketID never served and an issuer PocketID
-    /// never claimed. The harness has only one real identity provider, so this is the
-    /// stand-in the packet allows for "a token from a second provider": whatever the
-    /// verifier's actual rejection reason, the signing key can never be found in the real
-    /// JWKS this server was pointed at.
+    /// never claimed. The harness has only one real identity provider, so this stands in
+    /// for "a token from a second provider": whatever the verifier's actual rejection
+    /// reason, the signing key can never be found in the real JWKS this server was pointed
+    /// at.
     fn forged_token_with_unknown_kid() -> String {
         use jsonwebtoken::Algorithm;
         use jsonwebtoken::EncodingKey;
@@ -587,13 +579,11 @@ mod oidc_auth_tests {
         .expect("encode forged token")
     }
 
-    /// The quirk P2 flagged for P4: PocketID emits `aud` as a JSON array
-    /// (`["<client_id>"]`), not a bare string. This test is GREEN today, not red —
+    /// PocketID emits `aud` as a JSON array (`["<client_id>"]`), not a bare string.
     /// `#[serde_as(as = "OneOrMany<_, PreferMany>")]` on `AuthorizationToken::audience`
-    /// already accepts it. It stays in the suite as the assertion that answers the question
-    /// on its own: isolated from the RED test above, which fails for a different reason
-    /// entirely (the mandatory `env`/`name`/`preferred_username` claims, not the `aud`
-    /// shape) by supplying those fields here so this test is about exactly one thing.
+    /// already accepts it. Supplying `env`/`name`/`preferred_username` here isolates the
+    /// `aud`-shape question from the mandatory-claims question, so this test is about
+    /// exactly one thing.
     #[test]
     fn pocketid_style_array_audience_deserializes_into_authorization_token() {
         let claims = serde_json::json!({
@@ -714,8 +704,8 @@ mod oidc_auth_grpc_tests {
 
         // `[server.auth.oidc]`'s authn-only mode — the premise this whole matrix
         // tests against — is what `JwtVerifier::oidc` builds; `build_jwt_verifier`
-        // (P4, `lore-server/src/server.rs`) builds the identical verifier from
-        // real settings via the same constructor.
+        // (`lore-server/src/server.rs`) builds the identical verifier from real
+        // settings via the same constructor.
         Ok(JwtVerifier::oidc(
             jwk_service,
             Some(fixture.issuer().to_string()),
@@ -809,7 +799,7 @@ mod oidc_auth_grpc_tests {
 
         // `lore_transport::grpc::PARTITION_ID_KEY` — inlined rather than imported, since
         // `lore-transport` is not a dependency of this crate and pulling it in for one
-        // constant is out of this packet's file scope.
+        // constant is not worth the dependency.
         const PARTITION_ID_KEY: &str = "lore-partition-bin";
         let repository = lore_base::types::Partition::from([0xacu8; 16]);
         let repository_id = MetadataValue::from_bytes(repository.data());
@@ -910,9 +900,9 @@ mod oidc_auth_grpc_tests {
         Ok(())
     }
 
-    /// EXPECTED RED — see `http_valid_pocketid_token_is_accepted_for_repository_operations`
-    /// for the mechanism (the LEP's wildcard-resource population, and the deeper
-    /// mandatory-claim gap that fires first).
+    /// Same wildcard-resource-population behavior as
+    /// `http_valid_pocketid_token_is_accepted_for_repository_operations`, exercised over
+    /// gRPC.
     #[tokio::test]
     async fn grpc_valid_pocketid_token_is_accepted_for_storage_operations() -> TestResult {
         let fixture = oidc_common::setup().await?;

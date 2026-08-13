@@ -101,10 +101,6 @@ const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 /// characters, the minimum RFC 7636 §4.1 allows for a verifier.
 const RANDOM_BYTES: usize = 32;
 
-// ---------------------------------------------------------------------------
-// The advertised auth URL
-// ---------------------------------------------------------------------------
-
 /// What the advertised auth URL says about the provider.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AuthUrlParts {
@@ -198,10 +194,6 @@ fn is_loopback(host: Option<Host<&str>>) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Discovery
-// ---------------------------------------------------------------------------
-
 /// The members of the discovery document this client uses. The server reads its own copy for
 /// `jwks_uri`; nothing is relayed between them, so neither can serve the other a stale
 /// endpoint.
@@ -238,10 +230,6 @@ fn parse_discovery(body: &str, expected_issuer: &str) -> Result<Discovery, Proto
 
     Ok(discovery)
 }
-
-// ---------------------------------------------------------------------------
-// PKCE
-// ---------------------------------------------------------------------------
 
 /// A fresh code verifier: 32 random bytes, base64url without padding, which is 43
 /// characters drawn from the unreserved set RFC 7636 §4.1 requires.
@@ -373,10 +361,6 @@ fn authorization_code(
             ProtocolError::internal("authorization response carries neither a code nor an error")
         })
 }
-
-// ---------------------------------------------------------------------------
-// Tokens
-// ---------------------------------------------------------------------------
 
 /// A token endpoint success response.
 ///
@@ -563,7 +547,7 @@ struct AccessTokenClaims {
 /// ordinary client-audienced token and a `200`. Without the check, `lore login` succeeds,
 /// stores a credential, prints a user name -- and then every repository operation is
 /// refused, with the cause two layers away and nothing in the login transcript pointing at
-/// it. PocketID 2.6.2 behaves exactly this way, which is how this came to be written.
+/// it. PocketID 2.6.2 behaves exactly this way.
 fn resource_bound_credential(
     tokens: &TokenResponse,
     resource: &str,
@@ -667,10 +651,6 @@ fn authentication_token(
         refresh_token: tokens.refresh_token,
     })
 }
-
-// ---------------------------------------------------------------------------
-// The device authorization grant
-// ---------------------------------------------------------------------------
 
 /// A device authorization response (RFC 8628 §3.2).
 #[derive(Clone, Debug, Deserialize)]
@@ -798,10 +778,6 @@ impl PollSchedule {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The loopback redirect
-// ---------------------------------------------------------------------------
-
 /// A listener on `127.0.0.1:0` waiting for one authorization response.
 struct LoopbackRedirect {
     port: u16,
@@ -927,10 +903,6 @@ async fn read_request_target(stream: &mut TcpStream) -> Result<String, String> {
         .ok_or_else(|| format!("redirect request start line is malformed: '{line}'"))
 }
 
-// ---------------------------------------------------------------------------
-// HTTP
-// ---------------------------------------------------------------------------
-
 /// The pooled HTTP client, built on the net runtime.
 ///
 /// Pooled because a login makes several requests to the same provider -- discovery, then
@@ -992,10 +964,6 @@ async fn send(request: reqwest::RequestBuilder) -> Result<(StatusCode, String), 
     .await
     .map_err(|e| ProtocolError::internal(format!("provider request task: {e}")))?
 }
-
-// ---------------------------------------------------------------------------
-// The implementation
-// ---------------------------------------------------------------------------
 
 /// A login this process started and is polling for.
 enum PendingSession {
@@ -1097,12 +1065,11 @@ impl OidcAuthentication {
         parts: AuthUrlParts,
         discovery: Discovery,
     ) -> Result<AuthSession, ProtocolError> {
-        // The provider has no headless ceremony to offer, and there is no fallback worth
-        // pretending about: printing the authorization URL for the user to open elsewhere
-        // cannot complete, because the redirect goes to a loopback listener on *this*
-        // host. Saying so immediately, naming the missing capability and the way around
-        // it, is the whole of the right answer -- the wrong one is a poll loop waiting for
-        // a redirect that can never arrive.
+        // The provider has no headless ceremony, and there is no fallback: the browser
+        // flow's redirect goes to a loopback listener on *this* host, so an authorization
+        // URL for another device to open could never complete. This fails immediately and
+        // names the missing capability, rather than polling for a redirect that can never
+        // arrive.
         let endpoint = discovery
             .device_authorization_endpoint
             .clone()
@@ -1483,8 +1450,6 @@ mod tests {
         parse_discovery(DISCOVERY_JSON, "https://id.example.com").expect("discovery should parse")
     }
 
-    // -- PKCE ---------------------------------------------------------------
-
     /// RFC 7636 Appendix B's worked example. Getting the challenge derivation wrong is
     /// silent -- the provider simply refuses every exchange -- so it is pinned to the
     /// specification's own vector rather than to this code's output.
@@ -1512,8 +1477,6 @@ mod tests {
         );
         assert_ne!(verifier, code_verifier(), "verifier is not random");
     }
-
-    // -- The advertised auth URL -------------------------------------------
 
     #[test]
     fn auth_url_parses_the_issuer_client_id_and_resource() {
@@ -1581,8 +1544,6 @@ mod tests {
         assert_eq!(parsed.issuer_domain, "id.example.com");
     }
 
-    // -- Discovery ---------------------------------------------------------
-
     #[test]
     fn discovery_reads_the_endpoints_the_client_needs() {
         let discovery = discovery();
@@ -1626,8 +1587,6 @@ mod tests {
             parse_discovery(body, "https://id.example.com").expect("discovery should parse");
         assert_eq!(discovery.device_authorization_endpoint, None);
     }
-
-    // -- The authorization request -----------------------------------------
 
     #[test]
     fn authorization_url_carries_pkce_state_and_nonce() {
@@ -1696,8 +1655,6 @@ mod tests {
             Some("lore.example.com")
         );
     }
-
-    // -- The authorization response ----------------------------------------
 
     #[test]
     fn callback_query_is_read_from_the_request_target() {
@@ -1770,8 +1727,6 @@ mod tests {
         let outcome = callback_outcome("/callback?state=the-state").expect("should parse");
         authorization_code(&outcome, "the-state").expect_err("there is nothing to exchange");
     }
-
-    // -- The ID token ------------------------------------------------------
 
     #[test]
     fn id_token_nonce_mismatch_is_refused() {
@@ -1849,8 +1804,6 @@ mod tests {
         assert_eq!(token.user_id, "user-1");
     }
 
-    // -- Resource indicators (RFC 8707) and access tokens (RFC 9068) --------
-
     /// A deployment that names itself gets the `resource` parameter on every grant
     /// request and presents the access token the provider audience-restricted to it.
     mod resource_mode {
@@ -1882,11 +1835,7 @@ mod tests {
             }
         }
 
-        // -- The parameter reaches all five request kinds -------------------
-
-        /// 1 of 5: the authorization request. Already covered by
-        /// `authorization_url_forwards_a_resource_indicator`; asserted here too so the
-        /// five kinds read as one set rather than being scattered.
+        /// Also checked by `authorization_url_forwards_a_resource_indicator`.
         #[test]
         fn the_authorization_request_carries_the_resource() {
             let url = authorization_url(
@@ -1924,12 +1873,9 @@ mod tests {
                 .map(|(_, value)| value.as_str())
         }
 
-        /// Kinds 2 through 5 of the five: the authorization-code exchange, the device
-        /// authorization request, the device token poll, and the refresh grant. Every
-        /// form the module sends to a provider is built by one of these four functions,
-        /// so asserting over all of them is what makes "on every grant request" checked
-        /// rather than claimed. (Kind 1, the authorization request, is a URL rather than
-        /// a form and is asserted above.)
+        /// Every form this module sends to a provider except the authorization request
+        /// itself (a URL, checked above): the authorization-code exchange, the device
+        /// authorization request, the device token poll, and the refresh grant.
         #[test]
         fn every_grant_form_carries_the_resource() {
             let parts = resource_parts();
@@ -1967,8 +1913,8 @@ mod tests {
             }
         }
 
-        /// The forms still carry what they carried before, so routing them through one
-        /// helper did not quietly drop a field.
+        /// Each form still carries its own grant-specific parameters alongside the shared
+        /// `resource` parameter.
         #[test]
         fn the_grant_forms_keep_their_own_parameters() {
             let parts = resource_parts();
@@ -1993,8 +1939,6 @@ mod tests {
             );
             assert!(device_authorization_form(&parts).contains(&("scope", SCOPES.to_string())));
         }
-
-        // -- Which token is presented ---------------------------------------
 
         /// The switch this mode exists for: the credential stored and presented becomes
         /// the access token, and its expiry — not the ID token's — is what the credential
@@ -2041,13 +1985,11 @@ mod tests {
                 .expect_err("a replayed identity assertion is refused whatever is presented");
         }
 
-        // -- The provider that ignores the parameter ------------------------
-
-        /// PocketID 2.6.2's behavior, verified against the live instance on 2026-08-13:
-        /// `resource` is accepted with a `200` on both the device authorization and token
-        /// requests, silently ignored, and the access token comes back audienced to the
-        /// client id with `typ: "JWT"`. Failing here names the cause; not failing here
-        /// means a successful login followed by uniformly denied requests.
+        /// PocketID 2.6.2's behavior: `resource` is accepted with a `200` on both the
+        /// device authorization and token requests, silently ignored, and the access
+        /// token comes back audienced to the client id with `typ: "JWT"`. Failing here
+        /// names the cause; not failing here means a successful login followed by
+        /// uniformly denied requests.
         #[test]
         fn a_provider_that_ignores_the_resource_parameter_is_named() {
             let ignored = unsigned_jwt_typed(
@@ -2123,13 +2065,9 @@ mod tests {
         }
     }
 
-    // -- The device grant --------------------------------------------------
-
-    /// A provider with no device authorization endpoint has no headless ceremony, and
-    /// there is no fallback: the browser flow's redirect goes to a loopback listener on
-    /// this host, so printing its URL for another device cannot complete. The answer is
-    /// an immediate, typed refusal naming the missing capability — never a poll loop
-    /// waiting on a redirect that can never arrive.
+    /// A provider with no device authorization endpoint gets an immediate, typed refusal
+    /// naming the missing capability, not a poll loop waiting on a redirect that can never
+    /// arrive.
     #[tokio::test]
     async fn no_browser_login_against_a_provider_without_the_device_grant_fails_cleanly() {
         let auth = OidcAuthentication::default();
@@ -2287,8 +2225,6 @@ mod tests {
         );
         assert!(schedule.due(start + Duration::from_secs(10)));
     }
-
-    // -- Passthrough and unsupported operations ----------------------------
 
     /// There is nothing to exchange the authentication token for and nothing to mint, so
     /// the same token comes back -- and it comes back naming the issuer as its recipient,

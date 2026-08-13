@@ -66,15 +66,11 @@ pub fn is_expired(expires: u64) -> bool {
 /// The domains an authz token obtained via exchange may be sent to, recorded alongside it
 /// in the token store and later enforced by [`verify_jwt_usage_for_remote`].
 ///
-/// Always re-deriving this from the JWT's own claims breaks OpenID Connect: an OIDC ID
-/// token's `aud` is a client id and `iss` an issuer URL, neither of which is the
-/// repository's domain, so the JWT-derived set can never include it and every exchange
-/// would be rejected even though login already stored the correct domains for this
-/// backend. `AuthorizationToken::acceptable_root_domains` is authoritative when the
-/// `Authentication` implementation filled it in, for the same reason it already is at
-/// login (`lore-revision/src/auth/login.rs`): only the implementation knows its own
-/// tokens' audience semantics. `ucs-auth` returns empty and keeps the JWT-derived
-/// behavior exactly.
+/// An OIDC ID token's `aud` is a client id and `iss` an issuer URL, neither of which is
+/// the repository's domain, so a set derived only from the token's own claims can never
+/// include it. `AuthorizationToken::acceptable_root_domains` is authoritative whenever the
+/// `Authentication` implementation filled it in, since only the implementation knows its
+/// own tokens' audience semantics; an empty set falls back to the JWT-derived domains.
 fn acceptable_root_domains(
     authz: &AuthorizationToken,
     recipient_domain: &str,
@@ -635,8 +631,7 @@ mod tests {
     use super::*;
 
     /// A JWT with the given claims and a signature nothing checks -- the shape the client
-    /// reads, since the server owns verification. Mirrors `oidc.rs`'s test helper of the
-    /// same name.
+    /// reads, since the server owns verification.
     fn unsigned_jwt(claims: &str) -> String {
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -656,9 +651,8 @@ mod tests {
         }
     }
 
-    /// A ucs-auth-shaped response supplies no domains of its own (`acceptable_root_domains`
-    /// empty), so the guard must fall back to the JWT-derived set exactly as it did before
-    /// OIDC existed.
+    /// A response supplying no domains of its own (`acceptable_root_domains` empty) falls
+    /// back to the JWT-derived set.
     #[test]
     fn ucs_auth_shaped_token_keeps_jwt_derived_domains() {
         let jwt = unsigned_jwt(
@@ -677,15 +671,12 @@ mod tests {
         );
     }
 
-    /// The gap this fix closes: an OIDC ID token's own claims (`aud` = client id, `iss` =
-    /// issuer URL) can never name the repository's domain, so the JWT-derived fallback
-    /// rejects a login-time-authorized token on every repository operation. A non-empty
+    /// An OIDC ID token's own claims (`aud` = client id, `iss` = issuer URL) can never
+    /// name the repository's domain, so a non-empty
     /// `AuthorizationToken::acceptable_root_domains` from the backend must be authoritative
-    /// instead, exactly as it already is for login (`lore-revision/src/auth/login.rs`).
+    /// instead of the JWT-derived fallback.
     #[test]
     fn oidc_shaped_token_survives_the_exchange_path() {
-        // `aud` is a client id and `iss` a URL: neither names "repo.example.com", so the
-        // JWT-derived fallback alone would reject this token outright.
         let jwt = unsigned_jwt(
             r#"{"iss":"https://id.example.com","sub":"user-1","exp":9999999999,"aud":["lore-cli"]}"#,
         );

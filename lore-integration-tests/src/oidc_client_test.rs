@@ -65,7 +65,7 @@ mod oidc_client_tests {
     }
 
     /// Runs the browser half of a PKCE login and returns the token the implementation
-    /// produced, so the tests that need a live token do not each repeat the ceremony.
+    /// produced.
     async fn login_with_pkce(
         auth: &OidcAuthentication,
         fixture: &OidcFixture,
@@ -342,8 +342,7 @@ mod oidc_client_tests {
             .expect("The passed-through token did not verify against the issuer's JWKS");
     }
 
-    /// **PocketID 2.6.2 does not implement RFC 8707**, and this is the test that pins that
-    /// finding to the provider rather than to a comment.
+    /// **PocketID 2.6.2 does not implement RFC 8707.**
     ///
     /// The parameter is sent on every leg of the grant, and PocketID answers `200` to all
     /// of them, ignores it, and mints an access token audienced to the client id with

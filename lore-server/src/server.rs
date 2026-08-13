@@ -511,13 +511,11 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
 /// with the issuer's own path preserved so stripping the `oidc+` prefix
 /// recovers the issuer string unchanged. An explicit `auth_url` always wins.
 ///
-/// A configured `resource` is advertised alongside the client id, and doing so
-/// is what makes resource mode work at all rather than merely be strict: it is
-/// the only way the client learns to send the RFC 8707 `resource` parameter on
-/// its grant requests, and therefore the only way the provider knows to
-/// audience-restrict the token this server will demand. An operator who writes
-/// `auth_url` out by hand has to carry the parameter themselves, which the
-/// configuration reference says.
+/// A configured `resource` is advertised alongside the client id: it is the
+/// only way the client learns to send the RFC 8707 `resource` parameter on its
+/// grant requests, which the provider needs in order to audience-restrict the
+/// token this server demands. An operator who writes `auth_url` by hand must
+/// carry the parameter themselves.
 fn derive_oidc_auth_url(oidc: &crate::settings::OidcSettings) -> Option<String> {
     let issuer_url = reqwest::Url::parse(&oidc.issuer).ok()?;
     let scheme = match issuer_url.scheme() {
@@ -2333,12 +2331,10 @@ mod tests {
             assert_eq!(issuer_part, "https://id.example.com/realms/studio");
         }
 
-        /// Advertising the resource is not cosmetic: it is the only channel by
-        /// which a client learns to send the RFC 8707 `resource` parameter, and
-        /// without that parameter the provider mints a token audienced to the
-        /// client id — which a resource-mode server then refuses. A derivation
-        /// that dropped it would leave every login succeeding and every request
-        /// denied.
+        /// Without this, the client never learns to send the RFC 8707 `resource`
+        /// parameter, the provider mints a token audienced to the client id
+        /// instead, and a resource-mode server refuses it: every login would
+        /// succeed and every request would be denied.
         #[test]
         fn a_configured_resource_is_advertised() {
             let derived = derive_oidc_auth_url(&oidc_with_resource(
@@ -2481,12 +2477,10 @@ mod tests {
             );
         }
 
-        /// The headline of the resource-bound mode, at the level the operator
-        /// actually configures: naming a `resource` moves the audience pin off
-        /// the client id and onto this deployment. Two Lore servers behind one
-        /// provider share a client id — that is the normal case, not a
-        /// misconfiguration — so while `aud` names the client, each accepts
-        /// tokens minted for the other. After this, neither does.
+        /// Two Lore servers behind the same provider share a client id, so
+        /// without a configured `resource` each accepts a token minted for the
+        /// other. Naming a `resource` moves the audience pin from the client id
+        /// to this deployment, which stops that.
         #[tokio::test]
         async fn a_configured_resource_pins_the_audience_to_the_deployment() {
             let (_address, issuer) =

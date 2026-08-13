@@ -334,11 +334,9 @@ pub trait Environment: Send + Sync {
 /// What the host starting an interactive login can do, which decides the
 /// ceremony an `Authentication` implementation runs.
 ///
-/// This is the caller's capability, not a preference: it comes from
-/// `lore login --no-browser`, whose whole meaning is "there is no browser on
-/// this host". An implementation with one ceremony ignores it -- `ucs-auth`
-/// does -- and an implementation with two selects between them, as the OIDC one
-/// selects the authorization code flow or the device authorization grant.
+/// This is the caller's capability, not a preference: it reflects whether a
+/// browser can be opened on this host. An implementation with only one
+/// ceremony can ignore it; one with more than one selects between them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LoginFlow {
     /// A browser can be opened on this host, so a redirect back to it can

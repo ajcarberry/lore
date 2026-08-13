@@ -174,15 +174,15 @@ pub enum JwtVerifierError {
 /// deployment (`ucs-auth` and friends) always builds a `LoreClaims` verifier
 /// via [`JwtVerifier::new`], so a token that is correctly signed by its
 /// trusted issuer but happens to omit `env`/`name`/`preferred_username` keeps
-/// being refused exactly as it is today — it is never granted every
-/// repository on the strength of an omitted claim. Only a verifier built from
+/// being refused — it is never granted every repository on the strength of
+/// an omitted claim. Only a verifier built from
 /// a configured `[server.auth.oidc]` block, via [`JwtVerifier::oidc`] or
 /// [`JwtVerifier::oidc_resource`], is `Oidc` mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum JwtVerifierMode {
     /// Only Lore's own claim shapes (`AuthorizationToken`, `JWTUserInfo`)
-    /// verify. The mode of every verifier built before `[server.auth.oidc]`
-    /// existed, and the default.
+    /// verify. The mode of every verifier that does not configure
+    /// `[server.auth.oidc]`, and the default.
     #[default]
     LoreClaims,
     /// `[server.auth.oidc]`'s authn-only mode. Which credential the provider
@@ -196,8 +196,7 @@ pub enum JwtVerifierMode {
 /// Which of the provider's two tokens a `[server.auth.oidc]` deployment accepts.
 ///
 /// The distinction is `[server.auth.oidc].resource`, and it is the whole of the
-/// opt-in: absent, the deployment behaves exactly as it did before resource
-/// indicators existed; present, it is strict.
+/// opt-in: absent, the deployment accepts an ID token; present, it is strict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OidcAcceptance {
     /// No `resource` configured: a conformant OpenID Connect ID token, whose
@@ -224,7 +223,7 @@ pub struct JwtVerifier {
 }
 
 impl JwtVerifier {
-    /// Today's behavior: only Lore's own claim shapes verify. What every
+    /// Only Lore's own claim shapes verify. What every
     /// `[server.auth.jwk]`-only deployment builds.
     pub fn new(
         jwk_service: Arc<dyn JWKService>,
@@ -291,8 +290,9 @@ fn key_may_be_stale(error: &JwtVerifierError) -> bool {
 /// §2.1 registers the `application/at+jwt` media type and recommends omitting
 /// the `application/` prefix, and §4 step 1 accepts either spelling. The
 /// comparison is case-insensitive because `typ` is a media type, and media
-/// types are (RFC 9110 §8.3.1); a provider that spells it `AT+JWT` is
-/// conformant and refusing it would be a bug in this server, not in the token.
+/// types are compared case-insensitively (RFC 9110 §8.3.1); a provider that
+/// spells it `AT+JWT` is conformant and refusing it would be a bug in this
+/// server, not in the token.
 fn is_jwt_access_token_type(typ: &str) -> bool {
     typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
 }
@@ -431,10 +431,9 @@ impl JwtVerifier {
             }
             // Reached only once both Lore-specific claim shapes above have
             // failed to deserialize, and only in OIDC mode: a
-            // `[server.auth.jwk]`-only verifier stops here, exactly as it does
-            // today. In OIDC mode a conformant ID token satisfies this third
-            // shape instead, carrying none of `env`/`name`/`preferred_username`
-            // — see `OidcTokenClaims`.
+            // `[server.auth.jwk]`-only verifier stops here. In OIDC mode a
+            // conformant ID token satisfies this third shape instead, carrying
+            // none of `env`/`name`/`preferred_username` — see `OidcTokenClaims`.
             Err(_) if matches!(self.mode, JwtVerifierMode::Oidc(_)) => {
                 decode::<OidcTokenClaims>(token, key, &validation)
                     .map_err(decode_failure)
@@ -1404,10 +1403,10 @@ mod tests {
             /// `ucs-auth` deployment builds via `JwtVerifier::new` — must refuse a
             /// token this same signature, issuer, audience, and expiry would pass,
             /// once it lacks `env`/`name`/`preferred_username`. Without this gate,
-            /// such a deployment would newly accept a trusted-issuer-signed token
-            /// it refuses today, and grant it every repository on the strength of
-            /// the omitted claims — the exact widening `[server.auth.oidc]` is
-            /// supposed to require an explicit opt-in for.
+            /// such a deployment would accept a trusted-issuer-signed token that
+            /// must otherwise be refused, and grant it every repository on the
+            /// strength of the omitted claims — the exact widening
+            /// `[server.auth.oidc]` is supposed to require an explicit opt-in for.
             #[tokio::test]
             async fn a_non_oidc_verifier_rejects_the_minimal_claim_shape() {
                 let mut service = MockTestJWKService::new();
@@ -1490,12 +1489,12 @@ mod tests {
                 encode(&header, claims, &jwt_key).unwrap()
             }
 
-            /// **The headline case.** An ID token — or any token — whose `aud`
-            /// is the *client id* must be refused by a resource-mode server,
-            /// even though it is signed by the pinned issuer and unexpired.
-            /// This is what kills cross-deployment token interchange: a token
-            /// minted for a sibling Lore deployment behind the same provider
-            /// carries that deployment's `aud`, not this one's.
+            /// An ID token — or any token — whose `aud` is the *client id*
+            /// must be refused by a resource-mode server, even though it is
+            /// signed by the pinned issuer and unexpired. This is what kills
+            /// cross-deployment token interchange: a token minted for a
+            /// sibling Lore deployment behind the same provider carries that
+            /// deployment's `aud`, not this one's.
             #[tokio::test]
             async fn a_client_id_audience_token_is_rejected() {
                 let mut claims = access_token_claims();
@@ -1706,8 +1705,8 @@ mod tests {
             }
 
             /// The regression guard in the other direction: turning resource
-            /// mode off leaves the ID-token mode exactly as it was, so the
-            /// opt-in really is one.
+            /// mode off leaves the ID-token mode unaffected, so the opt-in
+            /// really is one.
             #[tokio::test]
             async fn an_access_token_shape_still_verifies_in_id_token_mode() {
                 let mut service = MockTestJWKService::new();

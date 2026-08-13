@@ -78,6 +78,69 @@ pub struct AuthorizationToken {
     pub idp: String,
 }
 
+/// The third and final claim shape `verify_token_internal` tries, reached only
+/// after both `AuthorizationToken` and `JWTUserInfo` fail to deserialize.
+/// Unlike those two, it demands only what RFC 7519 and OpenID Connect Core
+/// guarantee — `iss`, `sub`, `aud`, `exp`, `iat` — so a conformant ID token
+/// from any standard provider satisfies it, with `name`, `preferred_username`,
+/// and `email` accepted when present but never required.
+#[serde_as]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+struct OidcIdTokenClaims {
+    #[serde(rename = "sub")]
+    user_id: String,
+    #[serde(rename = "iss")]
+    issuer: String,
+    #[serde(rename = "iat")]
+    issued_at: u64,
+    #[serde(rename = "exp")]
+    expires: u64,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(rename = "aud")]
+    audience: Vec<String>,
+    name: Option<String>,
+    preferred_username: Option<String>,
+    #[allow(dead_code)]
+    email: Option<String>,
+}
+
+impl From<OidcIdTokenClaims> for AuthorizationToken {
+    /// Maps a minimal ID token onto the shape the rest of the server reads.
+    /// `idp` is the issuer, and the display fields fall back to `sub` when the
+    /// provider did not send them — the same substitution the LEP specifies
+    /// for the client's `JWTUserInfo` equivalent. `resources` is always the
+    /// all-repositories wildcard: reaching this decode at all already means
+    /// the token cleared signature, issuer, audience, and expiry checks, and
+    /// no configuration in the tree can produce a `[server.auth.oidc]`-style
+    /// `JwtVerifier` for which that grant is not the intended one — a
+    /// Lore-issued token always carries `env`/`name`/`preferred_username` and
+    /// is decoded by one of the two claim shapes above instead.
+    fn from(claims: OidcIdTokenClaims) -> Self {
+        let display_name = claims.name.unwrap_or_else(|| claims.user_id.clone());
+        let preferred_username = claims
+            .preferred_username
+            .unwrap_or_else(|| claims.user_id.clone());
+
+        AuthorizationToken {
+            user_id: claims.user_id,
+            issuer: claims.issuer.clone(),
+            issued_at: claims.issued_at,
+            expires: claims.expires,
+            audience: claims.audience,
+            env: String::default(),
+            name: display_name,
+            preferred_username,
+            resources: Some(vec![ResourcePermission {
+                resource_id: "urc-*".to_string(),
+                permission: vec![],
+            }]),
+            groups: None,
+            is_service_account: None,
+            idp: claims.issuer,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum JwtVerifierError {
     #[error("JWT header does not contain a kid")]
@@ -190,23 +253,17 @@ impl JwtVerifier {
         debug!("Decoding JWT token");
 
         if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {
-            debug!("Decoded user info: {:?}", token_data.claims);
-            Ok(token_data.claims)
-        } else {
-            let token_data = decode::<JWTUserInfo>(token, key, &validation).map_err(|error| {
-                if matches!(
-                    error.kind(),
-                    jsonwebtoken::errors::ErrorKind::ExpiredSignature
-                ) {
-                    debug!(error = ?error, "Allowable error decoding JWT AuthN token");
-                } else {
-                    warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
-                }
-                JwtVerifierError::ValidationFailed(error)
-            })?;
+            debug!(
+                sub = %token_data.claims.user_id,
+                iss = %token_data.claims.issuer,
+                "Decoded user info"
+            );
+            return Ok(token_data.claims);
+        }
 
+        if let Ok(token_data) = decode::<JWTUserInfo>(token, key, &validation) {
             let token = token_data.claims;
-            Ok(AuthorizationToken {
+            return Ok(AuthorizationToken {
                 user_id: token.user_id,
                 issuer: token.issuer,
                 issued_at: token.issued_at,
@@ -219,8 +276,26 @@ impl JwtVerifier {
                 groups: None,
                 is_service_account: token.is_service_account,
                 idp: String::default(),
-            })
+            });
         }
+
+        // Reached only once both Lore-specific claim shapes above have failed to
+        // deserialize. A conformant OpenID Connect ID token satisfies this one
+        // instead, carrying none of `env`/`name`/`preferred_username` — see
+        // `OidcIdTokenClaims`.
+        let token_data = decode::<OidcIdTokenClaims>(token, key, &validation).map_err(|error| {
+            if matches!(
+                error.kind(),
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature
+            ) {
+                debug!(error = ?error, "Allowable error decoding JWT AuthN token");
+            } else {
+                warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
+            }
+            JwtVerifierError::ValidationFailed(error)
+        })?;
+
+        Ok(token_data.claims.into())
     }
 }
 
@@ -996,6 +1071,162 @@ mod tests {
             assert_eq!(original_token, verified_token);
 
             Ok(())
+        }
+
+        /// The third-and-final claim decode: reached only when the token carries
+        /// none of the Lore-specific claims, as a conformant OpenID Connect ID
+        /// token does. It must accept the RFC 7519 / OIDC-guaranteed minimum,
+        /// accept the optional display claims when present, and still enforce
+        /// every check `Validation` applies regardless of target shape.
+        mod oidc_third_decode {
+            use super::*;
+
+            fn oidc_verifier() -> JwtVerifier {
+                let mut service = MockTestJWKService::new();
+                service.expect_get_key().returning(|_| {
+                    Ok((
+                        DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                        AGREED_UPON_ALGORITHM,
+                    ))
+                });
+
+                JwtVerifier {
+                    jwk_service: Arc::new(service),
+                    jwt_issuer: Some("https://id.example.com".to_string()),
+                    jwt_audience: Some(vec!["lore".to_string()]),
+                }
+            }
+
+            fn minimal_claims() -> serde_json::Value {
+                json!({
+                    "sub": "the-subject",
+                    "iss": "https://id.example.com",
+                    "aud": "lore",
+                    "iat": 1,
+                    "exp": SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .add(Duration::from_secs(5))
+                        .as_secs(),
+                })
+            }
+
+            #[tokio::test]
+            async fn minimal_claims_are_accepted_and_wildcarded() {
+                let encoded = encode_jwt(&minimal_claims());
+
+                let token = oidc_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect("a conformant minimal ID token is accepted");
+
+                assert_eq!(token.user_id, "the-subject");
+                assert_eq!(token.issuer, "https://id.example.com");
+                assert_eq!(token.idp, "https://id.example.com");
+                // No `name`/`preferred_username` in the token: both fall back to `sub`.
+                assert_eq!(token.name, "the-subject");
+                assert_eq!(token.preferred_username, "the-subject");
+                assert_eq!(token.env, "");
+                let resources = token.resources.expect("wildcard resource is populated");
+                assert!(resources[0].is_wildcard_resource());
+            }
+
+            #[tokio::test]
+            async fn optional_display_claims_are_used_when_present() {
+                let mut claims = minimal_claims();
+                claims["name"] = json!("Display Name");
+                claims["preferred_username"] = json!("display_name");
+                claims["email"] = json!("display@example.com");
+                let encoded = encode_jwt(&claims);
+
+                let token = oidc_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect("optional claims do not block acceptance");
+
+                assert_eq!(token.name, "Display Name");
+                assert_eq!(token.preferred_username, "display_name");
+            }
+
+            #[tokio::test]
+            async fn array_audience_is_accepted() {
+                let mut claims = minimal_claims();
+                claims["aud"] = json!(["lore"]);
+                let encoded = encode_jwt(&claims);
+
+                let token = oidc_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect("PocketID-style array audience is accepted");
+
+                assert_eq!(token.audience, vec!["lore".to_string()]);
+            }
+
+            #[tokio::test]
+            async fn wrong_issuer_is_still_rejected() {
+                let mut claims = minimal_claims();
+                claims["iss"] = json!("https://not-the-configured-issuer.invalid");
+                let encoded = encode_jwt(&claims);
+
+                let error = oidc_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect_err("issuer is checked before the minimal shape ever matters");
+                assert!(matches!(error, JwtVerifierError::ValidationFailed(_)));
+            }
+
+            #[tokio::test]
+            async fn wrong_audience_is_still_rejected() {
+                let mut claims = minimal_claims();
+                claims["aud"] = json!("not-lore");
+                let encoded = encode_jwt(&claims);
+
+                oidc_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect_err("audience is checked before the minimal shape ever matters");
+            }
+
+            #[tokio::test]
+            async fn expired_token_is_still_rejected() {
+                let mut claims = minimal_claims();
+                claims["exp"] = json!(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        - 3600
+                );
+                let encoded = encode_jwt(&claims);
+
+                oidc_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect_err("expiry is checked before the minimal shape ever matters");
+            }
+
+            /// A Lore-issued token (carrying `env`/`name`/`preferred_username`) always
+            /// matches `AuthorizationToken` or `JWTUserInfo` first, so it never reaches
+            /// this decode — and therefore never gets the wildcard from it.
+            #[tokio::test]
+            async fn a_full_lore_shaped_token_does_not_take_this_path() {
+                let mut claims = minimal_claims();
+                claims["env"] = json!("the env");
+                claims["name"] = json!("the name");
+                claims["preferred_username"] = json!("pu");
+                let encoded = encode_jwt(&claims);
+
+                let token = oidc_verifier()
+                    .verify_token(&encoded)
+                    .await
+                    .expect("still verifies, via JWTUserInfo");
+
+                assert_eq!(token.name, "the name");
+                assert_eq!(
+                    token.resources, None,
+                    "authn-only path grants nothing itself"
+                );
+            }
         }
 
         #[tokio::test]

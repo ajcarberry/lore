@@ -21,6 +21,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
 use lore_base::lore_spawn;
+use lore_base::lore_spawn_net;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::LoreTaskLifecycleEvent;
 use lore_base::runtime::LoreTaskSpawnLocation;
@@ -62,7 +63,10 @@ use tracing::info_span;
 use tracing::trace;
 use tracing::warn;
 
+use crate::auth::discovery;
+use crate::auth::jwk::JWKService;
 use crate::auth::jwk::JwkServiceImpl;
+use crate::auth::jwk::OidcJwkService;
 use crate::auth::jwt::JwtVerifier;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
@@ -94,6 +98,7 @@ use crate::quic::replication_store_service::server::ReplicationStoreService;
 use crate::quic::storage_service::StorageService;
 use crate::quic::stream_handler::StreamHandler;
 use crate::server_config::ServerConfig;
+use crate::settings::AuthSettings;
 use crate::settings::CompositeStoreSettings;
 use crate::settings::CompositeSubStoreSettings;
 use crate::settings::GrpcSettings;
@@ -415,6 +420,97 @@ fn compiled_features() -> Vec<String> {
     features
 }
 
+/// Build the server's `JwtVerifier` from `[server.auth]`, when configured.
+///
+/// `[server.auth.oidc]` supplies what `jwt_issuer`/`jwt_audience`/`jwk.endpoint`
+/// otherwise ask for twice: at start-up the server fetches the provider's
+/// discovery document — on the net runtime, since it is network I/O — checks
+/// its `issuer` against the configured one, and feeds `jwks_uri` to the same
+/// `JWKService` used everywhere else. An explicit `jwt_issuer`, `jwt_audience`,
+/// or `[server.auth.jwk].endpoint` still wins, which keeps the `file://`
+/// key-set endpoint reachable as an offline escape hatch. Settings validation
+/// (`validate_oidc_config`) has already refused to start a server whose
+/// `[server.auth.oidc]` block omits `authorize_all_repositories`, so reaching
+/// this function with `auth.oidc` set means that grant is intended.
+async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVerifier>> {
+    let Some(auth) = auth else {
+        return Ok(None);
+    };
+
+    let (jwt_issuer, jwt_audience, jwk_settings, oidc_mode) = match auth.oidc.as_ref() {
+        Some(oidc) => {
+            let issuer = oidc.issuer.clone();
+            let document =
+                lore_spawn_net!(async move { discovery::fetch_discovery_document(&issuer).await })
+                    .await??;
+
+            let jwk_settings = auth
+                .jwk
+                .clone()
+                .unwrap_or(crate::auth::jwk::JWKServiceSettings {
+                    endpoint: document.jwks_uri,
+                });
+            let jwt_issuer = auth.jwt_issuer.clone().or(Some(oidc.issuer.clone()));
+            let jwt_audience = auth
+                .jwt_audience
+                .clone()
+                .or_else(|| Some(vec![oidc.client_id.clone()]));
+
+            (jwt_issuer, jwt_audience, jwk_settings, true)
+        }
+        None => {
+            let Some(jwk) = auth.jwk.as_ref() else {
+                return Ok(None);
+            };
+            (
+                auth.jwt_issuer.clone(),
+                auth.jwt_audience.clone(),
+                jwk.clone(),
+                false,
+            )
+        }
+    };
+
+    let jwk_service = JwkServiceImpl::new(jwk_settings);
+    jwk_service
+        .fetch_new_keys(None /* fetch all keys */)
+        .await?;
+    let jwk_service: Arc<dyn JWKService> = if oidc_mode {
+        Arc::new(OidcJwkService::new(Arc::new(jwk_service)))
+    } else {
+        Arc::new(jwk_service)
+    };
+
+    Ok(Some(JwtVerifier {
+        jwk_service,
+        jwt_issuer,
+        jwt_audience,
+    }))
+}
+
+/// Derive `auth_url` from `[server.auth.oidc]` when the operator left
+/// `environment.endpoint.auth_url` empty, per the LEP's "Advertising the
+/// provider" section: `oidc+{scheme}://{issuer-without-scheme}?client_id=...`,
+/// with the issuer's own path preserved so stripping the `oidc+` prefix
+/// recovers the issuer string unchanged. An explicit `auth_url` always wins.
+fn derive_oidc_auth_url(oidc: &crate::settings::OidcSettings) -> Option<String> {
+    let issuer_url = reqwest::Url::parse(&oidc.issuer).ok()?;
+    let scheme = match issuer_url.scheme() {
+        "https" => "https",
+        "http" => "http",
+        _ => return None,
+    };
+
+    let mut derived = format!("oidc+{scheme}://{}", issuer_url.host_str()?);
+    if let Some(port) = issuer_url.port() {
+        derived.push_str(&format!(":{port}"));
+    }
+    derived.push_str(issuer_url.path().trim_end_matches('/'));
+    derived.push_str(&format!("?client_id={}", oidc.client_id));
+
+    Some(derived)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn launch_grpc_server(
     immutable_store: Arc<dyn ImmutableStore>,
@@ -466,6 +562,22 @@ async fn launch_grpc_server(
 
     let mut environment = settings.environment.clone().unwrap_or_default();
     let feature = settings.feature.clone().unwrap_or_default();
+
+    // Advertise the provider (LEP "Advertising the provider") when the operator
+    // configured OIDC but left the auth endpoint to derive. An explicit
+    // `auth_url` — including an explicitly empty one — always wins.
+    if let Some(oidc) = settings
+        .server
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.oidc.as_ref())
+    {
+        let mut endpoint = environment.endpoint.unwrap_or_default();
+        if endpoint.auth_url.as_deref().unwrap_or_default().is_empty() {
+            endpoint.auth_url = derive_oidc_auth_url(oidc);
+        }
+        environment.endpoint = Some(endpoint);
+    }
 
     // Enforce store limits
     if let Some(limit) = immutable_store.max_query_batch() {
@@ -1763,24 +1875,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         false
     };
 
-    let jwt_verifier = match settings.server.auth.as_ref() {
-        Some(auth) => match auth.jwk.as_ref() {
-            Some(jwk) => {
-                let jwk_service = JwkServiceImpl::new(jwk.clone());
-                jwk_service
-                    .fetch_new_keys(None /* fetch all keys */)
-                    .await?;
-                let jwt_verifier = JwtVerifier {
-                    jwk_service: Arc::new(jwk_service),
-                    jwt_issuer: auth.jwt_issuer.clone(),
-                    jwt_audience: auth.jwt_audience.clone(),
-                };
-                Some(jwt_verifier)
-            }
-            None => None,
-        },
-        None => None,
-    };
+    let jwt_verifier = build_jwt_verifier(settings.server.auth.as_ref()).await?;
 
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> = if let Some(grpc_public_services) =
         &settings.server.grpc_public_services
@@ -2144,6 +2239,238 @@ fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, mess
 
 #[cfg(test)]
 mod tests {
+    mod derive_oidc_auth_url {
+        use super::super::derive_oidc_auth_url;
+        use crate::settings::OidcSettings;
+
+        fn oidc(issuer: &str) -> OidcSettings {
+            OidcSettings {
+                issuer: issuer.to_string(),
+                client_id: "lore".to_string(),
+                authorize_all_repositories: true,
+            }
+        }
+
+        #[test]
+        fn bare_https_issuer() {
+            assert_eq!(
+                derive_oidc_auth_url(&oidc("https://id.example.com")),
+                Some("oidc+https://id.example.com?client_id=lore".to_string())
+            );
+        }
+
+        #[test]
+        fn issuer_with_a_path_is_preserved() {
+            assert_eq!(
+                derive_oidc_auth_url(&oidc("https://id.example.com/realms/studio")),
+                Some("oidc+https://id.example.com/realms/studio?client_id=lore".to_string())
+            );
+        }
+
+        #[test]
+        fn http_issuer_derives_oidc_plus_http() {
+            assert_eq!(
+                derive_oidc_auth_url(&oidc("http://127.0.0.1:1411")),
+                Some("oidc+http://127.0.0.1:1411?client_id=lore".to_string())
+            );
+        }
+
+        #[test]
+        fn stripping_the_oidc_prefix_recovers_the_issuer_byte_for_byte() {
+            let derived = derive_oidc_auth_url(&oidc("https://id.example.com/realms/studio"))
+                .expect("derives");
+            let (_, rest) = derived.split_once('+').expect("oidc+ prefix");
+            let issuer_part = rest.split('?').next().expect("query separator");
+            assert_eq!(issuer_part, "https://id.example.com/realms/studio");
+        }
+    }
+
+    mod build_jwt_verifier {
+        use std::net::SocketAddr;
+
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State;
+        use axum::routing::get;
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        use super::super::build_jwt_verifier;
+        use crate::auth::jwk::JWKServiceSettings;
+        use crate::settings::AuthSettings;
+        use crate::settings::OidcSettings;
+
+        #[tokio::test]
+        async fn absent_auth_yields_no_verifier() {
+            assert!(build_jwt_verifier(None).await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn auth_with_neither_jwk_nor_oidc_yields_no_verifier() {
+            let auth = AuthSettings {
+                jwk: None,
+                jwt_audience: None,
+                jwt_issuer: None,
+                oidc: None,
+            };
+            assert!(build_jwt_verifier(Some(&auth)).await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn plain_jwk_configuration_is_unaffected() {
+            let address = spawn_jwks_server(json!({
+                "keys": [{"kty": "oct", "use": "sig", "kid": "k", "alg": "HS256", "k": "c2VjcmV0"}]
+            }))
+            .await;
+            let auth = AuthSettings {
+                jwk: Some(JWKServiceSettings {
+                    endpoint: format!("http://{address}/jwks"),
+                }),
+                jwt_audience: Some(vec!["lore".to_string()]),
+                jwt_issuer: Some("the-issuer".to_string()),
+                oidc: None,
+            };
+
+            let verifier = build_jwt_verifier(Some(&auth))
+                .await
+                .unwrap()
+                .expect("jwk-only configuration still builds a verifier");
+
+            assert_eq!(verifier.jwt_issuer, Some("the-issuer".to_string()));
+            assert_eq!(verifier.jwt_audience, Some(vec!["lore".to_string()]));
+        }
+
+        #[tokio::test]
+        async fn oidc_derives_issuer_audience_and_jwk_endpoint_from_discovery() {
+            let (address, issuer) =
+                spawn_discovery_and_jwks_server(&issuer_agnostic_rsa_jwks()).await;
+            let oidc = OidcSettings {
+                issuer: issuer.clone(),
+                client_id: "lore-client".to_string(),
+                authorize_all_repositories: true,
+            };
+            let auth = AuthSettings {
+                jwk: None,
+                jwt_audience: None,
+                jwt_issuer: None,
+                oidc: Some(oidc),
+            };
+
+            let verifier = build_jwt_verifier(Some(&auth))
+                .await
+                .unwrap()
+                .expect("oidc configuration builds a verifier");
+
+            assert_eq!(verifier.jwt_issuer, Some(issuer));
+            assert_eq!(verifier.jwt_audience, Some(vec!["lore-client".to_string()]));
+            let _ = address;
+        }
+
+        #[tokio::test]
+        async fn explicit_settings_win_over_oidc_derived_values() {
+            let (_address, issuer) =
+                spawn_discovery_and_jwks_server(&issuer_agnostic_rsa_jwks()).await;
+            let oidc = OidcSettings {
+                issuer: issuer.clone(),
+                client_id: "lore-client".to_string(),
+                authorize_all_repositories: true,
+            };
+            let auth = AuthSettings {
+                jwk: None,
+                jwt_audience: Some(vec!["explicit-audience".to_string()]),
+                jwt_issuer: Some("explicit-issuer".to_string()),
+                oidc: Some(oidc),
+            };
+
+            let verifier = build_jwt_verifier(Some(&auth))
+                .await
+                .unwrap()
+                .expect("builds a verifier");
+
+            assert_eq!(verifier.jwt_issuer, Some("explicit-issuer".to_string()));
+            assert_eq!(
+                verifier.jwt_audience,
+                Some(vec!["explicit-audience".to_string()])
+            );
+        }
+
+        fn issuer_agnostic_rsa_jwks() -> serde_json::Value {
+            const RSA_N: &str = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4\
+                                 cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiF\
+                                 V4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6C\
+                                 f0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9\
+                                 c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTW\
+                                 hAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1\
+                                 jF44-csFCur-kEgU8awapJzKnqDKgw";
+            json!({
+                "keys": [{"kty": "RSA", "use": "sig", "kid": "k", "n": RSA_N, "e": "AQAB"}]
+            })
+        }
+
+        async fn jwks_handler(State(body): State<serde_json::Value>) -> Json<serde_json::Value> {
+            Json(body)
+        }
+
+        async fn spawn_jwks_server(jwks: serde_json::Value) -> SocketAddr {
+            let app = Router::new()
+                .route("/jwks", get(jwks_handler))
+                .with_state(jwks);
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test jwks server");
+            let address = listener.local_addr().expect("test jwks server address");
+
+            lore_base::lore_spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve test jwks server");
+            });
+
+            address
+        }
+
+        /// Binds the listener first so the discovery document can name the
+        /// server's own address as its issuer, satisfying the byte-for-byte
+        /// issuer check `fetch_discovery_document` applies.
+        async fn spawn_discovery_and_jwks_server(jwks: &serde_json::Value) -> (SocketAddr, String) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test discovery+jwks server");
+            let address = listener.local_addr().expect("test server address");
+            let issuer = format!("http://{address}");
+
+            let discovery_body = json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+            });
+            let jwks = jwks.clone();
+
+            let app = Router::new()
+                .route(
+                    "/.well-known/openid-configuration",
+                    get(move || {
+                        let body = discovery_body.clone();
+                        async move { Json(body) }
+                    }),
+                )
+                .route(
+                    "/jwks",
+                    get(move || {
+                        let body = jwks.clone();
+                        async move { Json(body) }
+                    }),
+                );
+
+            lore_base::lore_spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve test discovery+jwks server");
+            });
+
+            (address, issuer)
+        }
+    }
+
     mod validate_endpoint_security {
         use std::path::PathBuf;
 

@@ -90,11 +90,88 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
     }
 }
 
+/// Whether `auth_url` names a scheme this server has an authorization client
+/// for. `ucs-auth` and `https` both point at Epic's relationship-based
+/// authorization service; every other scheme — `oidc+https` included — is not
+/// that service, and handing it to `AuthClientAuthorizer` would point a gRPC
+/// client at whatever the scheme actually names (an identity provider, for
+/// `oidc+https`) and fail every repository operation that checks it.
+fn is_auth_client_scheme(auth_url: &str) -> bool {
+    matches!(
+        auth_url.split_once("://").map(|(scheme, _)| scheme),
+        Some("ucs-auth" | "https")
+    )
+}
+
 /// Creates the appropriate authorizer from an optional auth URL.
-/// Returns `AllowAllRepositoryAuthorizer` when no URL is configured.
+/// Returns `AllowAllRepositoryAuthorizer` when no URL is configured, or when
+/// the URL's scheme is not one this server has an authorization client for
+/// (see [`is_auth_client_scheme`]) — which is the correct answer under
+/// `authorize_all_repositories` and refuses to be a silent broken client
+/// under anything else.
 pub fn repository_authorizer(auth_url: Option<String>) -> Arc<dyn RepositoryAuthorizer> {
     match auth_url {
-        Some(url) => Arc::new(AuthClientAuthorizer::new(url)),
-        None => Arc::new(AllowAllRepositoryAuthorizer),
+        Some(url) if is_auth_client_scheme(&url) => Arc::new(AuthClientAuthorizer::new(url)),
+        _ => Arc::new(AllowAllRepositoryAuthorizer),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ucs_auth_scheme_selects_the_auth_client() {
+        assert!(is_auth_client_scheme("ucs-auth://auth.example.com"));
+    }
+
+    #[test]
+    fn https_scheme_selects_the_auth_client() {
+        assert!(is_auth_client_scheme("https://auth.example.com"));
+    }
+
+    /// The risk the LEP names by name: an OIDC-advertised `auth_url` must never
+    /// be handed to the gRPC client meant for the relationship-based
+    /// authorization service, or repository create/delete/query/metadata
+    /// operations would all fail against a live provider.
+    #[test]
+    fn oidc_https_scheme_does_not_select_the_auth_client() {
+        assert!(!is_auth_client_scheme("oidc+https://id.example.com"));
+    }
+
+    #[test]
+    fn oidc_http_scheme_does_not_select_the_auth_client() {
+        assert!(!is_auth_client_scheme("oidc+http://127.0.0.1:1411"));
+    }
+
+    #[test]
+    fn plain_http_scheme_does_not_select_the_auth_client() {
+        assert!(!is_auth_client_scheme("http://auth.example.com"));
+    }
+
+    #[tokio::test]
+    async fn no_auth_url_falls_back_to_allow_all() {
+        // Exercised through the public constructor: `AllowAllRepositoryAuthorizer`
+        // carries no state to introspect, so behavior is the observable proof.
+        let authorizer = repository_authorizer(None);
+        let repository_id = lore_base::types::RepositoryId::from([0u8; 16]);
+        assert!(
+            authorizer
+                .check_repository_access(None, repository_id)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oidc_auth_url_falls_back_to_allow_all() {
+        let authorizer = repository_authorizer(Some("oidc+https://id.example.com".to_string()));
+        let repository_id = lore_base::types::RepositoryId::from([0u8; 16]);
+        assert!(
+            authorizer
+                .check_repository_access(None, repository_id)
+                .await
+                .is_ok()
+        );
     }
 }

@@ -545,6 +545,72 @@ impl InstrumentProvider for JwkServiceImpl {
     }
 }
 
+/// Whether OIDC mode may verify a token signed with `algorithm`.
+///
+/// The loader already refuses to *infer* a symmetric algorithm and refuses a
+/// key whose declared algorithm belongs to another key type (the
+/// algorithm-confusion forgery). What it still honors is a provider
+/// *declaring* `HS256` on an `oct` key in its own published key set — a
+/// symmetric secret published in a public key set is a signing key for
+/// anyone who can read it. OIDC mode refuses symmetric algorithms outright,
+/// leaving `RS*`, `PS*`, `ES*`, and `EdDSA`. `alg: none` needs no entry here:
+/// `jsonwebtoken::Algorithm` has no such variant, so a token's header naming
+/// it is refused unconditionally, in every mode, before a key is ever looked
+/// up.
+fn oidc_permits_algorithm(algorithm: jsonwebtoken::Algorithm) -> bool {
+    !matches!(
+        algorithm,
+        jsonwebtoken::Algorithm::HS256
+            | jsonwebtoken::Algorithm::HS384
+            | jsonwebtoken::Algorithm::HS512
+    )
+}
+
+/// Wraps a [`JWKService`] to additionally refuse symmetric signing
+/// algorithms, for `[server.auth.oidc]` verifiers only. Composed onto the
+/// discovery-derived `JwkServiceImpl` at start-up rather than added as a mode
+/// flag on the shared service or verifier types, so a ucs-auth deployment's
+/// verification is unaffected.
+pub struct OidcJwkService {
+    inner: Arc<dyn JWKService>,
+}
+
+impl OidcJwkService {
+    pub fn new(inner: Arc<dyn JWKService>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl JWKService for OidcJwkService {
+    async fn get_key(
+        &self,
+        kid: &str,
+    ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
+        let (key, algorithm) = self.inner.get_key(kid).await?;
+        if oidc_permits_algorithm(algorithm) {
+            Ok((key, algorithm))
+        } else {
+            warn!(%kid, ?algorithm, "OIDC mode refuses a symmetric signing algorithm");
+            Err(JWKServiceError::NotFound)
+        }
+    }
+
+    fn get_cached_key(&self, kid: &str) -> Option<(DecodingKey, jsonwebtoken::Algorithm)> {
+        self.inner
+            .get_cached_key(kid)
+            .filter(|(_, algorithm)| oidc_permits_algorithm(*algorithm))
+    }
+
+    async fn refresh_key(
+        &self,
+        kid: &str,
+    ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError> {
+        let refreshed = self.inner.refresh_key(kid).await?;
+        Ok(refreshed.filter(|(_, algorithm)| oidc_permits_algorithm(*algorithm)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -1388,6 +1454,112 @@ mod tests {
             matches!(result, Err(JWKServiceError::ResponseTooLarge)),
             "a body with no declared length must still be capped: {result:?}"
         );
+    }
+
+    mod oidc_jwk_service {
+        use super::*;
+
+        fn hmac_key() -> (DecodingKey, jsonwebtoken::Algorithm) {
+            (
+                DecodingKey::from_secret(b"shared-secret"),
+                jsonwebtoken::Algorithm::HS256,
+            )
+        }
+
+        fn rsa_key() -> (DecodingKey, jsonwebtoken::Algorithm) {
+            (rsa_key_from_components(), jsonwebtoken::Algorithm::RS256)
+        }
+
+        fn rsa_key_from_components() -> DecodingKey {
+            DecodingKey::from_rsa_components(RSA_N, RSA_E).expect("rsa decoding key")
+        }
+
+        struct StaticJwkService {
+            key: (DecodingKey, jsonwebtoken::Algorithm),
+        }
+
+        #[async_trait]
+        impl JWKService for StaticJwkService {
+            async fn get_key(
+                &self,
+                _kid: &str,
+            ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
+                Ok((self.key.0.clone(), self.key.1))
+            }
+
+            fn get_cached_key(&self, _kid: &str) -> Option<(DecodingKey, jsonwebtoken::Algorithm)> {
+                Some((self.key.0.clone(), self.key.1))
+            }
+
+            async fn refresh_key(
+                &self,
+                _kid: &str,
+            ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>
+            {
+                Ok(Some((self.key.0.clone(), self.key.1)))
+            }
+        }
+
+        #[tokio::test]
+        async fn refuses_a_symmetric_key_from_get_key() {
+            let inner = Arc::new(StaticJwkService { key: hmac_key() });
+            let service = OidcJwkService::new(inner);
+
+            assert!(matches!(
+                service.get_key("kid").await,
+                Err(JWKServiceError::NotFound)
+            ));
+        }
+
+        #[test]
+        fn refuses_a_symmetric_key_from_the_cache() {
+            let inner = Arc::new(StaticJwkService { key: hmac_key() });
+            let service = OidcJwkService::new(inner);
+
+            assert!(service.get_cached_key("kid").is_none());
+        }
+
+        #[tokio::test]
+        async fn refuses_a_symmetric_key_on_refresh() {
+            let inner = Arc::new(StaticJwkService { key: hmac_key() });
+            let service = OidcJwkService::new(inner);
+
+            assert!(service.refresh_key("kid").await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn passes_through_an_asymmetric_key() {
+            let inner = Arc::new(StaticJwkService { key: rsa_key() });
+            let service = OidcJwkService::new(inner);
+
+            let (_, algorithm) = service.get_key("kid").await.expect("rsa key is permitted");
+            assert_eq!(algorithm, jsonwebtoken::Algorithm::RS256);
+            assert!(service.get_cached_key("kid").is_some());
+            assert!(service.refresh_key("kid").await.unwrap().is_some());
+        }
+
+        #[test]
+        fn oidc_permits_algorithm_allows_only_asymmetric_families() {
+            use jsonwebtoken::Algorithm;
+
+            for algorithm in [
+                Algorithm::RS256,
+                Algorithm::RS384,
+                Algorithm::RS512,
+                Algorithm::PS256,
+                Algorithm::PS384,
+                Algorithm::PS512,
+                Algorithm::ES256,
+                Algorithm::ES384,
+                Algorithm::EdDSA,
+            ] {
+                assert!(oidc_permits_algorithm(algorithm), "{algorithm:?}");
+            }
+
+            for algorithm in [Algorithm::HS256, Algorithm::HS384, Algorithm::HS512] {
+                assert!(!oidc_permits_algorithm(algorithm), "{algorithm:?}");
+            }
+        }
     }
 
     /// An oversized HTTP response is refused, and the cached keys are not disturbed by it.

@@ -175,13 +175,14 @@ This field is optional. When it's absent, the server starts with the presigned U
 
 ### Authentication
 
-`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` (or its `[server.auth.jwk]` sub-table) is absent — as in every shipped config — JWT verification is disabled and the gRPC services accept unauthenticated requests.
+`[server.auth]` configures JWT verification for gRPC, HTTP, and QUIC. When `[server.auth]` (or its `[server.auth.jwk]` and `[server.auth.oidc]` sub-tables) is absent — as in every shipped config — JWT verification is disabled and every protocol accepts unauthenticated requests.
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `jwt_issuer` | none | Expected JWT `iss` claim. When set, tokens with a different issuer are rejected; when unset, issuer validation is skipped. |
-| `jwt_audience` | none | Array of accepted JWT `aud` values. A token's audience must match one entry; when unset, audience validation is skipped. |
-| `jwk` | none | The `[server.auth.jwk]` sub-table below. Its presence enables JWT verification. |
+| `jwt_issuer` | none | Expected JWT `iss` claim. When set, tokens with a different issuer are rejected; when unset, issuer validation is skipped. Derived from `[server.auth.oidc].issuer` when that block is present and this is unset. |
+| `jwt_audience` | none | Array of accepted JWT `aud` values. A token's audience must match one entry; when unset, audience validation is skipped. Derived from `[server.auth.oidc].client_id` when that block is present and this is unset. |
+| `jwk` | none | The `[server.auth.jwk]` sub-table below. Its presence enables JWT verification. Derived from `[server.auth.oidc]`'s discovery document when that block is present and this is unset. |
+| `oidc` | none | The `[server.auth.oidc]` sub-table below: direct verification of a standard OpenID Connect provider's tokens. |
 
 `[server.auth.jwk]`:
 
@@ -197,6 +198,23 @@ jwt_audience = ["lore-service"]
 [server.auth.jwk]
 endpoint = "https://accounts.example.com/.well-known/jwks.json"
 ```
+
+`[server.auth.oidc]`: an operator secures a server with any conformant OpenID Connect provider by naming an issuer and a client id, with nothing provider-specific to configure. At start-up the server fetches `{issuer}/.well-known/openid-configuration`, checks the document's own `issuer` against the configured one, and feeds `jwks_uri` to the same key-set machinery `[server.auth.jwk]` uses directly. An explicit `jwt_issuer`, `jwt_audience`, or `[server.auth.jwk].endpoint` still wins over the derived value, which keeps a `file://` key set reachable as an offline escape hatch.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `issuer` | none (required) | The provider's issuer identifier, exactly as it publishes it — the same string it puts in the `iss` claim. |
+| `client_id` | none (required) | The public client id registered for Lore with the provider. |
+| `authorize_all_repositories` | none (required) | Has no default. A configured block that omits this, or sets it to `false`, fails startup validation: a verified token authorizes every repository on the server, and per-repository authorization from provider claims is not implemented, so an operator has to say explicitly that the coarse grant is what they want. |
+
+```toml
+[server.auth.oidc]
+issuer = "https://id.example.com"
+client_id = "lore"
+authorize_all_repositories = true
+```
+
+When `[server.auth.oidc]` is configured and `environment.endpoint.auth_url` is empty, the server also derives that field (encoded as `oidc+https://{issuer}?client_id={client_id}`, or `oidc+http` for an `http://` issuer) so the client knows where to log in. An explicitly configured `auth_url` always wins.
 
 ## Store settings
 

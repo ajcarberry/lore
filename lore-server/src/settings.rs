@@ -162,6 +162,7 @@ impl Settings {
         let settings: Settings = settings.try_deserialize()?;
         validate_trace_config(&settings)?;
         validate_feature_config(&settings)?;
+        validate_oidc_config(&settings)?;
         let settings_string = format!("{settings:?}");
         let settings_hash = hash::hash_string(&settings_string);
 
@@ -204,6 +205,35 @@ fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigErro
     Ok(())
 }
 
+/// `[server.auth.oidc]` offers exactly one authorization mode, and it is a coarse
+/// one: an operator has to write down that they want it. `authorize_all_repositories`
+/// has no default, so a configured block that omits it, or sets it to `false`, fails
+/// here rather than starting a server that verifies every token and then refuses
+/// every request (or, the other way, granting every repository to every
+/// authenticated identity on the strength of an omission).
+fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> {
+    let Some(oidc) = settings
+        .server
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.oidc.as_ref())
+    else {
+        return Ok(());
+    };
+
+    if !oidc.authorize_all_repositories {
+        return Err(config::ConfigError::Message(
+            "server.auth.oidc.authorize_all_repositories must be set to true: \
+             per-repository authorization from provider claims is not implemented, \
+             so a configured [server.auth.oidc] block must say explicitly that a \
+             verified token authorizes every repository on the server"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn trace_config_error_to_config(err: TraceConfigError) -> config::ConfigError {
     if let Some(out_of_range) = err.as_out_of_range() {
         return config::ConfigError::Message(format!(
@@ -224,6 +254,26 @@ pub struct AuthSettings {
     pub jwk: Option<JWKServiceSettings>,
     pub jwt_audience: Option<Vec<String>>,
     pub jwt_issuer: Option<String>,
+    pub oidc: Option<OidcSettings>,
+}
+
+/// `[server.auth.oidc]`: direct in-server verification of a standard OpenID Connect
+/// provider's tokens. See `docs/proposals/2026-08-13-oidc-authentication.md`.
+#[derive(Clone, Debug, Deserialize)]
+//#[serde(deny_unknown_fields)]
+pub struct OidcSettings {
+    /// The provider's issuer identifier, exactly as it publishes it — the same string
+    /// it puts in the `iss` claim. The server checks it against the discovery
+    /// document's own `issuer` member byte for byte.
+    pub issuer: String,
+    /// The public client id registered for Lore with the provider.
+    pub client_id: String,
+    /// Whether a verified token authorizes every repository on the server. Has no
+    /// default: a configured block that omits this, or sets it to `false`, fails
+    /// startup validation, because per-repository authorization from provider claims
+    /// is not implemented.
+    #[serde(default)]
+    pub authorize_all_repositories: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -514,6 +564,131 @@ mod tests {
     use crate::plugins::PluginRegistry;
     use crate::store::resolve_plugin_config_with_fallback;
     use crate::topology::TopologyProvider;
+
+    /// The settings matrix `[server.auth.oidc]` validation must reject: the block
+    /// absent (fine), the flag absent (fails), the flag `false` (fails), and the
+    /// flag `true` (fine) — see `validate_oidc_config`.
+    mod oidc_settings {
+        use super::*;
+
+        #[test]
+        fn absent_block_passes_validation() {
+            const CONFIG: &str = r#"
+                [server]
+                runtime_shutdown_timeout_seconds = 0
+
+                [immutable_store]
+                mode = "local"
+
+                [immutable_store.local]
+                path = "/tmp/immutable"
+                flush_delay_seconds = 5
+
+                [mutable_store]
+                mode = "local"
+
+                [mutable_store.local]
+                path = "/tmp/mutable"
+                flush_delay_seconds = 5
+            "#;
+            let settings: Settings = toml::from_str(CONFIG).expect("parses with no [server.auth]");
+            assert!(validate_oidc_config(&settings).is_ok());
+        }
+
+        #[test]
+        fn flag_absent_fails_validation() {
+            const CONFIG: &str = r#"
+                [server]
+                runtime_shutdown_timeout_seconds = 0
+
+                [server.auth.oidc]
+                issuer = "https://id.example.com"
+                client_id = "lore"
+
+                [immutable_store]
+                mode = "local"
+
+                [immutable_store.local]
+                path = "/tmp/immutable"
+                flush_delay_seconds = 5
+
+                [mutable_store]
+                mode = "local"
+
+                [mutable_store.local]
+                path = "/tmp/mutable"
+                flush_delay_seconds = 5
+            "#;
+            let settings: Settings = toml::from_str(CONFIG)
+                .expect("parses: authorize_all_repositories defaults to false");
+
+            let error = validate_oidc_config(&settings).expect_err("must fail closed");
+            assert!(
+                error.to_string().contains("authorize_all_repositories"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn flag_false_fails_validation() {
+            const CONFIG: &str = r#"
+                [server]
+                runtime_shutdown_timeout_seconds = 0
+
+                [server.auth.oidc]
+                issuer = "https://id.example.com"
+                client_id = "lore"
+                authorize_all_repositories = false
+
+                [immutable_store]
+                mode = "local"
+
+                [immutable_store.local]
+                path = "/tmp/immutable"
+                flush_delay_seconds = 5
+
+                [mutable_store]
+                mode = "local"
+
+                [mutable_store.local]
+                path = "/tmp/mutable"
+                flush_delay_seconds = 5
+            "#;
+            let settings: Settings = toml::from_str(CONFIG).expect("parses");
+
+            assert!(validate_oidc_config(&settings).is_err());
+        }
+
+        #[test]
+        fn flag_true_passes_validation() {
+            const CONFIG: &str = r#"
+                [server]
+                runtime_shutdown_timeout_seconds = 0
+
+                [server.auth.oidc]
+                issuer = "https://id.example.com"
+                client_id = "lore"
+                authorize_all_repositories = true
+
+                [immutable_store]
+                mode = "local"
+
+                [immutable_store.local]
+                path = "/tmp/immutable"
+                flush_delay_seconds = 5
+
+                [mutable_store]
+                mode = "local"
+
+                [mutable_store.local]
+                path = "/tmp/mutable"
+                flush_delay_seconds = 5
+            "#;
+            let settings: Settings = toml::from_str(CONFIG).expect("parses");
+
+            assert!(validate_oidc_config(&settings).is_ok());
+        }
+    }
 
     #[test]
     fn test_settings_with_plugin_sections() {

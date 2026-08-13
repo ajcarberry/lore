@@ -481,10 +481,10 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
         Arc::new(jwk_service)
     };
 
-    Ok(Some(JwtVerifier {
-        jwk_service,
-        jwt_issuer,
-        jwt_audience,
+    Ok(Some(if oidc_mode {
+        JwtVerifier::oidc(jwk_service, jwt_issuer, jwt_audience)
+    } else {
+        JwtVerifier::new(jwk_service, jwt_issuer, jwt_audience)
     }))
 }
 
@@ -2338,6 +2338,11 @@ mod tests {
 
             assert_eq!(verifier.jwt_issuer, Some("the-issuer".to_string()));
             assert_eq!(verifier.jwt_audience, Some(vec!["lore".to_string()]));
+            assert_eq!(
+                verifier.mode,
+                crate::auth::jwt::JwtVerifierMode::LoreClaims,
+                "a jwk-only verifier must not gain the OIDC third decode / wildcard grant"
+            );
         }
 
         #[tokio::test]
@@ -2363,6 +2368,11 @@ mod tests {
 
             assert_eq!(verifier.jwt_issuer, Some(issuer));
             assert_eq!(verifier.jwt_audience, Some(vec!["lore-client".to_string()]));
+            assert_eq!(
+                verifier.mode,
+                crate::auth::jwt::JwtVerifierMode::Oidc,
+                "a [server.auth.oidc]-derived verifier must be built in OIDC mode"
+            );
             let _ = address;
         }
 

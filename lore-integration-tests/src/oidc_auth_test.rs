@@ -86,11 +86,15 @@ mod oidc_auth_tests {
             endpoint: jwks_uri,
         }));
 
-        Ok(JwtVerifier {
+        // `[server.auth.oidc]`'s authn-only mode — the premise this whole matrix
+        // tests against — is what `JwtVerifier::oidc` builds; `build_jwt_verifier`
+        // (P4, `lore-server/src/server.rs`) builds the identical verifier from
+        // real settings via the same constructor.
+        Ok(JwtVerifier::oidc(
             jwk_service,
-            jwt_issuer: Some(fixture.issuer().to_string()),
-            jwt_audience: Some(vec![audience.to_string()]),
-        })
+            Some(fixture.issuer().to_string()),
+            Some(vec![audience.to_string()]),
+        ))
     }
 
     /// Start a real HTTP server, in process, over fresh in-memory backends — the same
@@ -521,11 +525,15 @@ mod oidc_auth_grpc_tests {
             endpoint: jwks_uri,
         }));
 
-        Ok(JwtVerifier {
+        // `[server.auth.oidc]`'s authn-only mode — the premise this whole matrix
+        // tests against — is what `JwtVerifier::oidc` builds; `build_jwt_verifier`
+        // (P4, `lore-server/src/server.rs`) builds the identical verifier from
+        // real settings via the same constructor.
+        Ok(JwtVerifier::oidc(
             jwk_service,
-            jwt_issuer: Some(fixture.issuer().to_string()),
-            jwt_audience: Some(vec![audience.to_string()]),
-        })
+            Some(fixture.issuer().to_string()),
+            Some(vec![audience.to_string()]),
+        ))
     }
 
     /// Start a real gRPC server, in process, the same shape `storage_remote_test.rs` uses

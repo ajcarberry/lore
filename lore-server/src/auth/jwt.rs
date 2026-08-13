@@ -109,12 +109,11 @@ impl From<OidcIdTokenClaims> for AuthorizationToken {
     /// `idp` is the issuer, and the display fields fall back to `sub` when the
     /// provider did not send them — the same substitution the LEP specifies
     /// for the client's `JWTUserInfo` equivalent. `resources` is always the
-    /// all-repositories wildcard: reaching this decode at all already means
-    /// the token cleared signature, issuer, audience, and expiry checks, and
-    /// no configuration in the tree can produce a `[server.auth.oidc]`-style
-    /// `JwtVerifier` for which that grant is not the intended one — a
-    /// Lore-issued token always carries `env`/`name`/`preferred_username` and
-    /// is decoded by one of the two claim shapes above instead.
+    /// all-repositories wildcard: this conversion is reachable only from a
+    /// [`JwtVerifierMode::Oidc`] verifier, whose configuration
+    /// (`authorize_all_repositories`) is what the wildcard records, and only
+    /// for a token that already cleared signature, issuer, audience, and
+    /// expiry checks.
     fn from(claims: OidcIdTokenClaims) -> Self {
         let display_name = claims.name.unwrap_or_else(|| claims.user_id.clone());
         let preferred_username = claims
@@ -153,11 +152,70 @@ pub enum JwtVerifierError {
     NotAuthorized,
 }
 
+/// Which claim shapes `verify_token_internal` accepts, and whether a
+/// successfully-decoded token is granted the all-repositories wildcard.
+///
+/// This is what makes the third, minimal OIDC claim decode additive rather
+/// than a widening (LEP Security Considerations, "the third claim decode
+/// accepts a token the operator did not intend"). A `[server.auth.jwk]`-only
+/// deployment (`ucs-auth` and friends) always builds a `LoreClaims` verifier
+/// via [`JwtVerifier::new`], so a token that is correctly signed by its
+/// trusted issuer but happens to omit `env`/`name`/`preferred_username` keeps
+/// being refused exactly as it is today — it is never granted every
+/// repository on the strength of an omitted claim. Only a verifier built from
+/// a configured `[server.auth.oidc]` block, via [`JwtVerifier::oidc`], is
+/// `Oidc` mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JwtVerifierMode {
+    /// Only Lore's own claim shapes (`AuthorizationToken`, `JWTUserInfo`)
+    /// verify. The mode of every verifier built before `[server.auth.oidc]`
+    /// existed, and the default.
+    #[default]
+    LoreClaims,
+    /// `[server.auth.oidc]`'s authn-only mode: after both Lore-shaped decodes
+    /// fail, a conformant ID token verifies too, and is granted the
+    /// all-repositories wildcard resource on success.
+    Oidc,
+}
+
 #[derive(Clone)]
 pub struct JwtVerifier {
     pub jwk_service: Arc<dyn JWKService>,
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<Vec<String>>,
+    pub mode: JwtVerifierMode,
+}
+
+impl JwtVerifier {
+    /// Today's behavior: only Lore's own claim shapes verify. What every
+    /// `[server.auth.jwk]`-only deployment builds.
+    pub fn new(
+        jwk_service: Arc<dyn JWKService>,
+        jwt_issuer: Option<String>,
+        jwt_audience: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            jwk_service,
+            jwt_issuer,
+            jwt_audience,
+            mode: JwtVerifierMode::LoreClaims,
+        }
+    }
+
+    /// `[server.auth.oidc]`'s authn-only mode. What `build_jwt_verifier`
+    /// builds when the operator configured that block.
+    pub fn oidc(
+        jwk_service: Arc<dyn JWKService>,
+        jwt_issuer: Option<String>,
+        jwt_audience: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            jwk_service,
+            jwt_issuer,
+            jwt_audience,
+            mode: JwtVerifierMode::Oidc,
+        }
+    }
 }
 
 /// Whether a verification failure could be the signing key's fault rather than the token's.
@@ -261,41 +319,57 @@ impl JwtVerifier {
             return Ok(token_data.claims);
         }
 
-        if let Ok(token_data) = decode::<JWTUserInfo>(token, key, &validation) {
-            let token = token_data.claims;
-            return Ok(AuthorizationToken {
-                user_id: token.user_id,
-                issuer: token.issuer,
-                issued_at: token.issued_at,
-                expires: token.expires,
-                audience: token.audience,
-                env: token.env,
-                name: token.name,
-                preferred_username: token.preferred_username,
-                resources: None,
-                groups: None,
-                is_service_account: token.is_service_account,
-                idp: String::default(),
-            });
-        }
-
-        // Reached only once both Lore-specific claim shapes above have failed to
-        // deserialize. A conformant OpenID Connect ID token satisfies this one
-        // instead, carrying none of `env`/`name`/`preferred_username` — see
-        // `OidcIdTokenClaims`.
-        let token_data = decode::<OidcIdTokenClaims>(token, key, &validation).map_err(|error| {
-            if matches!(
-                error.kind(),
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature
-            ) {
-                debug!(error = ?error, "Allowable error decoding JWT AuthN token");
-            } else {
-                warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
+        match decode::<JWTUserInfo>(token, key, &validation) {
+            Ok(token_data) => {
+                let token = token_data.claims;
+                Ok(AuthorizationToken {
+                    user_id: token.user_id,
+                    issuer: token.issuer,
+                    issued_at: token.issued_at,
+                    expires: token.expires,
+                    audience: token.audience,
+                    env: token.env,
+                    name: token.name,
+                    preferred_username: token.preferred_username,
+                    resources: None,
+                    groups: None,
+                    is_service_account: token.is_service_account,
+                    idp: String::default(),
+                })
             }
-            JwtVerifierError::ValidationFailed(error)
-        })?;
-
-        Ok(token_data.claims.into())
+            // Reached only once both Lore-specific claim shapes above have
+            // failed to deserialize, and only in OIDC mode: a
+            // `[server.auth.jwk]`-only verifier stops here, exactly as it does
+            // today. In OIDC mode a conformant ID token satisfies this third
+            // shape instead, carrying none of `env`/`name`/`preferred_username`
+            // — see `OidcIdTokenClaims`.
+            Err(_) if self.mode == JwtVerifierMode::Oidc => {
+                decode::<OidcIdTokenClaims>(token, key, &validation)
+                    .map_err(|error| {
+                        if matches!(
+                            error.kind(),
+                            jsonwebtoken::errors::ErrorKind::ExpiredSignature
+                        ) {
+                            debug!(error = ?error, "Allowable error decoding JWT AuthN token");
+                        } else {
+                            warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
+                        }
+                        JwtVerifierError::ValidationFailed(error)
+                    })
+                    .map(|token_data| token_data.claims.into())
+            }
+            Err(error) => {
+                if matches!(
+                    error.kind(),
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature
+                ) {
+                    debug!(error = ?error, "Allowable error decoding JWT AuthN token");
+                } else {
+                    warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
+                }
+                Err(JwtVerifierError::ValidationFailed(error))
+            }
+        }
     }
 }
 
@@ -557,11 +631,7 @@ mod tests {
         }
 
         fn verifier_for(service: Arc<RotatingJWKService>) -> JwtVerifier {
-            JwtVerifier {
-                jwk_service: service,
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["Lore".to_string()]),
-            }
+            JwtVerifier::new(service, None, Some(vec!["Lore".to_string()]))
         }
 
         /// Well past `Validation`'s default 60-second leeway, so the expiry is what fails.
@@ -694,11 +764,7 @@ mod tests {
             // Serving no replacement keeps these tests about the first verdict.
             service.expect_refresh_key().returning(|_| Ok(None));
 
-            JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["Lore".to_string()]),
-            }
+            JwtVerifier::new(Arc::new(service), None, Some(vec!["Lore".to_string()]))
         }
 
         /// Assemble a token with an arbitrary header, since `encode` will not produce the
@@ -768,11 +834,8 @@ mod tests {
                     Algorithm::RS256,
                 ))
             });
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["Lore".to_string()]),
-            };
+            let verifier =
+                JwtVerifier::new(Arc::new(service), None, Some(vec!["Lore".to_string()]));
 
             let forged = {
                 let jwt_key = EncodingKey::from_secret(RSA_N.as_bytes());
@@ -922,11 +985,11 @@ mod tests {
                 ))
             });
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
-            };
+            let verifier = JwtVerifier::new(
+                Arc::new(service),
+                None,
+                Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
+            );
 
             let authn_string_audience = json!({
                 "sub": "the u".to_string(),
@@ -961,11 +1024,11 @@ mod tests {
                 ))
             });
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
-            };
+            let verifier = JwtVerifier::new(
+                Arc::new(service),
+                None,
+                Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
+            );
 
             let base_authz_token = mock_authz_token(vec!["URC_test".to_string()]);
             let authz_string_audience = json!({
@@ -997,11 +1060,11 @@ mod tests {
                 ))
             });
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["urc.example.com".to_string(), "Lore".to_string()]),
-            };
+            let verifier = JwtVerifier::new(
+                Arc::new(service),
+                None,
+                Some(vec!["urc.example.com".to_string(), "Lore".to_string()]),
+            );
             let (original_authz_token, encoded_authz_token) =
                 make_authz_token_with_audience(vec!["Lore".to_string()]);
             let (original_authn_token, encoded_authn_token) =
@@ -1031,11 +1094,7 @@ mod tests {
 
             let common_audience = vec!["urc.example.com".to_string(), "Lore".to_string()];
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(common_audience.clone()),
-            };
+            let verifier = JwtVerifier::new(Arc::new(service), None, Some(common_audience.clone()));
 
             let (original_token, encoded_token) = make_authz_token_with_audience(common_audience);
 
@@ -1056,11 +1115,8 @@ mod tests {
                 ))
             });
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["Lore".to_string()]),
-            };
+            let verifier =
+                JwtVerifier::new(Arc::new(service), None, Some(vec!["Lore".to_string()]));
 
             let (original_token, encoded_token) = make_authz_token_with_audience(vec![
                 "urc.example.com".to_string(),
@@ -1090,11 +1146,11 @@ mod tests {
                     ))
                 });
 
-                JwtVerifier {
-                    jwk_service: Arc::new(service),
-                    jwt_issuer: Some("https://id.example.com".to_string()),
-                    jwt_audience: Some(vec!["lore".to_string()]),
-                }
+                JwtVerifier::oidc(
+                    Arc::new(service),
+                    Some("https://id.example.com".to_string()),
+                    Some(vec!["lore".to_string()]),
+                )
             }
 
             fn minimal_claims() -> serde_json::Value {
@@ -1227,6 +1283,38 @@ mod tests {
                     "authn-only path grants nothing itself"
                 );
             }
+
+            /// The invariant the third decode exists to preserve: a
+            /// `[server.auth.jwk]`-only verifier — `LoreClaims` mode, what every
+            /// `ucs-auth` deployment builds via `JwtVerifier::new` — must refuse a
+            /// token this same signature, issuer, audience, and expiry would pass,
+            /// once it lacks `env`/`name`/`preferred_username`. Without this gate,
+            /// such a deployment would newly accept a trusted-issuer-signed token
+            /// it refuses today, and grant it every repository on the strength of
+            /// the omitted claims — the exact widening `[server.auth.oidc]` is
+            /// supposed to require an explicit opt-in for.
+            #[tokio::test]
+            async fn a_non_oidc_verifier_rejects_the_minimal_claim_shape() {
+                let mut service = MockTestJWKService::new();
+                service.expect_get_key().returning(|_| {
+                    Ok((
+                        DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                        AGREED_UPON_ALGORITHM,
+                    ))
+                });
+                let non_oidc_verifier = JwtVerifier::new(
+                    Arc::new(service),
+                    Some("https://id.example.com".to_string()),
+                    Some(vec!["lore".to_string()]),
+                );
+                let encoded = encode_jwt(&minimal_claims());
+
+                let error = non_oidc_verifier.verify_token(&encoded).await.expect_err(
+                    "a LoreClaims verifier must never accept a token missing \
+                         env/name/preferred_username, however well it verifies otherwise",
+                );
+                assert!(matches!(error, JwtVerifierError::ValidationFailed(_)));
+            }
         }
 
         #[tokio::test]
@@ -1239,11 +1327,8 @@ mod tests {
                 ))
             });
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["skein".to_string()]),
-            };
+            let verifier =
+                JwtVerifier::new(Arc::new(service), None, Some(vec!["skein".to_string()]));
 
             let (_, encoded_token) = make_authz_token_with_audience(vec!["Lore".to_string()]);
 

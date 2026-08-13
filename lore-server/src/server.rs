@@ -2353,7 +2353,7 @@ mod tests {
 
         #[tokio::test]
         async fn oidc_derives_issuer_audience_and_jwk_endpoint_from_discovery() {
-            let (address, issuer) =
+            let (_address, issuer) =
                 spawn_discovery_and_jwks_server(&issuer_agnostic_rsa_jwks()).await;
             let oidc = OidcSettings {
                 issuer: issuer.clone(),
@@ -2379,7 +2379,6 @@ mod tests {
                 crate::auth::jwt::JwtVerifierMode::Oidc,
                 "a [server.auth.oidc]-derived verifier must be built in OIDC mode"
             );
-            let _ = address;
         }
 
         #[tokio::test]

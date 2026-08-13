@@ -232,6 +232,24 @@ fn key_may_be_stale(error: &JwtVerifierError) -> bool {
     ))
 }
 
+/// Log a claim-decode failure at the level its kind deserves, and carry it on.
+///
+/// An expired token is an ordinary event on any path a client can reach, so it stays at
+/// `debug`; anything else is worth an operator's attention. Both terminal decode arms of
+/// [`JwtVerifier::verify_token_internal`] end here, so the level a failure is reported at
+/// does not depend on which claim shape was tried last.
+fn decode_failure(error: jsonwebtoken::errors::Error) -> JwtVerifierError {
+    if matches!(
+        error.kind(),
+        jsonwebtoken::errors::ErrorKind::ExpiredSignature
+    ) {
+        debug!(error = ?error, "Allowable error decoding JWT AuthN token");
+    } else {
+        warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
+    }
+    JwtVerifierError::ValidationFailed(error)
+}
+
 impl JwtVerifier {
     /// Verify a token, re-fetching the signing key once if the cached one looks stale.
     ///
@@ -345,30 +363,10 @@ impl JwtVerifier {
             // — see `OidcIdTokenClaims`.
             Err(_) if self.mode == JwtVerifierMode::Oidc => {
                 decode::<OidcIdTokenClaims>(token, key, &validation)
-                    .map_err(|error| {
-                        if matches!(
-                            error.kind(),
-                            jsonwebtoken::errors::ErrorKind::ExpiredSignature
-                        ) {
-                            debug!(error = ?error, "Allowable error decoding JWT AuthN token");
-                        } else {
-                            warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
-                        }
-                        JwtVerifierError::ValidationFailed(error)
-                    })
+                    .map_err(decode_failure)
                     .map(|token_data| token_data.claims.into())
             }
-            Err(error) => {
-                if matches!(
-                    error.kind(),
-                    jsonwebtoken::errors::ErrorKind::ExpiredSignature
-                ) {
-                    debug!(error = ?error, "Allowable error decoding JWT AuthN token");
-                } else {
-                    warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
-                }
-                Err(JwtVerifierError::ValidationFailed(error))
-            }
+            Err(error) => Err(decode_failure(error)),
         }
     }
 }

@@ -24,6 +24,7 @@ use tracing::Instrument;
 use tracing::debug;
 
 use super::record::build_repository;
+use crate::authnz::repository_authorizer::is_auth_client_scheme;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -118,7 +119,10 @@ async fn list_candidate_ids(
     auth_url: Option<String>,
     authorization: Option<String>,
 ) -> Result<Vec<RepositoryId>, Status> {
-    if let Some(auth_url) = auth_url {
+    // The same rule the other authorization readers apply: an `oidc+` auth URL names an
+    // identity provider, which has no list of repositories a user may see, so listing falls
+    // back to what is stored locally rather than dialing it as a ReBAC service.
+    if let Some(auth_url) = auth_url.filter(|url| is_auth_client_scheme(url)) {
         let ids = lookup_authorized_repositories(auth_url, authorization).await?;
         Ok(ids.into_iter().map(RepositoryId::from).collect())
     } else {

@@ -89,13 +89,34 @@ fn acceptable_root_domains(
         return Ok(decoded_token.claims.acceptable_root_domains());
     }
 
-    // The remote is added rather than checked for, so the guard holds for it by
-    // construction instead of by a check that could disagree with what gets stored.
+    // The remote is added rather than checked for: what says whether this credential may
+    // reach it is the *authentication* token's stored set, which
+    // `tokens_for_auth_service_and_recipient` has already required the recipient to be in.
+    // A backend's set describes its own token's audience and can never name the remote.
     let mut domains = authz.acceptable_root_domains.clone();
     if !domains.iter().any(|domain| domain == recipient_domain) {
         domains.push(recipient_domain.to_string());
     }
     Ok(domains)
+}
+
+/// Loads only a stored authentication token that is acceptable both for the auth service
+/// it will be presented to and for the remote the authorization token is destined for.
+///
+/// The recipient half is the token-recipient guard on this path. `exchange` is reachable
+/// with an explicit identity and a caller-supplied recipient, and where the authorization
+/// token *is* the authentication token -- an OpenID Connect passthrough -- any remote that
+/// advertises the auth URL a user logged in against would otherwise be handed that user's
+/// credential. Only the stored acceptable-domain set records where a token may go, since an
+/// ID token's own claims name a client id and an issuer but never a remote, so the check
+/// belongs on the way out of the store.
+fn tokens_for_auth_service_and_recipient(
+    auth_domain: String,
+    recipient_domain: String,
+) -> impl FnMut(&&token_store::IdentityToken) -> bool {
+    let mut for_auth_service = tokens_only_for_recipient_domain(auth_domain);
+    let mut for_recipient = tokens_only_for_recipient_domain(recipient_domain);
+    move |item| for_auth_service(item) && for_recipient(item)
 }
 
 /// Exchanges an authentication token for a repository-scoped authorization
@@ -178,16 +199,18 @@ pub async fn exchange(
         lore_trace!("No stored authz token found for {cache_key:?}");
     }
 
-    // Load authn token for the auth service domain
+    // Load authn token for the auth service domain, and only if it may reach the recipient
     lore_trace!("Authorizing using authn identity: {identity}");
     let Some(auth_service_only_token) = lore_credential::user_info(
         auth_url.as_str(),
         identity,
-        tokens_only_for_recipient_domain(auth_domain),
+        tokens_for_auth_service_and_recipient(auth_domain, recipient_domain.clone()),
     )
     .await
     else {
-        lore_debug!("Not authenticated, unable to perform authz exchange");
+        lore_debug!(
+            "No authentication token usable at {recipient_domain}, unable to perform authz exchange"
+        );
         return Err(NotAuthenticated.into());
     };
     lore_trace!("Authorizing using endpoint: {auth_url}");
@@ -328,11 +351,13 @@ pub async fn exchange_custom_resource(
     let Some(auth_service_only_token) = lore_credential::user_info(
         auth_url.as_str(),
         identity,
-        tokens_only_for_recipient_domain(auth_domain),
+        tokens_for_auth_service_and_recipient(auth_domain, recipient_domain.clone()),
     )
     .await
     else {
-        lore_debug!("Not authenticated, unable to perform authz exchange");
+        lore_debug!(
+            "No authentication token usable at {recipient_domain}, unable to perform authz exchange"
+        );
         return Err(NotAuthenticated.into());
     };
     lore_trace!("Authorizing using endpoint: {auth_url}");

@@ -19,6 +19,7 @@ mod tests {
     use lore_base::error::NotAuthenticated;
     use lore_base::error::NotAuthorized;
     use lore_base::error::NotSupported;
+    use lore_credential::token_store;
     use lore_revision::lore::RepositoryId;
     use lore_transport::AuthSession;
     use lore_transport::Authentication;
@@ -28,6 +29,8 @@ mod tests {
     use lore_transport::ProtocolError;
     use lore_transport::ResolvedUser;
     use lore_transport::auth::authentication;
+
+    include!("helper.rs");
 
     struct TestAuthentication {
         exchange_result:
@@ -42,6 +45,21 @@ mod tests {
                         token: "authz-token".into(),
                         expires_ms: u64::MAX,
                         acceptable_root_domains: vec![],
+                    })
+                }),
+            }
+        }
+
+        /// The shape an OpenID Connect provider produces: the authorization token is the
+        /// authentication token, and the only domain it can name for itself is the
+        /// issuer's.
+        fn oidc_shaped(issuer_domain: &'static str) -> Self {
+            Self {
+                exchange_result: Box::new(move |_| {
+                    Ok(AuthorizationToken {
+                        token: unsigned_jwt("user-1"),
+                        expires_ms: u64::MAX,
+                        acceptable_root_domains: vec![issuer_domain.to_string()],
                     })
                 }),
             }
@@ -288,6 +306,89 @@ mod tests {
             .unwrap();
         assert!(user.is_some());
         assert_eq!(user.unwrap().user_id, "id-for-Alice");
+    }
+
+    /// A JWT with a far-future expiry and a signature nothing checks -- the credential
+    /// store reads the claims, and the server owns verification.
+    fn unsigned_jwt(subject: &str) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+            URL_SAFE_NO_PAD.encode(format!(
+                r#"{{"iss":"https://id.example.com","sub":"{subject}","exp":9999999999,"aud":["lore-cli"]}}"#
+            )),
+            URL_SAFE_NO_PAD.encode("not-a-signature"),
+        )
+    }
+
+    /// Points the credential store at a directory of its own, with the encryption key in a
+    /// file rather than the OS keyring, so the test neither reads nor writes the
+    /// developer's real credentials.
+    fn isolated_credential_store() -> TempDir {
+        let auth_dir = generate_tempdir();
+        unsafe {
+            std::env::set_var("LORE_AUTH_PATH", auth_dir.display().to_string());
+            std::env::set_var("LORE_AUTH_STORE", "fallback");
+        }
+        auth_dir
+    }
+
+    /// The token-recipient guard, on the path an explicit identity takes.
+    ///
+    /// `exchange` loads the stored authentication token by the *auth service's* domain, so
+    /// nothing in it consults the set of domains that token was stored as acceptable for.
+    /// A remote that advertises the auth URL the user logged in against therefore asks for,
+    /// and under an OIDC passthrough receives, the user's own credential -- which is the
+    /// leak the guard exists to prevent.
+    #[tokio::test]
+    async fn exchange_refuses_a_recipient_the_stored_token_does_not_name() {
+        let scheme = "test-exchange-recipient-guard";
+        let auth_url = format!("{scheme}://id.example.com");
+        let identity = "user-1";
+        let _auth_dir = isolated_credential_store();
+        authentication::add(
+            scheme,
+            Arc::new(TestAuthentication::oidc_shaped("id.example.com")),
+        )
+        .unwrap();
+
+        // What a login persists: the issuer, plus the remote the login was performed
+        // against. `repo-b.example.com` is not among them.
+        token_store::store_user_token(
+            &auth_url,
+            identity,
+            &unsigned_jwt(identity),
+            vec!["id.example.com".into(), "repo-a.example.com".into()],
+        )
+        .await
+        .expect("Failed to store authentication token");
+
+        let refused = lore_transport::auth::exchange::exchange(
+            &auth_url,
+            identity,
+            RepositoryId::default(),
+            "repo-b.example.com".to_string(),
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "a token stored for repo-a was handed to repo-b"
+        );
+
+        let allowed = lore_transport::auth::exchange::exchange(
+            &auth_url,
+            identity,
+            RepositoryId::default(),
+            "repo-a.example.com".to_string(),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "the remote the login named was refused its own token: {:?}",
+            allowed.unwrap_err()
+        );
     }
 
     #[tokio::test]

@@ -413,10 +413,10 @@ Considered** takes up why a dedicated field would be worse in both directions.
 everywhere it is read, and every reader on the server wants the same thing from it: a dial target for
 Epic's relationship-based authorization service. `repository_authorizer`
 (`lore-server/src/authnz/repository_authorizer.rs`) selects an `AuthClientAuthorizer` — a gRPC client
-for that service — whenever the value is `Some`, and `AllowAllRepositoryAuthorizer` otherwise; four
-repository handlers dial the service directly to register or check a resource. Left alone,
-advertising an `oidc+https://…` URL would point every one of them at the identity provider and fail
-repository create, delete, query, and metadata operations alike.
+for that service — whenever the value is `Some`, and `AllowAllRepositoryAuthorizer` otherwise; five
+repository handlers dial the service directly to register, check, or enumerate a resource. Left
+alone, advertising an `oidc+https://…` URL would point every one of them at the identity provider and
+fail repository create, delete, query, list, and metadata operations alike.
 
 Two mechanisms keep advertisement and dialing apart, and the design needs both.
 
@@ -430,14 +430,21 @@ than a string every downstream reader has to recognize and refuse.
 
 **Each consumer gates on the scheme as well**, because an operator may still set `auth_url`
 explicitly, and because a value travelling this far should not be safe only by virtue of where it
-came from. `is_auth_client_scheme` (`repository_authorizer.rs`) is the single predicate — `ucs-auth`
-and `https` name the authorization service, every other scheme does not — and it gates all five
-reading sites: `repository_authorizer` itself, plus the four direct dials, in the two independent
-repository-create implementations (`grpc/handlers/repository_create.rs`,
-`grpc/repository/v1/repository_create.rs`) and the two repository-delete ones
-(`grpc/handlers/repository_delete.rs`, `grpc/repository/v1/repository_delete.rs`). Falling back to
-`AllowAllRepositoryAuthorizer` is the correct answer under `authorize_all_repositories`, and refusing
-to be a silent broken client is the correct answer under anything else. Delete is the one operation
+came from. `is_auth_client_scheme` (`repository_authorizer.rs`) is the single predicate, and it is
+written as an exclusion rather than an allowlist: an `oidc+` scheme names an identity provider and
+gives up the authorization check, and **every other scheme keeps it**. That direction matters. An
+allowlist of the schemes known to name the authorization service — `ucs-auth` and `https` — silently
+drops the check for any deployment that spells its auth URL differently, plain `http` to a service
+behind a mesh being the obvious one, and a dropped check is the failure nobody notices from the
+outside, because every operation still succeeds. The predicate gates all six reading sites:
+`repository_authorizer` itself, plus the five direct dials, in the two independent repository-create
+implementations (`grpc/handlers/repository_create.rs`, `grpc/repository/v1/repository_create.rs`),
+the two repository-delete ones (`grpc/handlers/repository_delete.rs`,
+`grpc/repository/v1/repository_delete.rs`), and repository list
+(`grpc/repository/v1/repository_list.rs`). Falling back to `AllowAllRepositoryAuthorizer` is the
+correct answer under `authorize_all_repositories` and for an `oidc+` URL, where the check moves into
+the server's own token verification; it is logged as a warning naming the scheme, because a server
+that stops checking repository access should say so once at startup. Delete is the one operation
 where the fallback is not simply "allow": it lands on the local creator-ownership check instead, which
 **One authorization mode** takes up.
 
@@ -451,7 +458,12 @@ A new `Authentication` implementation registers for `oidc+https` and `oidc+http`
 It parses the issuer and parameters out of the auth URL, fetches the same discovery document the
 server did — the client needs `authorization_endpoint`, `token_endpoint`, and
 `device_authorization_endpoint`, none of which the server has reason to relay — and fits three flows
-onto the trait's existing method shapes. Every network client and task is constructed under
+onto the trait's existing method shapes. Those endpoints are remote input and are held to the rule the
+configured auth URL is held to: https, or http only to a loopback host. The authorization endpoint in
+particular becomes the URL handed to `open::that`, which asks the desktop to launch whatever URI it
+names, so a `javascript:` or `file:` endpoint in a malicious or compromised provider's document would
+be a local-execution primitive rather than a failed login. Every network client and task is
+constructed under
 `lore_spawn_net!` on the net runtime, per the accepted
 [runtime-split LEP](2026-07-24-tokio-runtime-split-and-async-io.md).
 
@@ -470,7 +482,9 @@ existing `poll_interactive_session` loop in `lore-revision/src/auth/login.rs` dr
 `login_url` as an event instead of opening a browser, and that is the shape
 [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) wants: `start_auth_session` posts to the device
 authorization endpoint and returns `verification_uri_complete` (or the URI and user code) as
-`login_url` and the device code as `session_code`; `poll_auth_session` polls the token endpoint,
+`login_url`, with an opaque handle as `session_code` and the device code held in the session state
+behind it — the orchestration layer logs the handle, and RFC 8628's device code redeems the login's
+tokens on its own; `poll_auth_session` polls the token endpoint,
 mapping `authorization_pending` to `None`, honoring `interval`, and backing off on `slow_down` (§3.5).
 PocketID 2.6.2, the provider this work validates against, advertises `device_authorization_endpoint`
 in its discovery document and completes the grant, so the headless path is proven against the first
@@ -486,7 +500,12 @@ can never arrive.
 **Staying logged in: the refresh grant.** The client requests the `offline_access` scope, and
 `refresh_authentication` posts a `refresh_token` grant. `AuthenticationToken.refresh_token` and
 `token_store::store_refresh_token` already exist and already treat refresh tokens as separately
-stored and rotated, so this is filling in an implementation, not extending a mechanism.
+stored and rotated, so this is filling in an implementation, not extending a mechanism. A refreshed
+response need not carry an ID token — Core §12.2 leaves it out of the required members — so the client
+treats it as optional there: under a resource indicator the access token is the credential and RFC
+9068 §2.2's `sub` is the identity, and without one the ID token is the credential, so its absence is a
+refusal naming what the provider omitted rather than a deserialization error. A login is the case
+where the ID token is never optional, because it is what the `nonce` travels on.
 
 **`exchange_for_repository` returns the authentication token unchanged.** There is nothing to exchange
 it with and nothing to mint. The call shape ADR-00003 established survives — the client still asks for
@@ -539,6 +558,20 @@ usable at the remote you logged in to and at its issuer, nowhere else. The guard
 preserved in full — a stored token never reaches a third party — and preserved without asking the
 operator to configure their own public hostname, which is the class of second-place-to-configure
 mistake issue #161 is.
+
+**Where that set is enforced.** Recording the set is half the guard; the other half is refusing to
+load a token for a recipient the set does not name, and the authorization exchange has to do that
+refusing itself. `auth_exchange` resolves an identity by loading the stored token under
+`tokens_only_for_recipient_domain(remote_domain)`, so a token that may not go to the remote is never
+selected — but `exchange` (`lore-transport/src/auth/exchange.rs`) is also called directly, with an
+explicit identity, from `connection.rs`, and on that path nothing upstream has consulted the set. So
+`exchange` applies the filter itself: it loads the authentication token only if the token is
+acceptable both for the auth service it is about to be presented to and for the remote the resulting
+authorization token is destined for. Where the authorization token *is* the authentication token —
+exactly the OIDC passthrough — that check is the whole distance between a stored credential and any
+remote that advertises the issuer it came from. Recording the recipient in the set on the way out,
+rather than checking it on the way in, would record it just as obligingly for an attacker's remote;
+pre-PR review found the implementation doing that, and it is why this paragraph exists.
 
 One consequence is visible to users: the store keys tokens by `(auth_url, identity)` and holds one per
 pair, so two deployments sharing an issuer and a client id share a bucket and logging in to one evicts
@@ -872,14 +905,16 @@ clear` already remove stored tokens, and refresh tokens live in the same store a
   is handed to code that expects an authorization service, failing repository create, delete, query,
   and metadata operations against a live provider — *materialized during implementation, and caught
   by the mitigation.* This entry originally named `repository_authorizer` as the only such consumer;
-  there are five reading sites, because repository create and delete each have two independent
-  implementations that dial the authorization service themselves. The end-to-end test asserting that
-  repository operations succeed against a secured server failed on `repository create` — a plaintext
-  h2c dial into the provider's TLS port — and the delete path was found by tracing the same call shape
-  rather than by a second failure. *Mitigation, as shipped:* the two mechanisms in **Advertising the
-  provider** — the derived URL confined to `advertised_environment`, and `is_auth_client_scheme`
-  gating all five sites — plus integration and end-to-end coverage of create and delete against a live
-  provider, which is what turned a design assumption into a caught bug.
+  there are six reading sites, because repository create and delete each have two independent
+  implementations that dial the authorization service themselves, and repository list dials it to
+  enumerate what a user may see. The end-to-end test asserting that repository operations succeed
+  against a secured server failed on `repository create` — a plaintext h2c dial into the provider's
+  TLS port — and the delete path was found by tracing the same call shape rather than by a second
+  failure; pre-PR review found the list path the same way. *Mitigation, as shipped:* the two
+  mechanisms in **Advertising the provider** — the derived URL confined to `advertised_environment`,
+  and `is_auth_client_scheme` gating all six sites — plus integration and end-to-end coverage of
+  create and delete against a live provider, which is what turned a design assumption into a caught
+  bug.
 - **Risk:** an unauthenticated caller drives outbound key-set fetches by cycling unknown key ids —
   *mitigation:* already bounded, and tested: `MIN_REFRESH_INTERVAL` throttles fetches once any key is
   cached, the refresh mutex collapses concurrent misses into one request, and a failure that no key

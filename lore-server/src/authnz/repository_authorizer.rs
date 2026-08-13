@@ -7,6 +7,7 @@ use lore_base::types::RepositoryId;
 use lore_proto::auth::CheckUserPermissionRequest;
 use tonic::Code;
 use tonic::Status;
+use tracing::warn;
 
 use super::auth::grpc_get_auth_client;
 use super::common::create_request_with_authorization;
@@ -90,29 +91,46 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
     }
 }
 
-/// Whether `auth_url` names a scheme this server has an authorization client
-/// for. `ucs-auth` and `https` both point at Epic's relationship-based
-/// authorization service; every other scheme — `oidc+https` included — is not
-/// that service, and handing it to `AuthClientAuthorizer` would point a gRPC
-/// client at whatever the scheme actually names (an identity provider, for
-/// `oidc+https`) and fail every repository operation that checks it.
+/// Whether `auth_url` names an OpenID Connect provider, which is the one thing this
+/// server must not point its relationship-based authorization client at: the URL names an
+/// identity provider, and dialing it as if it were the authorization service would fail
+/// every repository operation that checks a permission.
+fn is_oidc_scheme(auth_url: &str) -> bool {
+    auth_url
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.starts_with("oidc+"))
+}
+
+/// Whether `auth_url` names a scheme this server checks repository access against.
+///
+/// Everything that is not an `oidc+` URL does. The rule is written that way round on
+/// purpose: an allowlist of known authorization schemes silently drops the check for any
+/// deployment spelling its auth URL differently — plain `http` to a service behind a mesh,
+/// say — and dropping the check is the failure that cannot be noticed from the outside,
+/// because every operation still succeeds. Only OIDC, where the check genuinely moves into
+/// the server's own token verification, gives it up.
 pub(crate) fn is_auth_client_scheme(auth_url: &str) -> bool {
-    matches!(
-        auth_url.split_once("://").map(|(scheme, _)| scheme),
-        Some("ucs-auth" | "https")
-    )
+    !is_oidc_scheme(auth_url)
 }
 
 /// Creates the appropriate authorizer from an optional auth URL.
-/// Returns `AllowAllRepositoryAuthorizer` when no URL is configured, or when
-/// the URL's scheme is not one this server has an authorization client for
-/// (see [`is_auth_client_scheme`]) — which is the correct answer under
-/// `authorize_all_repositories` and refuses to be a silent broken client
-/// under anything else.
+///
+/// Returns `AllowAllRepositoryAuthorizer` when no URL is configured — the correct answer
+/// under `authorize_all_repositories` — and for an `oidc+` URL, where the server verifies
+/// the provider's token itself and has no per-repository authority to consult. Every other
+/// URL keeps its authorization check (see [`is_auth_client_scheme`]).
 pub fn repository_authorizer(auth_url: Option<String>) -> Arc<dyn RepositoryAuthorizer> {
     match auth_url {
-        Some(url) if is_auth_client_scheme(&url) => Arc::new(AuthClientAuthorizer::new(url)),
-        _ => Arc::new(AllowAllRepositoryAuthorizer),
+        Some(url) if is_oidc_scheme(&url) => {
+            warn!(
+                "Auth URL '{url}' names an OpenID Connect provider, so repository access is \
+                 not checked against an authorization service: every verified token is \
+                 allowed every repository"
+            );
+            Arc::new(AllowAllRepositoryAuthorizer)
+        }
+        Some(url) => Arc::new(AuthClientAuthorizer::new(url)),
+        None => Arc::new(AllowAllRepositoryAuthorizer),
     }
 }
 
@@ -144,9 +162,19 @@ mod tests {
         assert!(!is_auth_client_scheme("oidc+http://127.0.0.1:1411"));
     }
 
+    /// The rule is fail-closed for everything this change did not come to serve: only an
+    /// `oidc+` scheme gives up the authorization check. A deployment that reaches its
+    /// authorization service over plain `http` -- behind a mesh, or in a test harness --
+    /// kept its check before OIDC existed and keeps it now.
     #[test]
-    fn plain_http_scheme_does_not_select_the_auth_client() {
-        assert!(!is_auth_client_scheme("http://auth.example.com"));
+    fn plain_http_scheme_selects_the_auth_client() {
+        assert!(is_auth_client_scheme("http://auth.example.com"));
+    }
+
+    /// An unrecognized scheme is not a licence to stop checking either.
+    #[test]
+    fn an_unknown_scheme_selects_the_auth_client() {
+        assert!(is_auth_client_scheme("grpc://auth.example.com"));
     }
 
     #[tokio::test]

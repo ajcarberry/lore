@@ -228,7 +228,43 @@ fn parse_discovery(body: &str, expected_issuer: &str) -> Result<Discovery, Proto
         )));
     }
 
+    check_endpoint("authorization_endpoint", &discovery.authorization_endpoint)?;
+    check_endpoint("token_endpoint", &discovery.token_endpoint)?;
+    if let Some(endpoint) = &discovery.device_authorization_endpoint {
+        check_endpoint("device_authorization_endpoint", endpoint)?;
+    }
+
     Ok(discovery)
+}
+
+/// Holds an endpoint the provider advertised to the rule `parse_auth_url` holds a
+/// configured issuer to: https, or http only to a loopback host.
+///
+/// A discovery document is remote input, and these members are not just dialed: the
+/// authorization endpoint becomes the URL handed to `open::that`, which asks the desktop to
+/// launch whatever the URI names. Unchecked, a `javascript:` or `file:` endpoint from a
+/// malicious or compromised provider is a local-code-execution primitive, and a plain-http
+/// one puts an authorization code and an ID token on the wire in the clear.
+fn check_endpoint(member: &str, endpoint: &str) -> Result<(), ProtocolError> {
+    let url = Url::parse(endpoint).map_err(|e| {
+        ProtocolError::internal(format!(
+            "provider advertises an unusable {member} '{endpoint}': {e}"
+        ))
+    })?;
+
+    let dialable = match url.scheme() {
+        "https" => true,
+        "http" => is_loopback(url.host()),
+        _ => false,
+    };
+    if !dialable {
+        return Err(ProtocolError::internal(format!(
+            "provider advertises {member} '{endpoint}', which this client will not open or \
+             dial -- an endpoint has to be https, or http to a loopback host"
+        )));
+    }
+
+    Ok(())
 }
 
 /// A fresh code verifier: 32 random bytes, base64url without padding, which is 43
@@ -371,10 +407,14 @@ fn authorization_code(
 /// either way.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 struct TokenResponse {
-    id_token: String,
-    /// REQUIRED of a successful response by RFC 6749 §5.1, but optional here so a
-    /// provider that omits it produces this module's own diagnostic rather than a
+    /// Present on every login, and genuinely optional on a refresh: OpenID Connect Core
+    /// §12.2 does not oblige a provider to reissue an ID token for a refresh grant. Where
+    /// one is missing but needed, the diagnostic is this module's own rather than a
     /// deserialization error naming a field the operator has never heard of.
+    #[serde(default)]
+    id_token: Option<String>,
+    /// REQUIRED of a successful response by RFC 6749 §5.1, but optional here for the same
+    /// reason.
     #[serde(default)]
     access_token: Option<String>,
     #[serde(default)]
@@ -534,6 +574,11 @@ struct AccessTokenClaims {
     exp: u64,
     #[serde(default)]
     aud: Option<Audience>,
+    /// REQUIRED of an RFC 9068 access token (§2.2), but read only where the response
+    /// carried no ID token to take the identity from, so a provider that omits it stays
+    /// usable everywhere else.
+    #[serde(default)]
+    sub: Option<String>,
 }
 
 /// Picks the access token out of a token response and checks it is the one a
@@ -609,39 +654,87 @@ fn resource_bound_credential(
 /// authorization request that produced it, and `None` for a refresh, where OpenID Connect
 /// Core §12.2 makes the claim optional.
 ///
-/// The ID token is always the *identity*: it is the assertion carrying `nonce` and the
-/// display claims, and it is what is checked here. What changes under a resource indicator
-/// is only which token is the *credential* -- the thing stored, presented, and refreshed
-/// on expiry -- because that is what the server verifies.
+/// The ID token is the *identity* whenever the response carries one: it is the assertion
+/// carrying `nonce` and the display claims, and it is what is checked here. What changes
+/// under a resource indicator is only which token is the *credential* -- the thing stored,
+/// presented, and refreshed on expiry -- because that is what the server verifies.
 fn authentication_token(
     tokens: TokenResponse,
     expected_nonce: Option<&str>,
     parts: &AuthUrlParts,
 ) -> Result<AuthenticationToken, ProtocolError> {
-    let claims = id_token_claims(&tokens.id_token)?;
+    // The ID token and the claims read out of it travel together, so no later step has to
+    // reason about one being present without the other.
+    let identity = tokens
+        .id_token
+        .clone()
+        .map(|token| id_token_claims(&token).map(|claims| (token, claims)))
+        .transpose()?;
 
-    if let Some(expected) = expected_nonce
-        && claims.nonce.as_deref() != Some(expected)
-    {
-        return Err(ProtocolError::internal(
-            "ID token does not echo this login's nonce and may be a replay",
-        ));
+    // A login's ID token is not optional -- Core §3.1.3.3 puts it in the response, and it
+    // is what the nonce travels on -- so its absence there is a provider fault, named as
+    // one rather than left to surface as a missing identity three steps later.
+    if let Some(expected) = expected_nonce {
+        let (_, claims) = identity.as_ref().ok_or_else(|| {
+            ProtocolError::internal(
+                "the token endpoint returned no id_token, so this login cannot be tied to \
+                 the request that started it",
+            )
+        })?;
+        if claims.nonce.as_deref() != Some(expected) {
+            return Err(ProtocolError::internal(
+                "ID token does not echo this login's nonce and may be a replay",
+            ));
+        }
     }
 
     let (token, expires) = match parts.resource.as_deref() {
         Some(resource) => resource_bound_credential(&tokens, resource)?,
-        None => (tokens.id_token, claims.exp),
+        None => {
+            let (id_token, claims) = identity.as_ref().ok_or_else(|| {
+                ProtocolError::internal(
+                    "the token endpoint returned no id_token, and without a resource \
+                     indicator the ID token is the credential this deployment presents -- \
+                     a provider that omits it on a refresh (OpenID Connect Core §12.2 \
+                     permits that) can only be used where the server advertises a resource",
+                )
+            })?;
+            (id_token.clone(), claims.exp)
+        }
+    };
+
+    // Identity from the ID token whenever there is one. Without one -- a refresh against a
+    // provider that exercised §12.2, which reaches here only in resource mode -- the
+    // credential is the access token, of which RFC 9068 §2.2 requires `sub`.
+    let (user_id, user_name) = match identity {
+        Some((_, claims)) => (
+            claims.sub.clone(),
+            // `name` and `preferred_username` are optional claims delivered with the
+            // `profile` scope. Falling back to `sub` keeps a login from failing over a
+            // display string.
+            claims
+                .name
+                .or(claims.preferred_username)
+                .unwrap_or(claims.sub),
+        ),
+        None => {
+            let subject = decode_unverified::<AccessTokenClaims>(&token)
+                .ok()
+                .and_then(|claims| claims.sub)
+                .ok_or_else(|| {
+                    ProtocolError::internal(
+                        "the refreshed access token names no `sub`, so there is no identity \
+                         to store the credential under (RFC 9068 §2.2 requires one)",
+                    )
+                })?;
+            (subject.clone(), subject)
+        }
     };
 
     Ok(AuthenticationToken {
         token,
-        user_id: claims.sub.clone(),
-        // `name` and `preferred_username` are optional claims delivered with the `profile`
-        // scope. Falling back to `sub` keeps a login from failing over a display string.
-        user_name: claims
-            .name
-            .or(claims.preferred_username)
-            .unwrap_or(claims.sub),
+        user_id,
+        user_name,
         // Claims count seconds since the epoch; every other Lore timestamp is milliseconds.
         expires_ms: expires.saturating_mul(1000),
         // The party that issued the token already has it, so it can always go back there.
@@ -984,6 +1077,9 @@ struct PkceSession {
 struct DeviceSession {
     parts: AuthUrlParts,
     token_endpoint: String,
+    /// RFC 8628 §3.4's credential for redeeming this login's tokens. It stays in here: the
+    /// handle the caller polls with is a separate, opaque string.
+    device_code: String,
     schedule: PollSchedule,
 }
 
@@ -1111,12 +1207,15 @@ impl OidcAuthentication {
         );
 
         let login_url = device_login_url(&authorization);
-        let session_code = authorization.device_code.clone();
+        // Opaque to the caller, as in the PKCE flow: the device code redeems this login's
+        // tokens on its own, and the handle travels back out through a layer that logs it.
+        let session_code = random_token();
         self.sessions.lock().insert(
             session_code.clone(),
             PendingSession::Device(DeviceSession {
                 parts,
                 token_endpoint: discovery.token_endpoint,
+                device_code: authorization.device_code,
                 schedule: PollSchedule::new(authorization.interval),
             }),
         );
@@ -1208,7 +1307,7 @@ impl OidcAuthentication {
     ) -> Result<Option<AuthenticationToken>, ProtocolError> {
         // The provider's interval is authoritative, whatever period the caller's own
         // polling loop runs at, so a poll that is not due yet does not reach the network.
-        let (token_endpoint, parts) = {
+        let (token_endpoint, parts, device_code) = {
             let mut sessions = self.sessions.lock();
             let Some(PendingSession::Device(session)) = sessions.get_mut(session_code) else {
                 return Err(ProtocolError::internal(
@@ -1220,10 +1319,14 @@ impl OidcAuthentication {
                 return Ok(None);
             }
             session.schedule.mark(now);
-            (session.token_endpoint.clone(), session.parts.clone())
+            (
+                session.token_endpoint.clone(),
+                session.parts.clone(),
+                session.device_code.clone(),
+            )
         };
 
-        let form = device_token_form(&parts, session_code);
+        let form = device_token_form(&parts, &device_code);
 
         let client = http_client().await?;
         let (status, body) = send(client.post(&token_endpoint).form(&form)).await?;
@@ -1580,6 +1683,70 @@ mod tests {
             .expect_err("a provider with no token endpoint cannot complete any flow");
     }
 
+    /// A discovery document is remote input: its endpoints get dialed, and the
+    /// authorization endpoint is handed to the desktop to open. The rule a configured
+    /// issuer passes applies to them too -- https, or http only to a loopback host -- and a
+    /// document that breaks it is refused by naming the member that broke it.
+    #[test]
+    fn discovery_endpoints_that_must_not_be_dialed_are_refused() {
+        let cases = [
+            (
+                "authorization_endpoint",
+                "javascript:fetch('https://elsewhere.example.com')",
+            ),
+            ("authorization_endpoint", "file:///etc/passwd"),
+            ("authorization_endpoint", "http://id.example.com/authorize"),
+            ("token_endpoint", "http://id.example.com/token"),
+            ("device_authorization_endpoint", "file:///etc/passwd"),
+        ];
+
+        for (member, endpoint) in cases {
+            let mut endpoints = HashMap::from([
+                (
+                    "authorization_endpoint",
+                    "https://id.example.com/authorize".to_string(),
+                ),
+                ("token_endpoint", "https://id.example.com/token".to_string()),
+                (
+                    "device_authorization_endpoint",
+                    "https://id.example.com/device".to_string(),
+                ),
+            ]);
+            endpoints.insert(member, endpoint.to_string());
+            let document = format!(
+                r#"{{"issuer":"https://id.example.com",
+                     "authorization_endpoint":"{}",
+                     "token_endpoint":"{}",
+                     "device_authorization_endpoint":"{}"}}"#,
+                endpoints["authorization_endpoint"],
+                endpoints["token_endpoint"],
+                endpoints["device_authorization_endpoint"],
+            );
+
+            let Err(error) = parse_discovery(&document, "https://id.example.com") else {
+                panic!("'{endpoint}' must not be usable as {member}");
+            };
+            assert!(
+                error.to_string().contains(member),
+                "the diagnostic must name the member at fault, got: {error}"
+            );
+        }
+    }
+
+    /// And the case the rule exists to keep working: a provider on this machine, which is
+    /// what a development deployment and the test harness both are.
+    #[test]
+    fn a_loopback_provider_may_advertise_http_endpoints() {
+        parse_discovery(
+            r#"{"issuer":"http://127.0.0.1:1411",
+                "authorization_endpoint":"http://127.0.0.1:1411/authorize",
+                "token_endpoint":"http://127.0.0.1:1411/api/oidc/token",
+                "device_authorization_endpoint":"http://localhost:1411/api/oidc/device"}"#,
+            "http://127.0.0.1:1411",
+        )
+        .expect("a loopback provider is the case oidc+http exists for");
+    }
+
     #[test]
     fn discovery_may_omit_the_device_endpoint() {
         let body = r#"{"issuer":"https://id.example.com","authorization_endpoint":"https://id.example.com/authorize","token_endpoint":"https://id.example.com/token"}"#;
@@ -1731,7 +1898,9 @@ mod tests {
     #[test]
     fn id_token_nonce_mismatch_is_refused() {
         let tokens = TokenResponse {
-            id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1000,"nonce":"another-nonce"}"#),
+            id_token: Some(unsigned_jwt(
+                r#"{"sub":"user-1","exp":1000,"nonce":"another-nonce"}"#,
+            )),
             refresh_token: None,
             ..Default::default()
         };
@@ -1742,7 +1911,7 @@ mod tests {
     #[test]
     fn id_token_without_a_nonce_is_refused_on_a_login() {
         let tokens = TokenResponse {
-            id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#),
+            id_token: Some(unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#)),
             refresh_token: None,
             ..Default::default()
         };
@@ -1756,7 +1925,7 @@ mod tests {
             r#"{"sub":"user-1","exp":1000,"nonce":"the-nonce","name":"Ada Lovelace"}"#,
         );
         let tokens = TokenResponse {
-            id_token: id_token.clone(),
+            id_token: Some(id_token.clone()),
             refresh_token: Some("the-refresh-token".to_string()),
             ..Default::default()
         };
@@ -1776,7 +1945,9 @@ mod tests {
     #[test]
     fn display_name_falls_back_through_preferred_username_to_sub() {
         let tokens = TokenResponse {
-            id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1,"preferred_username":"ada"}"#),
+            id_token: Some(unsigned_jwt(
+                r#"{"sub":"user-1","exp":1,"preferred_username":"ada"}"#,
+            )),
             refresh_token: None,
             ..Default::default()
         };
@@ -1784,7 +1955,7 @@ mod tests {
         assert_eq!(token.user_name, "ada");
 
         let tokens = TokenResponse {
-            id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1}"#),
+            id_token: Some(unsigned_jwt(r#"{"sub":"user-1","exp":1}"#)),
             refresh_token: None,
             ..Default::default()
         };
@@ -1795,13 +1966,57 @@ mod tests {
     #[test]
     fn a_refreshed_id_token_need_not_carry_a_nonce() {
         let tokens = TokenResponse {
-            id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#),
+            id_token: Some(unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#)),
             refresh_token: Some("rotated".to_string()),
             ..Default::default()
         };
         let token =
             authentication_token(tokens, None, &parts()).expect("refresh should be accepted");
         assert_eq!(token.user_id, "user-1");
+    }
+
+    /// OpenID Connect Core §12.2 leaves `id_token` out of what a refresh response has to
+    /// carry, so a conformant provider that omits it must not fail before this module has
+    /// looked at the response at all.
+    #[test]
+    fn a_refresh_response_without_an_id_token_is_readable() {
+        serde_json::from_str::<TokenResponse>(
+            r#"{"access_token":"at","token_type":"Bearer","refresh_token":"rotated"}"#,
+        )
+        .expect("a refresh response may omit the ID token");
+    }
+
+    /// Where the ID token is the credential there is nothing left to present, so the
+    /// refresh fails -- but on this module's own diagnostic, which names the way out.
+    #[test]
+    fn a_refresh_without_an_id_token_is_refused_where_the_id_token_is_the_credential() {
+        let tokens = TokenResponse {
+            id_token: None,
+            access_token: Some("an-opaque-access-token".to_string()),
+            refresh_token: Some("rotated".to_string()),
+        };
+        let error = authentication_token(tokens, None, &parts())
+            .expect_err("there is no credential to store");
+        assert!(
+            error.to_string().contains("id_token"),
+            "the diagnostic should name the missing member: {error}"
+        );
+    }
+
+    /// A login is the case where the ID token is never optional: it is what the nonce
+    /// travels on.
+    #[test]
+    fn a_login_without_an_id_token_is_refused() {
+        let tokens = TokenResponse {
+            id_token: None,
+            ..Default::default()
+        };
+        let error = authentication_token(tokens, Some("the-nonce"), &parts())
+            .expect_err("a login cannot complete without an ID token");
+        assert!(
+            error.to_string().contains("id_token"),
+            "the diagnostic should name the missing member: {error}"
+        );
     }
 
     /// A deployment that names itself gets the `resource` parameter on every grant
@@ -1829,7 +2044,9 @@ mod tests {
 
         fn tokens_for(access_token: Option<String>) -> TokenResponse {
             TokenResponse {
-                id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1000,"name":"Ada Lovelace"}"#),
+                id_token: Some(unsigned_jwt(
+                    r#"{"sub":"user-1","exp":1000,"name":"Ada Lovelace"}"#,
+                )),
                 access_token,
                 refresh_token: Some("the-refresh-token".to_string()),
             }
@@ -1961,6 +2178,27 @@ mod tests {
             assert_eq!(token.acceptable_root_domains, vec!["id.example.com"]);
         }
 
+        /// The case OpenID Connect Core §12.2 allows and this deployment survives: the
+        /// refreshed response carries no ID token, the access token was already the
+        /// credential, and RFC 9068 §2.2's `sub` is the identity to store it under.
+        #[test]
+        fn a_refresh_without_an_id_token_still_yields_a_credential() {
+            let access = access_token(RESOURCE);
+            let tokens = TokenResponse {
+                id_token: None,
+                access_token: Some(access.clone()),
+                refresh_token: Some("rotated".to_string()),
+            };
+
+            let token = authentication_token(tokens, None, &resource_parts())
+                .expect("a refresh may omit the ID token");
+
+            assert_eq!(token.token, access, "the access token is the credential");
+            assert_eq!(token.user_id, "user-1");
+            assert_eq!(token.expires_ms, 2_000_000);
+            assert_eq!(token.refresh_token.as_deref(), Some("rotated"));
+        }
+
         /// And without a resource nothing moves: the ID token is still the credential.
         #[test]
         fn the_id_token_stays_the_credential_without_a_resource() {
@@ -1968,7 +2206,7 @@ mod tests {
             let id_token = tokens.id_token.clone();
             let token = authentication_token(tokens, None, &parts()).expect("unchanged behavior");
 
-            assert_eq!(token.token, id_token);
+            assert_eq!(Some(token.token), id_token);
             assert_eq!(token.expires_ms, 1_000_000);
         }
 
@@ -1977,7 +2215,9 @@ mod tests {
         #[test]
         fn the_nonce_is_still_checked_against_the_id_token() {
             let tokens = TokenResponse {
-                id_token: unsigned_jwt(r#"{"sub":"user-1","exp":1000,"nonce":"another"}"#),
+                id_token: Some(unsigned_jwt(
+                    r#"{"sub":"user-1","exp":1000,"nonce":"another"}"#,
+                )),
                 access_token: Some(access_token(RESOURCE)),
                 refresh_token: None,
             };
@@ -2100,6 +2340,87 @@ mod tests {
         );
     }
 
+    /// Answers one HTTP request on a loopback port with a canned body, so a grant that has
+    /// to reach a provider can be driven without one.
+    async fn one_shot_provider(body: &'static str) -> String {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("a bound address").port();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("a request");
+
+            // Drain the whole request before answering: a client still writing its body
+            // into a socket the far end has already closed sees a transport error rather
+            // than the response.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(headers_end) = text.find("\r\n\r\n") {
+                    let length: usize = text
+                        .to_ascii_lowercase()
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|rest| rest.split("\r\n").next())
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        });
+
+        format!("http://127.0.0.1:{port}/device")
+    }
+
+    /// RFC 8628's `device_code` is a bearer credential: whoever holds it redeems the
+    /// tokens. The handle `start_auth_session` returns is not one -- the orchestration
+    /// layer logs it, and the LEP undertakes that device codes are never logged -- so the
+    /// two must not be the same string.
+    #[tokio::test]
+    async fn a_device_login_hands_back_a_handle_that_is_not_the_device_code() {
+        let endpoint = one_shot_provider(
+            r#"{"device_code":"the-device-code","user_code":"WDJB-MJHT",
+                "verification_uri":"https://id.example.com/device","interval":5}"#,
+        )
+        .await;
+        let auth = OidcAuthentication::default();
+        let discovery = Discovery {
+            issuer: "https://id.example.com".to_string(),
+            authorization_endpoint: "https://id.example.com/authorize".to_string(),
+            token_endpoint: "https://id.example.com/token".to_string(),
+            device_authorization_endpoint: Some(endpoint),
+        };
+
+        let session = auth
+            .start_device(parts(), discovery)
+            .await
+            .expect("the device authorization should start");
+
+        assert_ne!(
+            session.session_code, "the-device-code",
+            "the device code is the session handle, and the handle gets logged"
+        );
+    }
+
     #[test]
     fn device_login_url_prefers_the_complete_verification_uri() {
         let authorization = DeviceAuthorization {
@@ -2188,7 +2509,7 @@ mod tests {
         let DeviceStep::Granted(tokens) = step else {
             panic!("expected tokens, got {step:?}");
         };
-        assert_eq!(tokens.id_token, "the-id-token");
+        assert_eq!(tokens.id_token.as_deref(), Some("the-id-token"));
         assert_eq!(tokens.refresh_token.as_deref(), Some("the-refresh-token"));
     }
 

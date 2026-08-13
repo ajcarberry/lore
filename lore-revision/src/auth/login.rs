@@ -408,3 +408,33 @@ async fn poll_interactive_session(
     }
     Err(InteractiveLoginError::internal("Timeout"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn authn_token(acceptable_root_domains: Vec<String>, token: &str) -> AuthenticationToken {
+        AuthenticationToken {
+            token: token.to_string(),
+            user_id: "user-1".to_string(),
+            user_name: "user-1".to_string(),
+            expires_ms: 0,
+            acceptable_root_domains,
+            refresh_token: None,
+        }
+    }
+
+    /// The producer half of the token-recipient guard: what login persists is what
+    /// `exchange` later requires the recipient to be in. Drop the remote here and every
+    /// OpenID Connect login still succeeds, while every operation against the remote it
+    /// was performed for is refused a token.
+    #[test]
+    fn an_oidc_login_may_be_used_at_its_remote_and_its_issuer() {
+        let authn = authn_token(vec!["id.example.com".to_string()], "not-decoded");
+
+        let domains = acceptable_root_domains(&authn, "repo.example.com").unwrap();
+
+        assert!(domains.contains(&"id.example.com".to_string()));
+        assert!(domains.contains(&"repo.example.com".to_string()));
+    }
+}

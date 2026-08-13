@@ -20,7 +20,7 @@ In this guide, you'll register Lore as a client with your provider, turn on auth
     - **PKCE** enabled.
     - A callback address of `http://127.0.0.1:*/callback`, where the browser login flow's loopback listener receives the redirect. PocketID accepts a wildcard port; other providers may need a fixed port or a range.
 
-    Set the access-token lifetime in minutes rather than hours. Lore holds no revocation list — a verified token works until it expires — so a short lifetime bounds how long a revoked user keeps access. Clients refresh without prompting, so it costs users nothing.
+    Set the ID-token lifetime in minutes rather than hours — that's the token Lore presents by default. Lore holds no revocation list — a verified token works until it expires — so a short lifetime bounds how long a revoked user keeps access. Clients refresh without prompting, so it costs users nothing. If you bind tokens to a resource (step 3), shorten the access-token lifetime too, since that becomes the credential.
 
     Note the client id and your provider's issuer address for the next step.
 

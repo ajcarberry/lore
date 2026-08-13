@@ -96,7 +96,7 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
 /// that service, and handing it to `AuthClientAuthorizer` would point a gRPC
 /// client at whatever the scheme actually names (an identity provider, for
 /// `oidc+https`) and fail every repository operation that checks it.
-fn is_auth_client_scheme(auth_url: &str) -> bool {
+pub(crate) fn is_auth_client_scheme(auth_url: &str) -> bool {
     matches!(
         auth_url.split_once("://").map(|(scheme, _)| scheme),
         Some("ucs-auth" | "https")

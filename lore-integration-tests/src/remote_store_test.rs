@@ -106,7 +106,7 @@ mod remote_store_tests {
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
+                .with_environment(EnvironmentConfig::default(), EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
                 .with_immutable_store(served_immutable.clone(), served_immutable)
                 .with_mutable_store(served_mutable)

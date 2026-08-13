@@ -171,22 +171,35 @@ impl GrpcServerBuilder<WantsEnvironment> {
     pub fn new() -> Self {
         Self(WantsEnvironment(()))
     }
+    /// `environment` is what internal consumers of the environment (currently
+    /// `LoreRepositoryService`/`LoreRepositoryV1Service`, for the ReBAC dial target)
+    /// read; `advertised_environment` is what `EnvironmentGet` returns to clients. They
+    /// start equal but diverge when `[server.auth.oidc]` derives an `auth_url` an
+    /// operator didn't set explicitly: that derived value is for advertisement only and
+    /// must never reach an internal consumer expecting a dialable endpoint (see
+    /// `repository_authorizer`'s scheme check, which exists for exactly this reason).
     pub fn with_environment(
         self,
         environment: EnvironmentConfig,
+        advertised_environment: EnvironmentConfig,
     ) -> GrpcServerBuilder<WantsFeature> {
-        GrpcServerBuilder(WantsFeature { environment })
+        GrpcServerBuilder(WantsFeature {
+            environment,
+            advertised_environment,
+        })
     }
 }
 
 pub struct WantsFeature {
     environment: EnvironmentConfig,
+    advertised_environment: EnvironmentConfig,
 }
 
 impl GrpcServerBuilder<WantsFeature> {
     pub fn with_feature(self, feature: FeatureSettings) -> GrpcServerBuilder<WantsImmutableStore> {
         GrpcServerBuilder(WantsImmutableStore {
             environment: self.0.environment,
+            advertised_environment: self.0.advertised_environment,
             feature,
         })
     }
@@ -194,6 +207,7 @@ impl GrpcServerBuilder<WantsFeature> {
 
 pub struct WantsImmutableStore {
     environment: EnvironmentConfig,
+    advertised_environment: EnvironmentConfig,
     feature: FeatureSettings,
 }
 
@@ -205,6 +219,7 @@ impl GrpcServerBuilder<WantsImmutableStore> {
     ) -> GrpcServerBuilder<WantsMutableStore> {
         GrpcServerBuilder(WantsMutableStore {
             environment: self.0.environment,
+            advertised_environment: self.0.advertised_environment,
             feature: self.0.feature,
             immutable_store,
             local_store,
@@ -214,6 +229,7 @@ impl GrpcServerBuilder<WantsImmutableStore> {
 
 pub struct WantsMutableStore {
     environment: EnvironmentConfig,
+    advertised_environment: EnvironmentConfig,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -226,6 +242,7 @@ impl GrpcServerBuilder<WantsMutableStore> {
     ) -> GrpcServerBuilder<MaybeLockStore> {
         GrpcServerBuilder(MaybeLockStore {
             environment: self.0.environment,
+            advertised_environment: self.0.advertised_environment,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -236,6 +253,7 @@ impl GrpcServerBuilder<WantsMutableStore> {
 
 pub struct MaybeLockStore {
     environment: EnvironmentConfig,
+    advertised_environment: EnvironmentConfig,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -249,6 +267,7 @@ impl GrpcServerBuilder<MaybeLockStore> {
     ) -> GrpcServerBuilder<WantsNotification> {
         GrpcServerBuilder(WantsNotification {
             environment: self.0.environment,
+            advertised_environment: self.0.advertised_environment,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -260,6 +279,7 @@ impl GrpcServerBuilder<MaybeLockStore> {
 
 pub struct WantsNotification {
     environment: EnvironmentConfig,
+    advertised_environment: EnvironmentConfig,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -275,6 +295,7 @@ impl GrpcServerBuilder<WantsNotification> {
     ) -> GrpcServerBuilder<MaybeHookDispatcher> {
         GrpcServerBuilder(MaybeHookDispatcher {
             environment: self.0.environment,
+            advertised_environment: self.0.advertised_environment,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -288,6 +309,7 @@ impl GrpcServerBuilder<WantsNotification> {
 
 pub struct MaybeHookDispatcher {
     environment: EnvironmentConfig,
+    advertised_environment: EnvironmentConfig,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -304,6 +326,7 @@ impl GrpcServerBuilder<MaybeHookDispatcher> {
     ) -> GrpcServerBuilder<WantsTlsConfig> {
         GrpcServerBuilder(WantsTlsConfig {
             environment: self.0.environment,
+            advertised_environment: self.0.advertised_environment,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -318,6 +341,7 @@ impl GrpcServerBuilder<MaybeHookDispatcher> {
 
 pub struct WantsTlsConfig {
     environment: EnvironmentConfig,
+    advertised_environment: EnvironmentConfig,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -358,6 +382,7 @@ impl GrpcServerBuilder<WantsTlsConfig> {
 
         Ok(GrpcServerBuilder(WantsAdminEndpoints {
             environment: self.0.environment,
+            advertised_environment: self.0.advertised_environment,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -373,6 +398,7 @@ impl GrpcServerBuilder<WantsTlsConfig> {
 
 pub struct WantsAdminEndpoints {
     environment: EnvironmentConfig,
+    advertised_environment: EnvironmentConfig,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -400,6 +426,7 @@ impl GrpcServerBuilder<WantsAdminEndpoints> {
         );
         GrpcServerBuilder(WantsHttp2Config {
             environment: self.0.environment,
+            advertised_environment: self.0.advertised_environment,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -416,6 +443,7 @@ impl GrpcServerBuilder<WantsAdminEndpoints> {
 
 pub struct WantsHttp2Config {
     environment: EnvironmentConfig,
+    advertised_environment: EnvironmentConfig,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -440,6 +468,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
     ) -> GrpcServerBuilder<MaybeJwtVerifier> {
         GrpcServerBuilder(MaybeJwtVerifier {
             environment: self.0.environment,
+            advertised_environment: self.0.advertised_environment,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -462,6 +491,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
 
 pub struct MaybeJwtVerifier {
     environment: EnvironmentConfig,
+    advertised_environment: EnvironmentConfig,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -561,8 +591,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             rpc_timeout,
         );
 
-        let environment_svc = LoreEnvironmentService::new(self.0.environment.clone());
-        let environment_v1_svc = LoreEnvironmentV1Service::new(self.0.environment);
+        let environment_svc = LoreEnvironmentService::new(self.0.advertised_environment.clone());
+        let environment_v1_svc = LoreEnvironmentV1Service::new(self.0.advertised_environment);
         let lock_svc = match self.0.lock_store {
             Some(lock_store) => {
                 info!("Enabling LockService");

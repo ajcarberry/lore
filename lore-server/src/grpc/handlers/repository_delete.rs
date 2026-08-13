@@ -27,6 +27,7 @@ use super::repository_query::repository_query_id;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::authnz::repository_authorizer::is_auth_client_scheme;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -104,7 +105,15 @@ async fn repository_delete(
 
     let user_id = execution_context().user_id().await;
 
-    if let Some(auth_url) = auth_url {
+    // Deliberate interim choice, not the LEP's authn-only model: a `ucs-auth`/`https`
+    // auth_url defers to the external ReBAC service as today, but any other scheme
+    // (`oidc+https` included) falls through to the same creator-ownership check an
+    // unconfigured server already uses, rather than dialing a non-ReBAC endpoint.
+    // Whether OIDC mode should instead let any authenticated identity delete any
+    // repository -- matching the all-repositories grant this mode gives every other
+    // operation -- is a design question for the LEP discussion, not a call this guard
+    // makes.
+    if let Some(auth_url) = auth_url.filter(|url| is_auth_client_scheme(url)) {
         // Use external auth service to authorize deletion
         repository_delete_auth_resource(auth_url, authorization, repository.id).await?;
     } else {

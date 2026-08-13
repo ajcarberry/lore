@@ -22,6 +22,7 @@ use tracing::info;
 
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
+use crate::authnz::repository_authorizer::is_auth_client_scheme;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -74,7 +75,15 @@ pub async fn handler(
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
-            if let Some(auth_url) = auth_url {
+            // Deliberate interim choice, not the LEP's authn-only model: a `ucs-auth`/
+            // `https` auth_url defers to the external ReBAC service as today, but any
+            // other scheme (`oidc+https` included) falls through to the same
+            // creator-ownership check an unconfigured server already uses, rather than
+            // dialing a non-ReBAC endpoint. Whether OIDC mode should instead let any
+            // authenticated identity delete any repository -- matching the
+            // all-repositories grant this mode gives every other operation -- is a
+            // design question for the LEP discussion, not a call this guard makes.
+            if let Some(auth_url) = auth_url.filter(|url| is_auth_client_scheme(url)) {
                 repository_delete_auth_resource(auth_url, authorization, id).await?;
             } else if metadata.creator != user_id && !bypass_protection {
                 info!(

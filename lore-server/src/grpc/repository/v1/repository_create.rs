@@ -24,6 +24,7 @@ use tracing::warn;
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use super::repository_get::repository_load_name;
+use crate::authnz::repository_authorizer::is_auth_client_scheme;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -290,7 +291,11 @@ async fn repository_create_inner(
         };
     }
 
-    if let Some(auth_url) = auth_url {
+    // `auth_url` also carries the OIDC provider's advertisement URL (see
+    // `repository_authorizer`, which applies the same scheme check for the same
+    // reason): only a `ucs-auth`/`https` value names Epic's relationship-based
+    // authorization service this call registers the new resource with.
+    if let Some(auth_url) = auth_url.filter(|url| is_auth_client_scheme(url)) {
         let client = Box::new(crate::authnz::rebac::grpc_get_rebac_client(auth_url).await?);
         repository_create_auth_resource(client, authorization, repository.id, name).await?;
     }

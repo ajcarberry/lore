@@ -563,22 +563,6 @@ async fn launch_grpc_server(
     let mut environment = settings.environment.clone().unwrap_or_default();
     let feature = settings.feature.clone().unwrap_or_default();
 
-    // Advertise the provider (LEP "Advertising the provider") when the operator
-    // configured OIDC but left the auth endpoint to derive. An explicit
-    // `auth_url` — including an explicitly empty one — always wins.
-    if let Some(oidc) = settings
-        .server
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.oidc.as_ref())
-    {
-        let mut endpoint = environment.endpoint.unwrap_or_default();
-        if endpoint.auth_url.as_deref().unwrap_or_default().is_empty() {
-            endpoint.auth_url = derive_oidc_auth_url(oidc);
-        }
-        environment.endpoint = Some(endpoint);
-    }
-
     // Enforce store limits
     if let Some(limit) = immutable_store.max_query_batch() {
         let mut config = environment.config.unwrap_or_default();
@@ -591,8 +575,30 @@ async fn launch_grpc_server(
         environment.config = Some(config);
     }
 
+    // Advertise the provider (LEP "Advertising the provider") when the operator
+    // configured OIDC but left the auth endpoint to derive. An explicit
+    // `auth_url` — including an explicitly empty one — always wins.
+    //
+    // This is advertisement only, so it is applied to a clone rather than
+    // `environment` itself: `environment` is also what internal consumers read
+    // (e.g. the ReBAC dial target for repository create/delete), and a derived
+    // `oidc+https://…` string is not a service either of them can dial.
+    let mut advertised_environment = environment.clone();
+    if let Some(oidc) = settings
+        .server
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.oidc.as_ref())
+    {
+        let mut endpoint = advertised_environment.endpoint.unwrap_or_default();
+        if endpoint.auth_url.as_deref().unwrap_or_default().is_empty() {
+            endpoint.auth_url = derive_oidc_auth_url(oidc);
+        }
+        advertised_environment.endpoint = Some(endpoint);
+    }
+
     GrpcServerBuilder::new()
-        .with_environment(environment)
+        .with_environment(environment, advertised_environment)
         .with_feature(feature)
         .with_immutable_store(immutable_store, local_store)
         .with_mutable_store(mutable_store)

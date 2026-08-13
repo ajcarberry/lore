@@ -29,6 +29,8 @@ mod oidc_client_tests {
     use std::time::Duration;
 
     use lore_base::types::RepositoryId;
+    use lore_credential::token_store;
+    use lore_credential::token_store::tokens_only_for_recipient_domain;
     use lore_transport::Authentication;
     use lore_transport::AuthenticationToken;
     use lore_transport::LoginFlow;
@@ -307,6 +309,129 @@ mod oidc_client_tests {
             rotated, refresh_token,
             "The refresh token was not rotated, so a stolen one stays usable"
         );
+    }
+
+    /// The refresh grant where it actually has to work: not called directly, but reached by
+    /// an ordinary repository operation whose stored login has aged out. What the user sees
+    /// is the operation going through; what they do not see is a browser.
+    ///
+    /// Expiry is staged rather than waited for -- PocketID's token lifetimes are measured in
+    /// hours. The client verifies no signatures (the server owns verification), so a stored
+    /// token whose `exp` has been moved into the past is expired as far as every client-side
+    /// check is concerned, which is the state this exercises.
+    ///
+    /// Requires the compose stack (see above).
+    #[tokio::test]
+    async fn an_expired_login_is_refreshed_by_the_exchange_path() {
+        let (fixture, user, auth_url) = setup().await.expect("PocketID fixture setup failed");
+        isolated_credential_store();
+        let auth = OidcAuthentication::default();
+
+        let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
+            .await
+            .expect("The PKCE login should complete");
+        let refresh_token = token
+            .refresh_token
+            .clone()
+            .expect("The login issued no refresh token");
+        let expired = with_expiry_in_the_past(&token.token);
+
+        // What a login leaves behind, some hours later. `REMOTE_DOMAIN` is the remote the
+        // login was performed against, and the credential store adds the auth service.
+        token_store::store_user_token(
+            &auth_url,
+            &token.user_id,
+            &expired,
+            vec![REMOTE_DOMAIN.to_string()],
+        )
+        .await
+        .expect("Failed to store the expired authentication token");
+        token_store::store_refresh_token(&auth_url, &token.user_id, &refresh_token)
+            .await
+            .expect("Failed to store the refresh token");
+
+        let authz = lore_transport::auth::exchange::exchange(
+            &auth_url,
+            &token.user_id,
+            RepositoryId::default(),
+            REMOTE_DOMAIN.to_string(),
+        )
+        .await
+        .expect("The operation should proceed on a refreshed credential, with no new login");
+
+        assert_ne!(
+            authz, expired,
+            "The expired credential was presented, so the server would refuse the operation"
+        );
+        fixture
+            .validate_token(&authz, CLIENT_ID)
+            .await
+            .expect("The refreshed credential did not verify against the issuer's JWKS");
+
+        // Rotated, and kept: PocketID retires the refresh token it was given, so storing the
+        // new one is what makes the *next* expiry survivable too.
+        let stored_refresh = token_store::load_refresh_token(&auth_url, &token.user_id)
+            .await
+            .expect("The refresh token is gone, so the next expiry needs a login");
+        assert_ne!(
+            stored_refresh, refresh_token,
+            "The rotated refresh token was not stored, so the session dies at the next expiry"
+        );
+
+        // And the refresh did not widen where the credential may be sent.
+        assert!(
+            token_store::load_user_token(
+                &auth_url,
+                &token.user_id,
+                tokens_only_for_recipient_domain("elsewhere.example.com".to_string()),
+            )
+            .await
+            .is_err(),
+            "The refreshed token is offered to a remote the login never named"
+        );
+    }
+
+    /// The remote the staged login was performed against.
+    const REMOTE_DOMAIN: &str = "repo.example.com";
+
+    /// Points the credential store at a directory of its own, with the encryption key in a
+    /// file rather than the OS keyring, so the test neither reads nor writes the developer's
+    /// real credentials -- and, on macOS, raises no keychain prompt.
+    fn isolated_credential_store() {
+        static AUTH_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        AUTH_DIR.get_or_init(|| {
+            let auth_dir = tempfile::tempdir().expect("Failed to create a credential store dir");
+            unsafe {
+                std::env::set_var("LORE_AUTH_PATH", auth_dir.path());
+                std::env::set_var("LORE_AUTH_STORE", "fallback");
+            }
+            auth_dir
+        });
+    }
+
+    /// The same token with its `exp` moved into the past. The signature no longer matches the
+    /// claims, which is exactly right: this stands in for a token the client should refuse to
+    /// present, and no client-side check reads the signature.
+    fn with_expiry_in_the_past(token: &str) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let mut parts = token.split('.');
+        let header = parts.next().expect("A JWT has a header");
+        let payload = parts.next().expect("A JWT has a payload");
+        let signature = parts.next().expect("A JWT has a signature");
+
+        let decoded = URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("The payload should be base64url");
+        let mut claims: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("The payload should be JSON");
+        claims["exp"] = serde_json::json!(1000000000);
+
+        format!(
+            "{header}.{}.{signature}",
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        )
     }
 
     /// `exchange_for_repository` returns the authentication token unchanged: there is nothing

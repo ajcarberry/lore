@@ -30,6 +30,7 @@ tracing-subscriber = { workspace = true }
 zerocopy = { workspace = true }
 lore = { workspace = true }
 lore-base = { workspace = true }
+lore-credential = { workspace = true }
 lore-storage = { workspace = true }
 lore-aws = { workspace = true }
 lore-revision = { workspace = true }

@@ -2665,6 +2665,7 @@ dependencies = [
  "lore",
  "lore-aws",
  "lore-base",
+ "lore-credential",
  "lore-hashicorp",
  "lore-proto",
  "lore-revision",

@@ -814,6 +814,67 @@ pub async fn store_refresh_token(
     }
 }
 
+/// Replaces an identity's stored authentication token with a refreshed one, keeping the
+/// acceptable-root-domain set recorded at login and rotating the refresh token when the
+/// provider issued a new one.
+///
+/// The domain set is deliberately not taken from the refreshed token. It is the recipient
+/// half of the token-recipient guard, and it names the remote the login was performed
+/// against -- something the auth backend cannot know and therefore cannot put on a token it
+/// hands back. Keeping the stored set means a refresh can neither widen where the credential
+/// may go nor strand it at the remote it was obtained for.
+///
+/// Returns `TokenNotFound` when there is no stored login to refresh: with no recorded
+/// recipients, a new entry here would be a token nobody may be given.
+pub async fn store_refreshed_user_token(
+    auth_endpoint: &str,
+    identity: &str,
+    token: &str,
+    rotated_refresh_token: Option<&str>,
+) -> Result<(), TokenStoreError> {
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
+
+    let encrypted_token = encrypt_token(token).await?;
+    let encrypted_refresh = match rotated_refresh_token {
+        Some(refresh_token) => Some(encrypt_token(refresh_token).await?),
+        None => None,
+    };
+
+    lore_trace!("Store refreshed user {identity} token for auth endpoint {auth_endpoint}");
+
+    let token_map = token_map();
+    let mut map_lock = token_map.lock().await;
+    let guard = lock_token_map().await?;
+    reload_token_map(&guard, &mut map_lock);
+
+    if let Some(map) = map_lock.as_mut()
+        && let Some(remote) = map
+            .remotes
+            .iter_mut()
+            .find(|entry| entry.remote == auth_endpoint)
+        && let Some(token_entry) = remote
+            .token
+            .iter_mut()
+            .find(|entry| entry.user_id == identity)
+    {
+        token_entry.token = encrypted_token;
+        if encrypted_refresh.is_some() {
+            token_entry.refresh_token = encrypted_refresh;
+        }
+    } else {
+        lore_debug!(
+            "No identity entry found for {identity} at {auth_endpoint}, cannot store refreshed token"
+        );
+        return Err(TokenNotFound.into());
+    }
+
+    if let Some(map) = map_lock.as_ref() {
+        store_token_map(&guard, map)
+    } else {
+        Err(TokenStoreError::internal("Failed to store token map"))
+    }
+}
+
 /// Loads and decrypts the refresh token for an identity.
 ///
 /// Returns `TokenStoreError::TokenNotFound` if no refresh token is stored.

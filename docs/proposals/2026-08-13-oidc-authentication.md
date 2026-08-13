@@ -507,6 +507,18 @@ treats it as optional there: under a resource indicator the access token is the 
 refusal naming what the provider omitted rather than a deserialization error. A login is the case
 where the ID token is never optional, because it is what the `nonce` travels on.
 
+The grant is consumed where an expired stored token would otherwise dead-end, in
+`lore-transport/src/auth/exchange.rs`: the authorization exchange refreshes instead of presenting a
+token the server will refuse, and identity resolution refreshes instead of passing the identity over
+as unusable. Refreshing is best-effort in the strict sense — a revoked token, a provider that is
+down, and `ucs-auth`'s `NotSupported` all leave the caller holding exactly the expired token and
+behaving exactly as it does today — so it can spare a user a re-login but can never fail an operation
+that would otherwise have succeeded. One attempt per operation, no retry loop, and single-flighted
+across concurrent callers, because the grant spends a single-use token. What gets persisted keeps the acceptable-root-domain set recorded at
+login (`token_store::store_refreshed_user_token`) rather than taking the refreshed token's own: that
+set names the remote the login was performed against, which no token a provider hands back can name —
+see **Keeping the token-recipient guard**.
+
 **`exchange_for_repository` returns the authentication token unchanged.** There is nothing to exchange
 it with and nothing to mint. The call shape ADR-00003 established survives — the client still asks for
 a token for a repository and still gets one back, and the QUIC path still sends one token per

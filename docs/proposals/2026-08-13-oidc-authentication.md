@@ -167,7 +167,7 @@ never relays a provider's endpoints and cannot get them stale.
 The document's own `issuer` member must equal the configured issuer, byte for byte (Discovery §4.3).
 That check is what makes a discovery URL safe to fetch: without it, a redirect or a compromised
 well-known path could point the server at a key set belonging to somebody else, and the server would
-verify forged tokens against it happily.
+verify forged tokens against it.
 
 This is the whole answer to PR #22's coupling objection. The server holds one provider-specific
 string, and it is configuration. There is no per-provider code path, no per-provider claim policy, no
@@ -215,8 +215,9 @@ algorithm, and refuses a key whose declared algorithm belongs to another key typ
 algorithm-confusion forgery, tested in `jwk.rs`. What it still honors is a provider *declaring*
 `HS256` on an `oct` key in its published key set, which is exactly the mistake PR #22 reports its own
 prototype making: a symmetric secret published in a public key set is a signing key for anyone who
-can read it. In OIDC mode the server refuses symmetric algorithms outright and refuses `alg: none`,
-leaving `RS*`, `PS*`, `ES*`, and `EdDSA`.
+can read it. In OIDC mode the server refuses symmetric algorithms outright, leaving `RS*`, `PS*`,
+`ES*`, and `EdDSA`. `alg: none` needs no narrowing to go with it: `jsonwebtoken::Algorithm` has no
+such variant, so a token header naming it is refused in every mode, before a key is looked up.
 
 ### One authorization mode, named for what it grants (Goal 3)
 
@@ -260,6 +261,18 @@ That objection does not reach this mode, because the resolution is a constant re
 It does reach the per-repository follow-up, which is why that work is a separate LEP and why
 ADR-00003's reasoning still stands where it was aimed. That follow-up replaces one function — the one
 that decides what `resources` a verified token carries — instead of revisiting seven call sites.
+
+**Delete is the one operation this mode does not reach, and that is an interim.** Repository delete is
+the only repository operation whose authorization does not run through `verify_authorization`: both
+implementations ask the relationship-based authorization service when `auth_url` names one, and
+otherwise fall back to a local check that the caller is the repository's recorded creator. The scheme
+gate takes that second path under OIDC, so delete is governed by creator ownership — the same rule an
+unconfigured server applies — while every other operation is governed by the all-repositories grant.
+This is the safer of two answers rather than a designed one: dialing the provider as though it were
+the authorization service is not an option, and letting any authenticated identity delete any
+repository on the server, silently and as a side effect of a scheme check, is a wider grant than this
+proposal argues for anywhere else. **Unresolved Questions** asks which it should be, and the answer
+belongs in this LEP's discussion rather than in the guard that currently decides it.
 
 ### The enforcement points (Goal 4)
 
@@ -326,23 +339,41 @@ would be worse in both directions: an old client would ignore it silently and re
 authentication, where an unknown scheme produces an error naming the scheme and listing the ones it
 does know.
 
-**One server-side consumer of the field has to learn the same scheme discipline.** Reusing `auth_url`
-means reusing it everywhere it is read, and it is read once on the server as well as by clients:
-`LoreRepositoryV1Service::auth_url` (`lore-server/src/grpc/repository/v1/service.rs`) pulls the same
-string out of the environment configuration and hands it to `repository_authorizer`
-(`lore-server/src/authnz/repository_authorizer.rs`), which selects an `AuthClientAuthorizer` — a gRPC
-client for Epic's relationship-based authorization service — whenever the value is `Some`, and
-`AllowAllRepositoryAuthorizer` otherwise. Left alone, advertising an `oidc+https://…` URL would point
-that gRPC client at the identity provider and fail every repository create, delete, query, and
-metadata operation.
+**The server reads this field too, and in more places than one.** Reusing `auth_url` means reusing it
+everywhere it is read, and on the server every reader wants the same thing from it: a dial target for
+Epic's relationship-based authorization service. `repository_authorizer`
+(`lore-server/src/authnz/repository_authorizer.rs`) selects an `AuthClientAuthorizer` — a gRPC client
+for that service — whenever the value is `Some`, and `AllowAllRepositoryAuthorizer` otherwise; and
+four repository handlers dial the service directly to register or check a resource. Left alone,
+advertising an `oidc+https://…` URL would point every one of them at the identity provider and fail
+repository create, delete, query, and metadata operations alike.
 
-So `repository_authorizer` selects on the scheme rather than on `Option::is_some`: a `ucs-auth` or
-`https` URL gets the authorization client as it does today, and any other scheme — `oidc+https`
-included — gets `AllowAllRepositoryAuthorizer`, which is the correct answer under
-`authorize_all_repositories` and refuses to be a silent broken client under anything else. This is the
-strongest argument for prefixing the scheme rather than putting a bare issuer URL in the field: the
-prefix is the only thing that makes the two cases distinguishable at all, and a bare URL would have
-made this failure mode undiagnosable.
+Two mechanisms keep advertisement and dialing apart, and the design needs both.
+
+**The derived URL never reaches an internal consumer.** `launch_grpc_server`
+(`lore-server/src/server.rs`) derives the advertisement into a clone rather than into the
+configuration itself: `environment` keeps whatever the operator configured and remains what internal
+consumers read, while `advertised_environment` carries the derived value and is what `EnvironmentGet`
+returns — `GrpcServerBuilder::with_environment` now takes both. For a deployment configuring OIDC and
+nothing else, the internal dial target is therefore `None`, exactly as on an unconfigured server,
+rather than a string every downstream reader has to recognize and refuse.
+
+**Each consumer gates on the scheme as well**, because an operator may still set `auth_url`
+explicitly, and because a value that travels this far should not be safe only by virtue of where it
+came from. `is_auth_client_scheme` (`repository_authorizer.rs`) is the single predicate — `ucs-auth`
+and `https` name the authorization service, every other scheme does not — and it gates all five
+reading sites: `repository_authorizer` itself, plus the four direct dials, in the two independent
+repository-create implementations (`grpc/handlers/repository_create.rs`,
+`grpc/repository/v1/repository_create.rs`) and the two repository-delete ones
+(`grpc/handlers/repository_delete.rs`, `grpc/repository/v1/repository_delete.rs`). Falling back to
+`AllowAllRepositoryAuthorizer` is the correct answer under `authorize_all_repositories`, and refusing
+to be a silent broken client is the correct answer under anything else. Delete is the one operation
+where the fallback is not simply "allow": it lands on the local creator-ownership check instead, which
+**One authorization mode** takes up.
+
+This is the strongest argument for prefixing the scheme rather than putting a bare issuer URL in the
+field: the prefix is the only thing that makes the two cases distinguishable at all, and a bare URL
+would have made this failure mode undiagnosable.
 
 ### The client implementation (Goal 5)
 
@@ -501,11 +532,25 @@ implementation**. Goal 6 → **Keeping the token-recipient guard**. Goal 7 → *
   diff. No existing script breaks, because every command that works today works identically against a
   server that has not turned this on.
 
-- **Rust crate surfaces** — One signature change, and it strictly widens what is accepted:
-  `JWTUserInfo.name` (`lore-credential`) becomes `Option<String>`, so every token that deserializes
-  today still deserializes and some that did not now do. `verify_authorization` keeps its signature and
-  its behavior, because the grant arrives on the token rather than as an argument. The type does not
-  cross the C or JavaScript boundary.
+- **Rust crate surfaces** — Three changes, none of which alters an existing behavior, and none of
+  which crosses the C or JavaScript boundary.
+
+  `JWTUserInfo.name` (`lore-credential`) becomes `Option<String>`. This strictly widens what is
+  accepted: every token that deserializes today still deserializes, and some that did not now do.
+
+  `Authentication::start_auth_session` (`lore-transport`) gains a `LoginFlow` parameter, so an
+  implementation can select a ceremony that suits the calling host — the OIDC implementation runs the
+  device authorization grant where `ucs-auth` has only one ceremony and ignores the argument. The
+  value is derived from the existing `lore login --no-browser` flag, so no CLI surface changes and no
+  caller gains a decision it did not already make; the fallout is mechanical, in `ucs_auth.rs`, the
+  one call site in `lore-revision`, and the test doubles.
+
+  `GrpcServerBuilder::with_environment` (`lore-server`) takes the advertised environment as a second
+  argument, per **Advertising the provider**. Passing the same value twice is exactly today's
+  behavior, which is what every caller outside `launch_grpc_server` does.
+
+  `verify_authorization` keeps its signature and its behavior, because the grant arrives on the token
+  rather than as an argument.
 
   `repository_authorizer` (`lore-server/src/authnz/repository_authorizer.rs`) keeps its signature and
   changes its selection rule from "any `Some` value" to "a scheme this server implements an
@@ -587,8 +632,9 @@ contain the configured client id, and `exp` must not have passed. Discovery and 
 over TLS through the shared `reqwest` client, which is built `use_rustls_tls()` with webpki and
 native roots. The verification algorithm comes from the key, never from the token header — the
 existing pin, tested against a forgery that signs with the public modulus as an HMAC secret — and in
-OIDC mode symmetric algorithms and `alg: none` are refused outright rather than merely left out of
-the inference, which closes the case of a provider publishing a symmetric secret in its own key set.
+OIDC mode a symmetric algorithm is refused outright rather than merely left out of the inference,
+which closes the case of a provider publishing a symmetric secret in its own key set. `alg: none` is
+refused in every mode, by a decoder that cannot represent it.
 
 **The all-repositories grant is stated plainly, because it is the sharpest edge here.** In this mode
 every identity the provider admits can read and write every repository on the server. There is no
@@ -599,7 +645,11 @@ a link traversal may read any linked repository, and the repository service's pe
 resolves to `AllowAllRepositoryAuthorizer`, because the relationship-based authorization service it
 would otherwise call is not part of this deployment. Each is the same sentence as the first one —
 every repository, every authenticated identity — and each would otherwise have been an inconsistency
-for an operator to discover. An operator whose repositories have different audiences needs either the
+for an operator to discover. Repository delete is the exception and runs narrower than the grant, not
+wider: it falls back to the creator-ownership check an unconfigured server uses, so an authenticated
+identity that may write every repository may still only delete the ones it created. **One
+authorization mode** explains why that is an interim, and **Unresolved Questions** asks what it should
+settle into. An operator whose repositories have different audiences needs either the
 follow-up
 per-repository LEP or one server per trust boundary, and `authorize_all_repositories` has no default
 precisely so that nobody arrives at this grant by omission.
@@ -710,12 +760,18 @@ and go with them.
   *mitigation:* distinct `resource` parameters give distinct auth URLs and distinct buckets; documented
   in the operator guide.
 - **Risk:** a consumer of `auth_url` other than the client registry is missed, and an `oidc+https` URL
-  is handed to code that expects an authorization service — the repository service's
-  `repository_authorizer` is the one such consumer in the tree today, and repository create, delete,
-  query, and metadata operations would fail against a live provider — *mitigation:* the scheme-based
-  selection described in **Advertising the provider**, plus an integration test asserting that
-  repository operations succeed against a server configured with an `oidc+https` auth URL, which is
-  the assertion that would have caught it.
+  is handed to code that expects an authorization service, failing repository create, delete, query,
+  and metadata operations against a live provider — *materialized during implementation, and caught
+  by the mitigation.* This entry originally named `repository_authorizer` as the one such consumer in
+  the tree; that was wrong. There are five reading sites, because repository create and delete each
+  have two independent implementations, and each dials the authorization service itself. The
+  end-to-end test asserting that repository operations succeed against a secured server failed on
+  `repository create` — a plaintext h2c dial into the provider's TLS port — and the delete path was
+  found by tracing the same call shape rather than by a second failure. *Mitigation, as shipped:* the
+  two mechanisms in **Advertising the provider** — the derived URL is confined to
+  `advertised_environment` so internal consumers never see it, and `is_auth_client_scheme` gates all
+  five sites — plus the integration and end-to-end coverage of create and delete against a live
+  provider, which now exists and is what turned a design assumption into a caught bug.
 - **Risk:** an unauthenticated caller drives outbound key-set fetches by cycling unknown key ids —
   *mitigation:* already bounded, and tested: `MIN_REFRESH_INTERVAL` throttles fetches once any key is
   cached, the refresh mutex collapses concurrent misses into one request, and a failure that no key
@@ -889,3 +945,32 @@ scheme produces an error naming the scheme and listing the ones the client knows
   from the start so the per-repository follow-up extends a setting instead of replacing one?
 - Should a single server be able to trust more than one issuer, and if so, does anything in this design
   need to change now to keep that from being a breaking addition later?
+- Should repository delete under `authorize_all_repositories` follow the grant — any authenticated
+  identity may delete any repository, consistent with every other operation — or keep the
+  creator-ownership check it currently falls back to? The grant's own logic argues for the first: a
+  mode that says "every repository, every authenticated identity" and then makes delete the one
+  exception is an asymmetry an operator has to learn by hitting it. Against that, delete is the one
+  irreversible operation here, and a coarse mode staying narrow at exactly that point is defensible.
+  What is not defensible is the status quo's provenance — the current behavior is what a scheme check
+  happened to produce, not what anybody chose.
+- What should a CLI login do when the credential store's keychain blocks on a user prompt? On macOS the
+  keychain item's access control binds to the binary that created it, so a rebuilt or reinstalled
+  `lore` faces an authorization prompt on the next read, and `get_secret_from_store`
+  (`lore-credential/src/token_store.rs`) waits on it with no timeout — its own comment says "a locked
+  keychain blocks until the user answers a prompt". None of this is new or caused by this proposal:
+  it is how the store has always behaved, for `ucs-auth` tokens too. It belongs here because OIDC
+  login is the first flow that puts a store read in front of ordinary self-hosted users, on the one
+  path where an indefinite wait is indistinguishable from a hung login. The directions are a bounded,
+  prompt-aware read that fails with a message naming the keychain, or documenting `LORE_AUTH_STORE`
+  as the escape hatch, or both; deciding belongs with the maintainers rather than in this LEP's
+  implementation.
+- Should `login::with_token` accept a provider-issued token? Its `token_type = "lore"` branch derives
+  the recipient domains from the token's own claims, which for an ID token are a client id and an
+  issuer URL, so the recipient guard refuses it and there is no non-interactive way to hand a token to
+  the CLI under OIDC. That is a defensible default — `exchange_external_token` is `NotSupported` by
+  design, and interactive login is the flow this proposal specifies — but it means an OIDC deployment
+  has no headless credential path at all, which is what
+  [issue #59](https://github.com/EpicGames/lore/issues/59) asks for. Whether the answer is making the
+  implementation-supplied domains authoritative on this path too, as they now are at login and at
+  exchange, or the client credentials grant issue #59 points at, is the question; the two are not the
+  same door.

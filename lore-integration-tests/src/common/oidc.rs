@@ -154,7 +154,7 @@ pub(crate) mod oidc_common {
                         }
                         Ok(_) => info!("PocketID admin API not ready on attempt {attempt}"),
                         Err(e) => {
-                            info!("PocketID admin API not reachable on attempt {attempt}: {e}")
+                            info!("PocketID admin API not reachable on attempt {attempt}: {e}");
                         }
                     }
                 }

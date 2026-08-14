@@ -171,39 +171,22 @@ impl GrpcServerBuilder<WantsEnvironment> {
     pub fn new() -> Self {
         Self(WantsEnvironment(()))
     }
-    /// Sets the environment both internal consumers and `EnvironmentGet` read.
     pub fn with_environment(
         self,
         environment: EnvironmentConfig,
     ) -> GrpcServerBuilder<WantsFeature> {
-        GrpcServerBuilder(WantsFeature {
-            environment,
-            advertised_auth_url: None,
-        })
-    }
-}
-
-impl GrpcServerBuilder<WantsFeature> {
-    /// Sets the OIDC login URL advertised in the `EnvironmentGet` response when the
-    /// environment carries no `auth_url` of its own. Applied only at that response
-    /// boundary, so the derived `oidc+https://…` string never reaches an internal
-    /// consumer (e.g. the `ReBAC` dial target for repository create/delete).
-    pub fn with_advertised_auth_url(mut self, advertised_auth_url: Option<String>) -> Self {
-        self.0.advertised_auth_url = advertised_auth_url;
-        self
+        GrpcServerBuilder(WantsFeature { environment })
     }
 }
 
 pub struct WantsFeature {
     environment: EnvironmentConfig,
-    advertised_auth_url: Option<String>,
 }
 
 impl GrpcServerBuilder<WantsFeature> {
     pub fn with_feature(self, feature: FeatureSettings) -> GrpcServerBuilder<WantsImmutableStore> {
         GrpcServerBuilder(WantsImmutableStore {
             environment: self.0.environment,
-            advertised_auth_url: self.0.advertised_auth_url,
             feature,
         })
     }
@@ -211,7 +194,6 @@ impl GrpcServerBuilder<WantsFeature> {
 
 pub struct WantsImmutableStore {
     environment: EnvironmentConfig,
-    advertised_auth_url: Option<String>,
     feature: FeatureSettings,
 }
 
@@ -223,7 +205,6 @@ impl GrpcServerBuilder<WantsImmutableStore> {
     ) -> GrpcServerBuilder<WantsMutableStore> {
         GrpcServerBuilder(WantsMutableStore {
             environment: self.0.environment,
-            advertised_auth_url: self.0.advertised_auth_url,
             feature: self.0.feature,
             immutable_store,
             local_store,
@@ -233,7 +214,6 @@ impl GrpcServerBuilder<WantsImmutableStore> {
 
 pub struct WantsMutableStore {
     environment: EnvironmentConfig,
-    advertised_auth_url: Option<String>,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -246,7 +226,6 @@ impl GrpcServerBuilder<WantsMutableStore> {
     ) -> GrpcServerBuilder<MaybeLockStore> {
         GrpcServerBuilder(MaybeLockStore {
             environment: self.0.environment,
-            advertised_auth_url: self.0.advertised_auth_url,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -257,7 +236,6 @@ impl GrpcServerBuilder<WantsMutableStore> {
 
 pub struct MaybeLockStore {
     environment: EnvironmentConfig,
-    advertised_auth_url: Option<String>,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -271,7 +249,6 @@ impl GrpcServerBuilder<MaybeLockStore> {
     ) -> GrpcServerBuilder<WantsNotification> {
         GrpcServerBuilder(WantsNotification {
             environment: self.0.environment,
-            advertised_auth_url: self.0.advertised_auth_url,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -283,7 +260,6 @@ impl GrpcServerBuilder<MaybeLockStore> {
 
 pub struct WantsNotification {
     environment: EnvironmentConfig,
-    advertised_auth_url: Option<String>,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -299,7 +275,6 @@ impl GrpcServerBuilder<WantsNotification> {
     ) -> GrpcServerBuilder<MaybeHookDispatcher> {
         GrpcServerBuilder(MaybeHookDispatcher {
             environment: self.0.environment,
-            advertised_auth_url: self.0.advertised_auth_url,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -313,7 +288,6 @@ impl GrpcServerBuilder<WantsNotification> {
 
 pub struct MaybeHookDispatcher {
     environment: EnvironmentConfig,
-    advertised_auth_url: Option<String>,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -330,7 +304,6 @@ impl GrpcServerBuilder<MaybeHookDispatcher> {
     ) -> GrpcServerBuilder<WantsTlsConfig> {
         GrpcServerBuilder(WantsTlsConfig {
             environment: self.0.environment,
-            advertised_auth_url: self.0.advertised_auth_url,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -345,7 +318,6 @@ impl GrpcServerBuilder<MaybeHookDispatcher> {
 
 pub struct WantsTlsConfig {
     environment: EnvironmentConfig,
-    advertised_auth_url: Option<String>,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -386,7 +358,6 @@ impl GrpcServerBuilder<WantsTlsConfig> {
 
         Ok(GrpcServerBuilder(WantsAdminEndpoints {
             environment: self.0.environment,
-            advertised_auth_url: self.0.advertised_auth_url,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -402,7 +373,6 @@ impl GrpcServerBuilder<WantsTlsConfig> {
 
 pub struct WantsAdminEndpoints {
     environment: EnvironmentConfig,
-    advertised_auth_url: Option<String>,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -430,7 +400,6 @@ impl GrpcServerBuilder<WantsAdminEndpoints> {
         );
         GrpcServerBuilder(WantsHttp2Config {
             environment: self.0.environment,
-            advertised_auth_url: self.0.advertised_auth_url,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -447,7 +416,6 @@ impl GrpcServerBuilder<WantsAdminEndpoints> {
 
 pub struct WantsHttp2Config {
     environment: EnvironmentConfig,
-    advertised_auth_url: Option<String>,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -472,7 +440,6 @@ impl GrpcServerBuilder<WantsHttp2Config> {
     ) -> GrpcServerBuilder<MaybeJwtVerifier> {
         GrpcServerBuilder(MaybeJwtVerifier {
             environment: self.0.environment,
-            advertised_auth_url: self.0.advertised_auth_url,
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
@@ -489,13 +456,13 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             service_settings,
             user_agent_filter,
             forwarded_requests,
+            advertised_auth_url: None,
         })
     }
 }
 
 pub struct MaybeJwtVerifier {
     environment: EnvironmentConfig,
-    advertised_auth_url: Option<String>,
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -512,9 +479,20 @@ pub struct MaybeJwtVerifier {
     service_settings: Option<GrpcPublicServicesSettings>,
     user_agent_filter: Arc<UserAgentFilter>,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
+    advertised_auth_url: Option<String>,
 }
 
 impl GrpcServerBuilder<MaybeJwtVerifier> {
+    /// Sets the OIDC login URL advertised in the `EnvironmentGet` response when the
+    /// environment carries no `auth_url` of its own. Applied only to the copy the
+    /// environment services serve, so the derived `oidc+https://…` string never
+    /// reaches an internal consumer (e.g. the `ReBAC` dial target for repository
+    /// create/delete).
+    pub fn with_advertised_auth_url(mut self, advertised_auth_url: Option<String>) -> Self {
+        self.0.advertised_auth_url = advertised_auth_url;
+        self
+    }
+
     fn make_lock_service(
         services_settings: &Option<GrpcPublicServicesSettings>,
         inner: LoreLockService,
@@ -595,12 +573,17 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             rpc_timeout,
         );
 
-        let environment_svc = LoreEnvironmentService::new(
-            self.0.environment.clone(),
-            self.0.advertised_auth_url.clone(),
-        );
-        let environment_v1_svc =
-            LoreEnvironmentV1Service::new(self.0.environment, self.0.advertised_auth_url);
+        // The advertised copy exists only here: internal consumers keep reading
+        // `self.0.environment`, whose `auth_url` never carries an `oidc+…` scheme.
+        let mut advertised = self.0.environment;
+        if let Some(auth_url) = self.0.advertised_auth_url {
+            let endpoint = advertised.endpoint.get_or_insert_with(Default::default);
+            if endpoint.auth_url.as_deref().unwrap_or_default().is_empty() {
+                endpoint.auth_url = Some(auth_url);
+            }
+        }
+        let environment_svc = LoreEnvironmentService::new(advertised.clone());
+        let environment_v1_svc = LoreEnvironmentV1Service::new(advertised);
         let lock_svc = match self.0.lock_store {
             Some(lock_store) => {
                 info!("Enabling LockService");

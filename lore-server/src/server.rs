@@ -598,7 +598,6 @@ async fn launch_grpc_server(
 
     GrpcServerBuilder::new()
         .with_environment(environment)
-        .with_advertised_auth_url(advertised_auth_url)
         .with_feature(feature)
         .with_immutable_store(immutable_store, local_store)
         .with_mutable_store(mutable_store)
@@ -619,6 +618,7 @@ async fn launch_grpc_server(
             user_agent_filter,
             forwarded_requests,
         )
+        .with_advertised_auth_url(advertised_auth_url)
         .with_jwt_verifier(jwt_verifier)?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;

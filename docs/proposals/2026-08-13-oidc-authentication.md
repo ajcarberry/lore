@@ -13,18 +13,27 @@ discussion: <LEP PR — to be opened>
 
 ## Summary
 
-A Lore server verifies tokens issued by a standard OpenID Connect provider itself, and the Lore CLI
-obtains those tokens from that provider with standard OAuth 2.0 flows. An operator names an issuer
-URL and a client id in the server configuration; the server reads the provider's discovery document
-to find its key set, and from then on every repository operation over gRPC, HTTP, and QUIC requires
-an unexpired token from that issuer. A verified token authorizes every repository on the server — the
-provider decides who is let in, and this proposal deliberately stops there. On the client, one new
-`Authentication` implementation joins `ucs-auth` in the existing scheme registry and runs three
-standard flows: authorization code with PKCE over a loopback redirect, the device authorization grant
-for hosts with no browser, and the refresh grant to keep a session alive. A deployment whose provider
-supports resource indicators can additionally name itself and accept only tokens bound to it. Nothing
-new is deployed: no broker, no sidecar, no second token format, no Lore-minted tokens. An
-unconfigured server behaves exactly as it does today.
+Self-hosted Lore deployments have no way to authenticate users: the only login backend in the tree
+speaks to an Epic-internal service, so every server outside Epic runs open. Operators are asking to
+put Lore behind the identity provider they already run — PocketID, Keycloak, Entra — and their users
+expect `lore login` to work the way `gh auth login` does.
+
+This proposal makes that provider the whole answer, using only standard
+[OpenID Connect](https://openid.net/specs/openid-connect-core-1_0.html) and OAuth 2.0 mechanisms.
+The server verifies the provider's tokens directly: the operator names an issuer and a client id in
+configuration, the server finds the signing keys through
+[OIDC Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html), and from then on every
+repository operation — gRPC, HTTP, and QUIC alike — requires a valid token from that issuer.
+Authorization is deliberately simple: a verified identity may use every repository on the server;
+deciding who gets in is the provider's job. The CLI gains one new scheme in its existing
+authentication registry, implementing three standard flows — authorization code with PKCE
+([RFC 7636](https://www.rfc-editor.org/rfc/rfc7636)) where there's a browser, the device
+authorization grant ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) where there isn't, and the
+refresh grant so a session outlives its first token. A deployment whose provider supports resource
+indicators ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707)) can additionally bind tokens to
+itself alone, accepting only JWT access tokens ([RFC 9068](https://www.rfc-editor.org/rfc/rfc9068))
+audienced to it. Nothing new is deployed — no broker, no sidecar, no Lore-minted tokens — and a
+server that doesn't configure this is unchanged.
 
 ## Motivation
 

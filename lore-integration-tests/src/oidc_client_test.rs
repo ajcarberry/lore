@@ -74,9 +74,19 @@ mod oidc_client_tests {
             .await?;
         deliver(&redirect).await?;
 
-        auth.poll_auth_session(auth_url, "client-state", &session.session_code, "")
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Poll returned no token after the redirect").into())
+        // The listener records the delivered code on its own task, so poll a few times
+        // rather than assuming the token is ready the instant `deliver` returns, the way a
+        // real client polls instead of expecting the first poll to succeed.
+        for _ in 0..20 {
+            if let Some(token) = auth
+                .poll_auth_session(auth_url, "client-state", &session.session_code, "")
+                .await?
+            {
+                return Ok(token);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Err(anyhow::anyhow!("Poll returned no token after the redirect").into())
     }
 
     /// Fetches a redirect URL, putting the authorization response in front of the loopback
@@ -173,9 +183,23 @@ mod oidc_client_tests {
             .await
             .expect("The listener should still answer the request");
 
-        auth.poll_auth_session(&auth_url, "client-state", &session.session_code, "")
-            .await
-            .expect_err("A response carrying another session's state must not be exchanged");
+        // The listener records the delivered response on its own task, so poll until it has
+        // been processed rather than assuming the first poll sees it, then confirm the
+        // mismatched state was refused.
+        let mut outcome = auth
+            .poll_auth_session(&auth_url, "client-state", &session.session_code, "")
+            .await;
+        for _ in 0..20 {
+            if matches!(outcome, Ok(None)) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                outcome = auth
+                    .poll_auth_session(&auth_url, "client-state", &session.session_code, "")
+                    .await;
+            } else {
+                break;
+            }
+        }
+        outcome.expect_err("A response carrying another session's state must not be exchanged");
     }
 
     /// The device authorization grant behind `lore login --no-browser`, driven with no

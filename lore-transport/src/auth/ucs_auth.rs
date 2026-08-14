@@ -84,9 +84,7 @@ pub struct UcsAuthentication;
 
 #[async_trait]
 impl Authentication for UcsAuthentication {
-    /// UCS Auth has one ceremony -- the auth service hands back a login URL and
-    /// the caller either opens it or prints it -- so `flow` selects nothing here
-    /// and is ignored.
+    /// UCS Auth has one login ceremony, so `flow` selects nothing and is ignored.
     async fn start_auth_session(
         &self,
         auth_url: &str,

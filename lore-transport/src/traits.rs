@@ -331,20 +331,17 @@ pub trait Environment: Send + Sync {
     async fn get(&self) -> Result<EnvironmentConfig, ProtocolError>;
 }
 
-/// What the host starting an interactive login can do, which decides the
-/// ceremony an `Authentication` implementation runs.
+/// Whether a browser can be opened on the host starting an interactive login,
+/// which decides the ceremony an `Authentication` implementation runs.
 ///
-/// This is the caller's capability, not a preference: it reflects whether a
-/// browser can be opened on this host. An implementation with only one
-/// ceremony can ignore it; one with more than one selects between them.
+/// This is a capability, not a preference. An implementation with only one
+/// ceremony ignores it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LoginFlow {
-    /// A browser can be opened on this host, so a redirect back to it can
-    /// complete the login.
+    /// A redirect back to this host can complete the login.
     #[default]
     Browser,
-    /// No browser on this host: the login has to be completed on another
-    /// device.
+    /// The login has to be completed on another device.
     NoBrowser,
 }
 

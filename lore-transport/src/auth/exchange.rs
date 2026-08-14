@@ -67,11 +67,10 @@ pub fn is_expired(expires: u64) -> bool {
 /// The domains an authz token obtained via exchange may be sent to, recorded alongside it
 /// in the token store and later enforced by [`verify_jwt_usage_for_remote`].
 ///
-/// An OIDC ID token's `aud` is a client id and `iss` an issuer URL, neither of which is
-/// the repository's domain, so a set derived only from the token's own claims can never
-/// include it. `AuthorizationToken::acceptable_root_domains` is authoritative whenever the
-/// `Authentication` implementation filled it in, since only the implementation knows its
-/// own tokens' audience semantics; an empty set falls back to the JWT-derived domains.
+/// `AuthorizationToken::acceptable_root_domains` is authoritative whenever the
+/// `Authentication` implementation filled it in; an empty set falls back to the JWT-derived
+/// domains. An OIDC ID token's own claims name a client id and an issuer, never the
+/// repository's domain, so a derived set could never include it.
 fn acceptable_root_domains(
     authz: &AuthorizationToken,
     recipient_domain: &str,
@@ -90,10 +89,9 @@ fn acceptable_root_domains(
         return Ok(decoded_token.claims.acceptable_root_domains());
     }
 
-    // The remote is added rather than checked for: what says whether this credential may
-    // reach it is the *authentication* token's stored set, which
+    // Added rather than checked for: what says whether this credential may reach the
+    // remote is the authentication token's stored set, which
     // `tokens_for_auth_service_and_recipient` has already required the recipient to be in.
-    // A backend's set describes its own token's audience and can never name the remote.
     let mut domains = authz.acceptable_root_domains.clone();
     if !domains.iter().any(|domain| domain == recipient_domain) {
         domains.push(recipient_domain.to_string());
@@ -104,13 +102,11 @@ fn acceptable_root_domains(
 /// Loads only a stored authentication token that is acceptable both for the auth service
 /// it will be presented to and for the remote the authorization token is destined for.
 ///
-/// The recipient half is the token-recipient guard on this path. `exchange` is reachable
+/// The recipient half is the token-recipient guard on this path: `exchange` is reachable
 /// with an explicit identity and a caller-supplied recipient, and where the authorization
-/// token *is* the authentication token -- an `OpenID` Connect passthrough -- any remote that
-/// advertises the auth URL a user logged in against would otherwise be handed that user's
-/// credential. Only the stored acceptable-domain set records where a token may go, since an
-/// ID token's own claims name a client id and an issuer but never a remote, so the check
-/// belongs on the way out of the store.
+/// token is the authentication token -- an `OpenID` Connect passthrough -- any remote
+/// advertising the same auth URL would otherwise be handed that user's credential. Only the
+/// stored acceptable-domain set records where a token may go.
 fn tokens_for_auth_service_and_recipient(
     auth_domain: String,
     recipient_domain: String,
@@ -128,8 +124,7 @@ fn refresh_lock() -> &'static Mutex<()> {
 
 /// The authentication token to present, refreshed first if it has expired.
 ///
-/// A refresh that cannot happen leaves the expired token in place rather than raising
-/// anything of its own: what the caller does next is then exactly what it did before.
+/// A refresh that cannot happen leaves the expired token in place.
 async fn keep_alive(
     stored: UserInfo,
     auth_url: &str,
@@ -149,21 +144,17 @@ async fn keep_alive(
 /// Trades the stored refresh token for a new authentication token, so a login that has
 /// simply aged out does not have to become an interactive one.
 ///
-/// Everything here is best-effort and answers `None` on any disappointment: no refresh token
-/// stored, a backend whose refresh grant is `NotSupported` (which is `ucs-auth`'s answer), a
-/// provider that is down, a refresh token that was revoked or already spent. The caller is
-/// then left holding exactly the expired token it already had, and behaves exactly as it did
-/// before refreshing existed. One attempt per operation, and no retry loop: a provider that
-/// says no has said no for as long as the command lasts.
+/// Best-effort: `None` when no refresh token is stored, when the backend's refresh grant is
+/// `NotSupported`, or when the provider refuses, leaving the caller holding exactly the
+/// expired token it already had. One attempt per operation, and no retry loop.
 async fn refreshed_authn_token(
     auth_url: &str,
     auth_domain: &str,
     identity: &str,
     recipient_domain: &str,
 ) -> Option<String> {
-    // One refresh at a time. The grant spends a single-use token, so two callers racing on
-    // the same expiry would spend it twice and the loser would report a failure for a
-    // session that is in fact alive.
+    // One refresh at a time: the grant spends a single-use token, so two callers racing on
+    // the same expiry would spend it twice.
     let _single_flight = refresh_lock().lock().await;
 
     // Another caller may have refreshed while this one waited for the lock.
@@ -203,9 +194,8 @@ async fn refreshed_authn_token(
         return None;
     }
 
-    // A store failure does not refuse the operation the caller is in the middle of -- the
-    // credential in hand is good -- but a rotated refresh token is then lost, so the next
-    // expiry needs an interactive login.
+    // A store failure does not refuse the operation in flight, but the rotated refresh
+    // token is then lost and the next expiry needs an interactive login.
     if let Err(err) = token_store::store_refreshed_user_token(
         auth_url,
         identity,
@@ -582,8 +572,7 @@ async fn auth_exchange_for_identity(
         return (String::new(), String::new(), String::new());
     };
 
-    // An expired authn token is worth one refresh before the identity is passed over: an
-    // identity whose login can be kept alive is one the user should not have to redo.
+    // One refresh before the identity is passed over, so an aged-out login is not redone.
     if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
@@ -775,8 +764,7 @@ async fn auth_exchange_custom_resource_for_identity(
 mod tests {
     use super::*;
 
-    /// A JWT with the given claims and a signature nothing checks -- the shape the client
-    /// reads, since the server owns verification.
+    /// A JWT with the given claims and a signature nothing checks.
     fn unsigned_jwt(claims: &str) -> String {
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -816,10 +804,8 @@ mod tests {
         );
     }
 
-    /// An OIDC ID token's own claims (`aud` = client id, `iss` = issuer URL) can never
-    /// name the repository's domain, so a non-empty
-    /// `AuthorizationToken::acceptable_root_domains` from the backend must be authoritative
-    /// instead of the JWT-derived fallback.
+    /// An OIDC ID token's own claims name a client id and an issuer, never the
+    /// repository's domain, so a non-empty backend set must beat the JWT-derived fallback.
     #[test]
     fn oidc_shaped_token_survives_the_exchange_path() {
         let jwt = unsigned_jwt(

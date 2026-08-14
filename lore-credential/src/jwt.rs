@@ -28,9 +28,8 @@ pub struct JWTUserInfo {
     pub issuer: String,
     #[serde(rename = "sub")]
     pub user_id: String,
-    /// `name` is an `OpenID` Connect claim delivered only with the `profile` scope, so a
-    /// conformant provider may omit it. Optional rather than required so a token without
-    /// it still deserializes.
+    /// `name` arrives only with the `OpenID` Connect `profile` scope, so a conformant
+    /// provider may omit it.
     pub name: Option<String>,
     pub preferred_username: Option<String>,
     pub is_service_account: Option<bool>,
@@ -88,8 +87,8 @@ pub fn user_info_from_token(token: String) -> Option<UserInfo> {
     };
     Some(UserInfo {
         id: token_data.claims.user_id.clone(),
-        // Falls back to the subject identifier: a provider that sends no `name` must not
-        // turn a successful login into "unable to load user info".
+        // Falls back to the subject identifier, so a provider that sends no `name` does
+        // not fail the lookup.
         name: token_data
             .claims
             .name

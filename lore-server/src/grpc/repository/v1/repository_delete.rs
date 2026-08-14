@@ -75,10 +75,9 @@ pub async fn handler(
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
-            // A `ucs-auth`/`https` auth_url defers to the external ReBAC service; any
-            // other scheme (`oidc+https` included) falls through to the same
-            // creator-ownership check used when no auth service is configured, rather
-            // than dialing a non-ReBAC endpoint.
+            // A `ucs-auth`/`https` auth_url defers to the external `ReBAC` service; any
+            // other scheme falls through to the creator-ownership check used when none
+            // is configured.
             if let Some(auth_url) = auth_url.filter(|url| is_auth_client_scheme(url)) {
                 repository_delete_auth_resource(auth_url, authorization, id).await?;
             } else if metadata.creator != user_id && !bypass_protection {

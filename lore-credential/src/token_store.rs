@@ -818,14 +818,11 @@ pub async fn store_refresh_token(
 /// acceptable-root-domain set recorded at login and rotating the refresh token when the
 /// provider issued a new one.
 ///
-/// The domain set is deliberately not taken from the refreshed token. It is the recipient
-/// half of the token-recipient guard, and it names the remote the login was performed
-/// against -- something the auth backend cannot know and therefore cannot put on a token it
-/// hands back. Keeping the stored set means a refresh can neither widen where the credential
-/// may go nor strand it at the remote it was obtained for.
+/// The domain set is deliberately not taken from the refreshed token: it names the remote
+/// the login was performed against, which the auth backend cannot know, so keeping the
+/// stored set is what stops a refresh widening where the credential may go.
 ///
-/// Returns `TokenNotFound` when there is no stored login to refresh: with no recorded
-/// recipients, a new entry here would be a token nobody may be given.
+/// Returns `TokenNotFound` when there is no stored login to refresh.
 pub async fn store_refreshed_user_token(
     auth_endpoint: &str,
     identity: &str,

@@ -50,8 +50,6 @@ pub mod authentication {
 
             // One instance for both spellings: it holds the state of a login in flight,
             // and a login started against one scheme is polled against the same one.
-            // `oidc+http` reaches the same implementation, which accepts it only for a
-            // loopback host.
             let oidc = Arc::new(oidc::OidcAuthentication::default());
             let _ = add("oidc+https", oidc.clone());
             let _ = add("oidc+http", oidc);

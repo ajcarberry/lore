@@ -4,25 +4,15 @@
 //!
 //! Everything here drives `lore_transport::auth::oidc::OidcAuthentication` through the
 //! `Authentication` trait, exactly as `lore login` does, against the `PocketID` container in
-//! `compose.yaml`. Nothing is stubbed: the discovery document, the authorization code, the
-//! PKCE verification, the device grant, and the refresh grant are all the provider's.
+//! `compose.yaml`. Nothing is stubbed.
 //!
-//! Two harness problems are worth naming, because both are properties of the flows rather
-//! than of the tests.
-//!
-//! **The loopback port is dynamic, and `PocketID` validates redirect URIs.** RFC 8252 §7.3
-//! has the client bind `127.0.0.1:0` and let the kernel choose, so the redirect URI is not
-//! known until the flow starts — and no client registration written ahead of time can name
-//! it. `PocketID` accepts a wildcard in a callback URL, so the test client is registered once
-//! with `http://127.0.0.1:*/callback` and every run's port matches it. That is the whole
-//! solution; no bind-then-register ordering is needed.
-//!
-//! **The test has to be the browser.** `PocketID`'s only interactive login is a passkey
-//! ceremony, so `OidcFixture::follow_authorization_url` stands in for the browser: it is
-//! handed the authorization URL the implementation produced, completes the consent leg over
-//! `PocketID`'s JSON API, and returns the URL the provider would have redirected to. The test
-//! then fetches that URL, which is what delivers the code to the implementation's loopback
-//! listener.
+//! Two properties of the flows shape the harness. RFC 8252 §7.3 has the client bind
+//! `127.0.0.1:0`, so no client registration written ahead of time can name the redirect URI;
+//! the test client is registered once with the wildcard `http://127.0.0.1:*/callback`.
+//! And `PocketID`'s only interactive login is a passkey ceremony, so
+//! `OidcFixture::follow_authorization_url` stands in for the browser, completing the consent
+//! leg over `PocketID`'s JSON API and returning the URL the provider would have redirected
+//! to.
 #[cfg(all(test, feature = "integration_tests"))]
 mod oidc_client_tests {
     use std::error::Error;
@@ -41,8 +31,7 @@ mod oidc_client_tests {
     use crate::common::oidc::oidc_common::TestUser;
 
     /// A client of its own, registered with a wildcard port so any loopback redirect the
-    /// kernel hands out is a registered callback. Separate from `TEST_CLIENT_ID`, which is
-    /// registered with one fixed port for the server-side tests.
+    /// kernel hands out is a registered callback.
     const CLIENT_ID: &str = "lore-oidc-client-tests";
 
     /// The wildcard that makes RFC 8252 §7.3's ephemeral port workable against a provider
@@ -112,8 +101,7 @@ mod oidc_client_tests {
     }
 
     /// The authorization code flow with PKCE over a loopback redirect, end to end against a
-    /// real provider: a real authorization URL, a real code, a real verifier check, and a
-    /// real signed ID token.
+    /// real provider.
     ///
     /// Requires the compose stack:
     /// `docker compose --file lore-integration-tests/compose.yaml up --detach pocket-id`
@@ -126,8 +114,8 @@ mod oidc_client_tests {
             .await
             .expect("The PKCE login should complete");
 
-        // The credential is the ID token, and the provider's own JWKS has to verify it --
-        // which is the same path the server takes.
+        // The credential is the ID token, verified against the provider's own JWKS, which
+        // is the path the server takes.
         let claims = fixture
             .validate_token(&token.token, CLIENT_ID)
             .await
@@ -157,8 +145,8 @@ mod oidc_client_tests {
         );
     }
 
-    /// An authorization response belonging to another session must not be exchanged, and the
-    /// `state` check is what refuses it before the code is ever used (RFC 9700).
+    /// An authorization response belonging to another session must not be exchanged; the
+    /// `state` check refuses it before the code is ever used (RFC 9700).
     ///
     /// Requires the compose stack (see above).
     #[tokio::test]
@@ -198,8 +186,7 @@ mod oidc_client_tests {
     }
 
     /// The device authorization grant behind `lore login --no-browser`, driven with no
-    /// browser and no human: `start_auth_session` asks the provider for a code, the poll
-    /// answers `None` until it is approved, and approval yields the same ID token.
+    /// browser and no human.
     ///
     /// Requires the compose stack (see above).
     #[tokio::test]
@@ -213,7 +200,7 @@ mod oidc_client_tests {
             .expect("The device authorization should start");
 
         // `login_url` is the provider's complete verification URI, which carries the user
-        // code so the user has one thing to open rather than a URL and a code to retype.
+        // code.
         assert!(
             session.login_url.starts_with(fixture.issuer()),
             "Verification URI {} is not on the issuer",
@@ -226,8 +213,8 @@ mod oidc_client_tests {
             .map(|(_, value)| value.into_owned())
             .expect("The verification URI carries no user code");
 
-        // Nobody has approved yet, which RFC 8628 §3.5 reports as `authorization_pending`
-        // and the trait reports as `None` -- not as a failure.
+        // RFC 8628 §3.5 reports an unapproved code as `authorization_pending`, which the
+        // trait reports as `None` rather than as a failure.
         assert!(
             auth.poll_auth_session(&auth_url, "client-state", &session.session_code, "")
                 .await
@@ -243,7 +230,7 @@ mod oidc_client_tests {
             .expect("Could not approve the device user code");
 
         // The provider's advertised interval is honored, so an immediate second poll would
-        // not reach the network at all. Waiting it out is the flow working as specified.
+        // not reach the network at all.
         tokio::time::sleep(Duration::from_secs(6)).await;
 
         let token = auth
@@ -265,8 +252,8 @@ mod oidc_client_tests {
         );
     }
 
-    /// The refresh grant: a stored refresh token yields a new ID token and a rotated refresh
-    /// token, which is what `store_refresh_token` is already built to keep.
+    /// The refresh grant: a stored refresh token yields a new ID token and a rotated
+    /// refresh token.
     ///
     /// Requires the compose stack (see above).
     #[tokio::test]
@@ -311,14 +298,12 @@ mod oidc_client_tests {
         );
     }
 
-    /// The refresh grant where it actually has to work: not called directly, but reached by
-    /// an ordinary repository operation whose stored login has aged out. What the user sees
-    /// is the operation going through; what they do not see is a browser.
+    /// The refresh grant reached the way it is in production: by an ordinary repository
+    /// operation whose stored login has aged out.
     ///
-    /// Expiry is staged rather than waited for -- `PocketID`'s token lifetimes are measured in
-    /// hours. The client verifies no signatures (the server owns verification), so a stored
-    /// token whose `exp` has been moved into the past is expired as far as every client-side
-    /// check is concerned, which is the state this exercises.
+    /// Expiry is staged rather than waited for, since `PocketID`'s token lifetimes are
+    /// measured in hours. The client verifies no signatures, so a stored token whose `exp`
+    /// is in the past is expired as far as every client-side check is concerned.
     ///
     /// Requires the compose stack (see above).
     #[tokio::test]
@@ -336,8 +321,7 @@ mod oidc_client_tests {
             .expect("The login issued no refresh token");
         let expired = with_expiry_in_the_past(&token.token);
 
-        // What a login leaves behind, some hours later. `REMOTE_DOMAIN` is the remote the
-        // login was performed against, and the credential store adds the auth service.
+        // What a login leaves behind, some hours later.
         token_store::store_user_token(
             &auth_url,
             &token.user_id,
@@ -368,8 +352,8 @@ mod oidc_client_tests {
             .await
             .expect("The refreshed credential did not verify against the issuer's JWKS");
 
-        // Rotated, and kept: PocketID retires the refresh token it was given, so storing the
-        // new one is what makes the *next* expiry survivable too.
+        // Rotated, and kept: PocketID retires the refresh token it was given, so storing
+        // the new one is what makes the next expiry survivable too.
         let stored_refresh = token_store::load_refresh_token(&auth_url, &token.user_id)
             .await
             .expect("The refresh token is gone, so the next expiry needs a login");
@@ -395,8 +379,7 @@ mod oidc_client_tests {
     const REMOTE_DOMAIN: &str = "repo.example.com";
 
     /// Points the credential store at a directory of its own, with the encryption key in a
-    /// file rather than the OS keyring, so the test neither reads nor writes the developer's
-    /// real credentials -- and, on macOS, raises no keychain prompt.
+    /// file rather than the OS keyring, which on macOS also raises no keychain prompt.
     fn isolated_credential_store() {
         static AUTH_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         AUTH_DIR.get_or_init(|| {
@@ -409,9 +392,8 @@ mod oidc_client_tests {
         });
     }
 
-    /// The same token with its `exp` moved into the past. The signature no longer matches the
-    /// claims, which is exactly right: this stands in for a token the client should refuse to
-    /// present, and no client-side check reads the signature.
+    /// The same token with its `exp` moved into the past. The signature no longer matches
+    /// the claims, which is immaterial: no client-side check reads it.
     fn with_expiry_in_the_past(token: &str) -> String {
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -434,9 +416,8 @@ mod oidc_client_tests {
         )
     }
 
-    /// `exchange_for_repository` returns the authentication token unchanged: there is nothing
-    /// to exchange it with and nothing to mint, and the server authorizes a verified token
-    /// for every repository from its own configuration.
+    /// `exchange_for_repository` returns the authentication token unchanged: there is
+    /// nothing to exchange it with and nothing to mint.
     ///
     /// Requires the compose stack (see above).
     #[tokio::test]
@@ -467,20 +448,11 @@ mod oidc_client_tests {
             .expect("The passed-through token did not verify against the issuer's JWKS");
     }
 
-    /// **`PocketID` 2.6.2 does not implement RFC 8707.**
-    ///
-    /// The parameter is sent on every leg of the grant, and `PocketID` answers `200` to all
-    /// of them, ignores it, and mints an access token audienced to the client id with
-    /// header `typ: "JWT"` — no `invalid_target`, no warning, nothing in the response that
-    /// says the request was not honored. That silence is the reason the client checks the
-    /// token it got back rather than trusting the flow's success: without the check, a
-    /// login against a resource-mode server would complete, store a credential, print a
-    /// user name, and then have every single repository operation refused with the cause
-    /// nowhere in sight.
-    ///
-    /// So this asserts the failure is the *right* failure — raised at login, naming what
-    /// the provider did not do. If `PocketID` gains RFC 8707 support, this test starts
-    /// failing and should become the end-to-end success case.
+    /// `PocketID` 2.6.2 does not implement RFC 8707: it answers `200` to the parameter on
+    /// every leg of the grant, ignores it, and mints an access token audienced to the client
+    /// id with header `typ: "JWT"`. That silence is why the client checks the token it got
+    /// back rather than trusting the flow's success, and this asserts the failure is raised
+    /// at login, naming what the provider did not do.
     ///
     /// Requires the compose stack (see above).
     #[tokio::test]

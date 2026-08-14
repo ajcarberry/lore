@@ -205,11 +205,10 @@ fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigErro
     Ok(())
 }
 
-/// `[server.auth.oidc]` offers exactly one authorization mode: a verified token
-/// authorizes every repository on the server. `authorize_all_repositories` has
-/// no default, so a configured block that omits it, or sets it to `false`,
-/// fails here rather than starting a server that verifies every token and then
-/// refuses every request.
+/// `[server.auth.oidc]` offers one authorization mode: a verified token authorizes
+/// every repository. `authorize_all_repositories` has no default, so a configured
+/// block that omits it, or sets it to `false`, fails here rather than starting a
+/// server that verifies every token and then refuses every request.
 fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> {
     let Some(oidc) = settings
         .server
@@ -237,16 +236,14 @@ fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> 
     Ok(())
 }
 
-/// `server.auth.oidc.resource` is an RFC 8707 resource indicator, and §2 is
-/// specific about what one is: "Its value MUST be an absolute URI, as specified
-/// by Section 4.3 of [RFC3986]. The URI MUST NOT include a fragment component."
+/// RFC 8707 §2 on `server.auth.oidc.resource`: "Its value MUST be an absolute URI,
+/// as specified by Section 4.3 of [RFC3986]. The URI MUST NOT include a fragment
+/// component." A query component is permitted, since §2 only says clients SHOULD
+/// NOT include one.
 ///
-/// This is checked at start-up rather than left to the provider because a
-/// malformed indicator fails in the least useful place otherwise: the server
-/// would verify tokens against an audience no provider will ever mint, and
-/// every login would succeed while every request was refused. A query component
-/// is permitted — §2 says clients SHOULD NOT include one but acknowledges cases
-/// that need it — so it is not rejected here.
+/// Checked at start-up because a malformed indicator otherwise pins the server to
+/// an audience no provider will ever mint: every login succeeds and every request
+/// is refused.
 fn validate_resource_indicator(resource: &str) -> Result<(), config::ConfigError> {
     let malformed = |reason: &str| {
         config::ConfigError::Message(format!(
@@ -292,16 +289,14 @@ pub struct AuthSettings {
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct OidcSettings {
-    /// The provider's issuer identifier, exactly as it publishes it — the same string
-    /// it puts in the `iss` claim. The server checks it against the discovery
-    /// document's own `issuer` member byte for byte.
+    /// The provider's issuer identifier, exactly as it publishes it. The server checks
+    /// it against the discovery document's own `issuer` member byte for byte.
     pub issuer: String,
     /// The public client id registered for Lore with the provider.
     pub client_id: String,
     /// Whether a verified token authorizes every repository on the server. Has no
     /// default: a configured block that omits this, or sets it to `false`, fails
-    /// startup validation, because per-repository authorization from provider claims
-    /// is not implemented.
+    /// startup validation, because no other mode is implemented.
     #[serde(default)]
     pub authorize_all_repositories: bool,
     /// This deployment's own identifier, as an
@@ -310,11 +305,9 @@ pub struct OidcSettings {
     ///
     /// Setting it turns on resource-bound mode: the server requires an
     /// [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) JWT access token whose
-    /// `aud` names *this* value, instead of an ID token whose `aud` names the
-    /// client id. That is what stops two deployments behind the same provider
-    /// from accepting each other's tokens. It requires a provider that honors
-    /// resource indicators; leaving it unset keeps the ID-token behavior
-    /// unchanged.
+    /// `aud` names this value, instead of an ID token whose `aud` names the client
+    /// id. It requires a provider that honors resource indicators; leaving it unset
+    /// keeps the ID-token behavior.
     pub resource: Option<String>,
 }
 
@@ -607,9 +600,8 @@ mod tests {
     use crate::store::resolve_plugin_config_with_fallback;
     use crate::topology::TopologyProvider;
 
-    /// The settings matrix `[server.auth.oidc]` validation must reject: the block
-    /// absent (fine), the flag absent (fails), the flag `false` (fails), and the
-    /// flag `true` (fine) — see `validate_oidc_config`.
+    /// The `[server.auth.oidc]` matrix: block absent (fine), flag absent (fails),
+    /// flag `false` (fails), flag `true` (fine).
     mod oidc_settings {
         use super::*;
 
@@ -731,11 +723,8 @@ mod tests {
             assert!(validate_oidc_config(&settings).is_ok());
         }
 
-        /// `resource` is an RFC 8707 resource indicator, and §2 constrains its
-        /// syntax. A malformed one is caught at start-up because the alternative
-        /// is the worst kind of failure: the server would pin an audience no
-        /// provider will ever mint, so every login would succeed and every
-        /// request would be refused.
+        /// RFC 8707 §2 constrains a resource indicator's syntax, and a malformed
+        /// one pins the server to an audience no provider will ever mint.
         mod resource_indicator {
             use super::*;
 
@@ -752,9 +741,7 @@ mod tests {
                 }
             }
 
-            /// RFC 8707 §2: "Its value MUST be an absolute URI". A bare hostname
-            /// is what an operator writes when they read `resource` as a name
-            /// for this server rather than a URI.
+            /// RFC 8707 §2: "Its value MUST be an absolute URI".
             #[test]
             fn a_relative_reference_is_rejected() {
                 for resource in ["lore.example.com", "/lore", ""] {
@@ -772,8 +759,7 @@ mod tests {
                 assert!(error.to_string().contains("fragment"), "{error}");
             }
 
-            /// §2 says a client SHOULD NOT send a query component but recognizes
-            /// cases that need one, so it is not this server's place to refuse.
+            /// RFC 8707 §2 only says a client SHOULD NOT send a query component.
             #[test]
             fn a_query_component_is_permitted() {
                 validate_resource_indicator("https://lore.example.com?tenant=studio")

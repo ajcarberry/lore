@@ -236,10 +236,8 @@ async fn repository_create(
         };
     }
 
-    // `auth_url` also carries the OIDC provider's advertisement URL (see
-    // `repository_authorizer`, which applies the same scheme check for the same
-    // reason): only a `ucs-auth`/`https` value names Epic's relationship-based
-    // authorization service this call registers the new resource with.
+    // `auth_url` also carries the OIDC provider's advertisement URL, so only a
+    // `ucs-auth`/`https` value names the `ReBAC` service this call registers with.
     if let Some(auth_url) = auth_url.filter(|url| is_auth_client_scheme(url)) {
         let client = Box::new(grpc_get_rebac_client(auth_url).await?);
         repository_create_auth_resource(client, authorization, repository.id, name).await?;

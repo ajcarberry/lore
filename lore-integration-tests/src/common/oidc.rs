@@ -3,25 +3,13 @@
 //! Provisioning helpers for the `PocketID` instance in `lore-integration-tests/compose.yaml`.
 //!
 //! `PocketID`'s only interactive login is a passkey ceremony, which no test can drive. The
-//! way around it is entirely made of documented endpoints, and this module is the one
-//! place that knows the sequence:
+//! way around it uses documented endpoints only: `STATIC_API_KEY` authenticates as an admin
+//! (`X-API-KEY`) to register a client and a user, a one-time access token is traded for the
+//! session cookie a passkey login would have produced, and that cookie drives the JSON
+//! `authorize` endpoint the web UI itself calls. The device grant approves a user code the
+//! same way.
 //!
-//! 1. `STATIC_API_KEY` in the compose file provisions an admin user on first boot, so
-//!    there is no setup wizard to click through. It authenticates as `X-API-KEY`.
-//! 2. `POST /api/oidc/clients` and `POST /api/users` register a client and a user.
-//! 3. `POST /api/users/{id}/one-time-access-token` mints a short-lived login token for
-//!    that user, and `POST /api/one-time-access-token/{token}` trades it for the same
-//!    session cookie a passkey login would have produced.
-//! 4. `POST /api/oidc/authorize` with that cookie returns an authorization code —
-//!    it is the JSON endpoint the web UI itself calls, not the HTML consent page — and
-//!    `POST /api/oidc/token` exchanges the code for real signed tokens.
-//!
-//! The device authorization grant behind `lore login --no-browser` works the same way:
-//! `POST /api/oidc/device/authorize` for a code, then the same session cookie approves it
-//! via `POST /api/oidc/device/verify`, and the token endpoint redeems the device code.
-//!
-//! Every token this module hands out is minted and signed by `PocketID`; nothing here
-//! fabricates or self-signs one.
+//! Every token this module hands out is minted and signed by `PocketID`.
 #[cfg(all(test, feature = "integration_tests"))]
 pub(crate) mod oidc_common {
     use std::error::Error;
@@ -43,18 +31,15 @@ pub(crate) mod oidc_common {
     /// Must match the port published for `pocket-id` in `compose.yaml`.
     const POCKET_ID_URL: &str = "http://127.0.0.1:1411";
 
-    /// NOTE: this is just hardcoded in lore-integration-tests/compose.yaml as
-    /// `STATIC_API_KEY`, which is what makes the admin API reachable without a wizard.
+    /// Hardcoded in lore-integration-tests/compose.yaml as `STATIC_API_KEY`.
     const API_KEY: &str = "lorelocaltestapikeylorelocaltestapikey";
 
     /// The OIDC client every test shares. `PocketID` accepts a caller-chosen client id, so
-    /// this is stable across runs and across a `docker compose down -v`, which means a
-    /// server config can name it without discovering it first.
+    /// this stays stable across runs and across a `docker compose down -v`.
     pub const TEST_CLIENT_ID: &str = "lore-integration-tests";
 
-    /// Loopback redirect for the authorization-code flow. `PocketID` validates the value
-    /// against the client's registered callbacks, but nothing ever listens on it here:
-    /// the code comes back in the `authorize` JSON response, not through a redirect.
+    /// Loopback redirect for the authorization-code flow. Nothing listens on it: the code
+    /// comes back in the `authorize` JSON response, not through a redirect.
     pub const TEST_REDIRECT_URI: &str = "http://127.0.0.1:19999/callback";
 
     const SCOPE: &str = "openid profile email";
@@ -67,7 +52,7 @@ pub(crate) mod oidc_common {
         pub email: String,
     }
 
-    /// The token endpoint's response. Every field is signed by `PocketID`.
+    /// The token endpoint's response.
     #[derive(Clone, Debug, Deserialize)]
     pub struct TokenSet {
         pub access_token: String,
@@ -87,8 +72,8 @@ pub(crate) mod oidc_common {
         pub interval: i64,
     }
 
-    /// The claims Lore cares about. `PocketID` sends `aud` as an array, so it is typed as
-    /// one — a bare `String` here fails to deserialize against a real token.
+    /// The claims Lore cares about. `PocketID` sends `aud` as an array, so a bare `String`
+    /// here fails to deserialize against a real token.
     #[derive(Clone, Debug, Deserialize)]
     pub struct PocketIdClaims {
         pub sub: String,
@@ -114,9 +99,8 @@ pub(crate) mod oidc_common {
     /// Point the fixture at the compose-managed `PocketID` and make sure the shared OIDC
     /// client exists.
     ///
-    /// Idempotent and safe to call from tests running in parallel, in the same spirit as
-    /// `aws_common::setup`: a losing racer sees `PocketID` reject the duplicate client and
-    /// treats that as success.
+    /// Idempotent and safe to call from tests running in parallel: a losing racer sees
+    /// `PocketID` reject the duplicate client and treats that as success.
     pub async fn setup() -> Result<OidcFixture, Box<dyn Error + 'static>> {
         let _ = tracing_subscriber::fmt::try_init();
 
@@ -143,9 +127,8 @@ pub(crate) mod oidc_common {
             format!("{}{path}", self.base_url)
         }
 
-        /// Poll `/healthz` until the container is serving. Compose's healthcheck already
-        /// gates `depends_on`, but tests are also run against a manually started
-        /// container, where nothing has waited for it.
+        /// Poll `/healthz` until the container is serving, since a manually started
+        /// container has no `depends_on` gate.
         async fn wait_until_ready(&self) -> Result<(), Box<dyn Error + 'static>> {
             for attempt in 1..=30 {
                 match self.client.get(self.url("/healthz")).send().await {
@@ -185,8 +168,8 @@ pub(crate) mod oidc_common {
                 .await?)
         }
 
-        /// Fail with the endpoint's own error text rather than a bare status code, since
-        /// `PocketID` explains validation failures in the body and nowhere else.
+        /// Fail with the endpoint's own error text: `PocketID` explains validation
+        /// failures in the body and nowhere else.
         async fn json_or_error(
             path: &str,
             response: reqwest::Response,
@@ -224,8 +207,7 @@ pub(crate) mod oidc_common {
                 .await?;
 
             // Tests run in parallel and the container survives between runs, so losing
-            // the race to create the client is the normal case, not a failure. PocketID
-            // reports it as a 400 naming the client id.
+            // the race is the normal case. PocketID reports it as a 400 naming the id.
             if response.status() == StatusCode::BAD_REQUEST {
                 let body = response.text().await?;
                 if body.contains("already in use") {
@@ -238,8 +220,8 @@ pub(crate) mod oidc_common {
             Ok(())
         }
 
-        /// Provision a user. `prefix` is only a label — a random suffix keeps parallel
-        /// tests from colliding on the username and email, both of which are unique.
+        /// Provision a user. A random suffix keeps parallel tests from colliding on the
+        /// username and email, both of which are unique.
         pub async fn create_user(
             &self,
             prefix: &str,
@@ -276,9 +258,8 @@ pub(crate) mod oidc_common {
 
         /// Log `user` in without a passkey, returning the session cookie.
         ///
-        /// The cookie is returned rather than kept in a cookie jar because `PocketID` marks
-        /// it `Secure` even when serving plain HTTP, which a conforming cookie store
-        /// drops on an `http://` origin.
+        /// Returned rather than kept in a cookie jar because `PocketID` marks it `Secure`
+        /// even over plain HTTP, which a conforming cookie store drops.
         async fn login(&self, user: &TestUser) -> Result<String, Box<dyn Error + 'static>> {
             let path = format!("/api/users/{}/one-time-access-token", user.id);
             let response = self.admin_post(&path, json!({ "ttl": "1h" })).await?;
@@ -288,7 +269,7 @@ pub(crate) mod oidc_common {
                 .ok_or_else(|| anyhow::anyhow!("No one-time access token in response: {token}"))?
                 .to_string();
 
-            // Unauthenticated by design: possessing the one-time token *is* the credential.
+            // Unauthenticated by design: the one-time token is the credential.
             let exchange_path = format!("/api/one-time-access-token/{token}");
             let response = self.client.post(self.url(&exchange_path)).send().await?;
             let status = response.status();
@@ -323,8 +304,8 @@ pub(crate) mod oidc_common {
             self.issue_token_for_client(user, TEST_CLIENT_ID).await
         }
 
-        /// As [`issue_token`](Self::issue_token), but for a specific client — which is how
-        /// a test gets a token carrying an audience the server under test should refuse.
+        /// As [`issue_token`](Self::issue_token), but for a specific client, so a test can
+        /// get a token carrying an audience the server under test should refuse.
         pub async fn issue_token_for_client(
             &self,
             user: &TestUser,
@@ -339,8 +320,8 @@ pub(crate) mod oidc_common {
             ));
             let nonce = uuid::Uuid::new_v4().simple().to_string();
 
-            // The endpoint the PocketID web UI calls once a user has approved the client.
-            // With a session cookie in hand it needs no browser and renders no HTML.
+            // The endpoint the PocketID web UI calls once a user has approved the client;
+            // with a session cookie it needs no browser and renders no HTML.
             let authorize_body = json!({
                 "clientID": client_id,
                 "scope": SCOPE,
@@ -384,10 +365,8 @@ pub(crate) mod oidc_common {
         /// a client handed to `open::that`, and return the URL the provider would then have
         /// redirected to.
         ///
-        /// Everything the exchange needs — client id, scope, redirect URI, `state`,
-        /// `nonce`, and the PKCE challenge — is read out of the URL, because that is all a
-        /// browser is given. The returned target carries the `code` and echoes the `state`,
-        /// which is what a client's loopback listener receives.
+        /// Everything the exchange needs is read out of the URL, because that is all a
+        /// browser is given. The returned target carries the `code` and echoes the `state`.
         pub async fn follow_authorization_url(
             &self,
             user: &TestUser,
@@ -435,10 +414,8 @@ pub(crate) mod oidc_common {
             Ok(redirect.into())
         }
 
-        /// Begin an RFC 8628 device authorization, the way a headless client does.
-        ///
-        /// This is the first leg of `lore login --no-browser`: no session is involved
-        /// yet, so it needs no credentials at all.
+        /// Begin an RFC 8628 device authorization. No session is involved yet, so it
+        /// needs no credentials.
         pub async fn start_device_authorization(
             &self,
         ) -> Result<DeviceAuthorization, Box<dyn Error + 'static>> {
@@ -453,11 +430,8 @@ pub(crate) mod oidc_common {
             Ok(serde_json::from_value(authorization)?)
         }
 
-        /// Approve a device `user_code` as `user`.
-        ///
-        /// This stands in for the human half of the device flow — reading the code off
-        /// the terminal and confirming it — which is why it needs the session cookie
-        /// rather than the admin API key.
+        /// Approve a device `user_code` as `user`, standing in for the human half of the
+        /// flow, which is why it needs the session cookie rather than the admin API key.
         pub async fn approve_user_code(
             &self,
             user: &TestUser,
@@ -482,10 +456,8 @@ pub(crate) mod oidc_common {
             Ok(())
         }
 
-        /// Redeem an approved `device_code` for tokens.
-        ///
-        /// A real client polls this until the user approves; here approval has already
-        /// happened, so one call is enough.
+        /// Redeem an approved `device_code` for tokens. A real client polls until the
+        /// user approves; here approval has already happened.
         pub async fn redeem_device_code(
             &self,
             device_code: &str,
@@ -518,12 +490,9 @@ pub(crate) mod oidc_common {
             )?)
         }
 
-        /// Verify a token's signature against the issuer's published JWKS, the way a
-        /// server would, and return its claims.
-        ///
-        /// Discovery is followed rather than assumed: the JWKS URL comes from
-        /// `/.well-known/openid-configuration`, so a token that validates here validates
-        /// through the same path the Lore server will use.
+        /// Verify a token's signature against the issuer's published JWKS and return its
+        /// claims. The JWKS URL comes from discovery, so this is the path the Lore server
+        /// takes too.
         pub async fn validate_token(
             &self,
             token: &str,
@@ -564,9 +533,8 @@ pub(crate) mod oidc_common {
         }
     }
 
-    /// The spike this module was written to settle: a `PocketID` container, driven only
-    /// over its documented API, issues a real signed token for a user it has never seen
-    /// log in.
+    /// A `PocketID` container, driven only over its documented API, issues a real signed
+    /// token for a user it has never seen log in.
     ///
     /// Requires the compose stack:
     /// `docker compose --file lore-integration-tests/compose.yaml up --detach pocket-id`
@@ -583,8 +551,7 @@ pub(crate) mod oidc_common {
             .await
             .expect("Could not issue a token");
 
-        // Both tokens are RS256-signed by the container and must verify against the
-        // JWKS that discovery points at.
+        // Both tokens must verify against the JWKS that discovery points at.
         for token in [&tokens.id_token, &tokens.access_token] {
             let claims = fixture
                 .validate_token(token, TEST_CLIENT_ID)
@@ -614,22 +581,19 @@ pub(crate) mod oidc_common {
         assert_eq!(id_claims.token_type.as_deref(), Some("id-token"));
         assert!(tokens.expires_in > 0, "Token expires immediately");
         assert!(id_claims.exp > 0, "id_token carries no expiry");
-        // The nonce binds the token to this exchange; without it a replayed
-        // authorization response would be indistinguishable from a fresh login.
+        // The nonce binds the token to this exchange.
         assert!(
             id_claims.nonce.is_some(),
             "id_token did not echo the request nonce"
         );
 
-        // The refresh grant is what keeps a `lore` session alive past expiry, so the
-        // spike has to confirm the provider hands one out for this client.
+        // The refresh grant keeps a `lore` session alive past expiry.
         assert!(
             tokens.refresh_token.is_some(),
             "No refresh token issued for a public PKCE client"
         );
 
-        // A token minted for another client must not pass as one of ours; this is the
-        // rejection path the server-side tests build on.
+        // A token minted for another client must not pass as one of ours.
         let other_client = "lore-integration-tests-other";
         fixture
             .ensure_client(other_client, &[TEST_REDIRECT_URI])
@@ -648,8 +612,7 @@ pub(crate) mod oidc_common {
         );
     }
 
-    /// The device authorization grant (RFC 8628) behind `lore login --no-browser`,
-    /// driven end to end with no browser and no human at the keyboard.
+    /// The device authorization grant (RFC 8628), driven end to end with no browser.
     ///
     /// Requires the compose stack:
     /// `docker compose --file lore-integration-tests/compose.yaml up --detach pocket-id`
@@ -657,8 +620,7 @@ pub(crate) mod oidc_common {
     async fn pocket_id_device_grant_completes_without_a_browser() {
         let fixture = setup().await.expect("PocketID fixture setup failed");
 
-        // The client only trusts the grant if the provider advertises it, which is what
-        // `lore login --no-browser` will key off rather than assuming support.
+        // The client keys off the advertisement rather than assuming support.
         let discovery = fixture
             .discovery()
             .await
@@ -725,8 +687,7 @@ pub(crate) mod oidc_common {
             "Wrong audience"
         );
 
-        // The refresh grant has to work for a device login too, or a headless host
-        // would have to re-run the whole ceremony on every expiry.
+        // The refresh grant has to work for a device login too.
         assert!(
             tokens.refresh_token.is_some(),
             "No refresh token issued for the device grant"

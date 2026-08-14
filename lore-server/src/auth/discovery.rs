@@ -1,14 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! `OpenID` Connect Discovery (§4 of the spec): fetching a provider's
+//! `OpenID` Connect Discovery §4: fetching a provider's
 //! `.well-known/openid-configuration` document at server start-up so
 //! `[server.auth.oidc]` needs only an issuer and a client id.
 //!
-//! The server reads exactly two members from the document: `issuer`, checked
-//! against the configured issuer, and `jwks_uri`, which becomes the
-//! `JWKService` endpoint. Every other endpoint a login flow uses is the
-//! client's business, so the server never relays a provider's endpoints and
-//! cannot get them stale.
+//! The server reads two members: `issuer`, checked against the configured
+//! issuer, and `jwks_uri`, which becomes the `JWKService` endpoint.
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -43,16 +40,14 @@ pub enum DiscoveryError {
 }
 
 /// Cap on the discovery document this server will hold in memory, matching the
-/// JWKS cap (`JWKS_MAX_RESPONSE_BYTES`): generous beside any real document, so
-/// the only ones refused are larger than any provider would plausibly send.
+/// JWKS cap (`JWKS_MAX_RESPONSE_BYTES`).
 const DISCOVERY_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 const DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One pooled client for discovery fetches, built the same way as the JWKS
-/// client (`crate::auth::jwk::http_client`): rustls, both cert stores, a
-/// bounded connect/request timeout.
+/// One pooled client for discovery fetches, built like the JWKS client
+/// (`crate::auth::jwk::http_client`): rustls, both cert stores, bounded timeouts.
 fn http_client() -> Result<&'static reqwest::Client, DiscoveryError> {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     if let Some(client) = CLIENT.get() {
@@ -76,7 +71,7 @@ fn http_client() -> Result<&'static reqwest::Client, DiscoveryError> {
 /// Read a response body, refusing anything past [`DISCOVERY_MAX_RESPONSE_BYTES`].
 ///
 /// `Content-Length` is a claim, not a fact, so the accumulating read is what
-/// actually enforces the cap — the same reasoning as `jwk::read_capped_body`.
+/// actually enforces the cap.
 async fn read_capped_body(response: &mut reqwest::Response) -> Result<String, DiscoveryError> {
     if let Some(declared) = response.content_length()
         && declared > DISCOVERY_MAX_RESPONSE_BYTES as u64
@@ -106,9 +101,8 @@ async fn read_capped_body(response: &mut reqwest::Response) -> Result<String, Di
     })
 }
 
-/// The discovery document URL for an issuer, per Discovery §4: the
-/// `.well-known` suffix joins the issuer identifier with no path normalization
-/// beyond avoiding a doubled slash.
+/// The discovery document URL for an issuer (Discovery §4). The `.well-known`
+/// suffix joins the issuer with no normalization beyond avoiding a doubled slash.
 fn discovery_url(issuer: &str) -> String {
     format!(
         "{}/.well-known/openid-configuration",
@@ -118,10 +112,9 @@ fn discovery_url(issuer: &str) -> String {
 
 /// Fetch and validate the discovery document for `issuer`.
 ///
-/// The document's own `issuer` member must equal the configured issuer byte
-/// for byte (Discovery §4.3) — this is what makes the discovery URL safe to
-/// fetch at all: without it, a redirect or a compromised well-known path could
-/// point the server at a key set belonging to somebody else.
+/// The document's own `issuer` member must equal the configured issuer byte for
+/// byte (Discovery §4.3), so a redirect or a compromised well-known path cannot
+/// point the server at somebody else's key set.
 pub async fn fetch_discovery_document(issuer: &str) -> Result<DiscoveryDocument, DiscoveryError> {
     let url = discovery_url(issuer);
     let client = http_client()?;
@@ -192,8 +185,8 @@ mod tests {
         Json(body)
     }
 
-    /// Binds the listener first, so `make_body` can bake the address the test
-    /// server will answer on — its own issuer identifier — into the document.
+    /// Binds the listener first, so `make_body` can bake in the address the test
+    /// server will answer on.
     async fn spawn_discovery_server(
         make_body: impl FnOnce(&str) -> serde_json::Value,
     ) -> (SocketAddr, String) {
@@ -219,9 +212,6 @@ mod tests {
         (address, issuer)
     }
 
-    /// The issuer argument doubles as the dial target (`{issuer}/.well-known/...`)
-    /// and the expected value, so pointing it at the test server's own address
-    /// exercises the real `fetch_discovery_document` end to end.
     #[tokio::test]
     async fn fetches_and_returns_jwks_uri_when_issuer_matches() {
         let (_address, issuer) = spawn_discovery_server(

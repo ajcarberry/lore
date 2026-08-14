@@ -171,13 +171,10 @@ impl GrpcServerBuilder<WantsEnvironment> {
     pub fn new() -> Self {
         Self(WantsEnvironment(()))
     }
-    /// `environment` is what internal consumers of the environment (currently
-    /// `LoreRepositoryService`/`LoreRepositoryV1Service`, for the `ReBAC` dial target)
-    /// read; `advertised_environment` is what `EnvironmentGet` returns to clients. They
-    /// start equal but diverge when `[server.auth.oidc]` derives an `auth_url` an
-    /// operator didn't set explicitly: that derived value is for advertisement only and
-    /// must never reach an internal consumer expecting a dialable endpoint (see
-    /// `repository_authorizer`'s scheme check, which exists for exactly this reason).
+    /// `environment` is what internal consumers read for a dialable endpoint;
+    /// `advertised_environment` is what `EnvironmentGet` returns to clients. They start
+    /// equal but diverge when `[server.auth.oidc]` derives an `auth_url`, which is for
+    /// advertisement only and must never reach an internal consumer.
     pub fn with_environment(
         self,
         environment: EnvironmentConfig,

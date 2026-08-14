@@ -280,9 +280,8 @@ pub async fn interactive(
     lore_debug!("ClientState {}", client_state);
 
     // 2. Start auth session via the Authentication implementation. `--no-browser`
-    //    selects a login ceremony that can finish without one: the OIDC
-    //    implementation runs the device authorization grant instead of a loopback
-    //    redirect. An implementation with a single ceremony ignores it.
+    //    selects a login ceremony that can finish without one; an implementation
+    //    with a single ceremony ignores it.
     let flow = if no_browser {
         LoginFlow::NoBrowser
     } else {
@@ -357,16 +356,14 @@ pub async fn interactive(
 /// records alongside it and what [`verify_jwt_usage_for_remote`] later enforces.
 ///
 /// [`AuthenticationToken::acceptable_root_domains`] is authoritative when the
-/// implementation filled it in, because only the implementation knows how its own tokens'
-/// audience semantics work. An `OpenID` Connect provider issues `aud` as a client id and
-/// `iss` as a URL, neither of which is a domain any remote could match, so deriving the set
-/// from the JWT would make every OIDC login refuse its own token. What the implementation
-/// cannot know is the remote the login was performed against; this layer adds it, so the
-/// rule for such a token is: usable at the remote you logged in to, and at its issuer,
-/// nowhere else.
+/// implementation filled it in, because only the implementation knows its own tokens'
+/// audience semantics. An `OpenID` Connect provider issues `aud` as a client id and `iss`
+/// as a URL, neither of which a remote could match, so a JWT-derived set would make every
+/// OIDC login refuse its own token. This layer adds the remote the login was performed
+/// against, which the implementation cannot know.
 ///
-/// `ucs-auth` returns an empty vector and keeps the JWT-derived behavior exactly: its auth
-/// service issues `aud` as a list of root domains, so the token itself says where it may go.
+/// `ucs-auth` returns an empty vector and keeps the JWT-derived behavior: its `aud` is a
+/// list of root domains, so the token itself says where it may go.
 fn acceptable_root_domains(
     authn: &AuthenticationToken,
     remote_domain: &str,
@@ -425,9 +422,7 @@ mod tests {
     }
 
     /// The producer half of the token-recipient guard: what login persists is what
-    /// `exchange` later requires the recipient to be in. Drop the remote here and every
-    /// `OpenID` Connect login still succeeds, while every operation against the remote it
-    /// was performed for is refused a token.
+    /// `exchange` later requires the recipient to be in.
     #[test]
     fn an_oidc_login_may_be_used_at_its_remote_and_its_issuer() {
         let authn = authn_token(vec!["id.example.com".to_string()], "not-decoded");

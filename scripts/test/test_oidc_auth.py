@@ -48,11 +48,9 @@ from pocket_id import PocketIdClient
 
 logger = logging.getLogger(__name__)
 
-# The CLI polls the device endpoint every 5s for up to 30 attempts
-# (lore-revision/src/auth/login.rs POLLING_INTERVAL_SECS / POLLING_MAX_RETRIES),
-# so ~150s is its own worst-case ceiling; this gives it room to land within
-# one interval of approval without waiting out that entire ceiling on a
-# genuine hang.
+# The CLI's own ceiling is ~150s (lore-revision/src/auth/login.rs
+# POLLING_INTERVAL_SECS / POLLING_MAX_RETRIES); this leaves room to land within
+# one poll interval of approval without waiting that ceiling out on a hang.
 DEVICE_LOGIN_TIMEOUT = 60
 
 
@@ -123,11 +121,9 @@ def _login_no_browser(
         text=True,
         env={**os.environ, **env},
     )
-    # `for line in process.stdout` blocks on the next read with no way to poll
-    # a deadline in between lines, so a plain elapsed-time check inside the
-    # loop never fires once the CLI stops producing output. A watchdog thread
-    # that kills the process after `timeout` closes the pipe (EOF), which is
-    # the only way to bound the loop below from the outside.
+    # `for line in process.stdout` blocks on the next read, so an elapsed-time
+    # check inside the loop never fires once the CLI stops producing output. A
+    # watchdog thread that kills the process closes the pipe, bounding the loop.
     finished = threading.Event()
     timed_out = threading.Event()
 

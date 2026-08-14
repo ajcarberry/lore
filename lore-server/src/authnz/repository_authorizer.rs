@@ -91,10 +91,8 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
     }
 }
 
-/// Whether `auth_url` names an `OpenID` Connect provider, which is the one thing this
-/// server must not point its relationship-based authorization client at: the URL names an
-/// identity provider, and dialing it as if it were the authorization service would fail
-/// every repository operation that checks a permission.
+/// Whether `auth_url` names an `OpenID` Connect provider, which this server must never
+/// point its relationship-based authorization client at.
 fn is_oidc_scheme(auth_url: &str) -> bool {
     auth_url
         .split_once("://")
@@ -103,22 +101,19 @@ fn is_oidc_scheme(auth_url: &str) -> bool {
 
 /// Whether `auth_url` names a scheme this server checks repository access against.
 ///
-/// Everything that is not an `oidc+` URL does. The rule is written that way round on
-/// purpose: an allowlist of known authorization schemes silently drops the check for any
-/// deployment spelling its auth URL differently — plain `http` to a service behind a mesh,
-/// say — and dropping the check is the failure that cannot be noticed from the outside,
-/// because every operation still succeeds. Only OIDC, where the check genuinely moves into
-/// the server's own token verification, gives it up.
+/// Everything that is not an `oidc+` URL does. Written that way round because an allowlist
+/// of known authorization schemes silently drops the check for a deployment spelling its
+/// auth URL differently — plain `http` to a service behind a mesh, say — and a dropped
+/// check cannot be noticed from the outside.
 pub(crate) fn is_auth_client_scheme(auth_url: &str) -> bool {
     !is_oidc_scheme(auth_url)
 }
 
 /// Creates the appropriate authorizer from an optional auth URL.
 ///
-/// Returns `AllowAllRepositoryAuthorizer` when no URL is configured — the correct answer
-/// under `authorize_all_repositories` — and for an `oidc+` URL, where the server verifies
-/// the provider's token itself and has no per-repository authority to consult. Every other
-/// URL keeps its authorization check (see [`is_auth_client_scheme`]).
+/// Returns `AllowAllRepositoryAuthorizer` when no URL is configured and for an `oidc+` URL,
+/// where the server verifies the provider's token itself and has no per-repository
+/// authority to consult. Every other URL keeps its authorization check.
 pub fn repository_authorizer(auth_url: Option<String>) -> Arc<dyn RepositoryAuthorizer> {
     match auth_url {
         Some(url) if is_oidc_scheme(&url) => {
@@ -148,10 +143,8 @@ mod tests {
         assert!(is_auth_client_scheme("https://auth.example.com"));
     }
 
-    /// The risk the LEP names by name: an OIDC-advertised `auth_url` must never
-    /// be handed to the gRPC client meant for the relationship-based
-    /// authorization service, or repository create/delete/query/metadata
-    /// operations would all fail against a live provider.
+    /// An OIDC-advertised `auth_url` must never be handed to the gRPC client meant
+    /// for the relationship-based authorization service.
     #[test]
     fn oidc_https_scheme_does_not_select_the_auth_client() {
         assert!(!is_auth_client_scheme("oidc+https://id.example.com"));
@@ -162,10 +155,8 @@ mod tests {
         assert!(!is_auth_client_scheme("oidc+http://127.0.0.1:1411"));
     }
 
-    /// The rule is fail-closed for everything this change did not come to serve: only an
-    /// `oidc+` scheme gives up the authorization check. A deployment that reaches its
-    /// authorization service over plain `http` -- behind a mesh, or in a test harness --
-    /// kept its check before OIDC existed and keeps it now.
+    /// Only an `oidc+` scheme gives up the authorization check: a deployment reaching its
+    /// authorization service over plain `http` keeps the check it had before OIDC existed.
     #[test]
     fn plain_http_scheme_selects_the_auth_client() {
         assert!(is_auth_client_scheme("http://auth.example.com"));
@@ -179,8 +170,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_auth_url_falls_back_to_allow_all() {
-        // Exercised through the public constructor: `AllowAllRepositoryAuthorizer`
-        // carries no state to introspect, so behavior is the observable proof.
+        // `AllowAllRepositoryAuthorizer` carries no state to introspect, so behavior is
+        // the only observable proof.
         let authorizer = repository_authorizer(None);
         let repository_id = lore_base::types::RepositoryId::from([0u8; 16]);
         assert!(

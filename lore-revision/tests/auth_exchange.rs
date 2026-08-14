@@ -38,9 +38,8 @@ mod tests {
     struct TestAuthentication {
         exchange_result:
             Box<dyn Fn(RepositoryId) -> Result<AuthorizationToken, ProtocolError> + Send + Sync>,
-        /// What the backend's refresh grant answers. `NotSupported` is `ucs-auth`'s answer
-        /// and the default here, so a test that says nothing about refreshing gets the
-        /// behavior a backend without the grant has.
+        /// What the backend's refresh grant answers. `NotSupported` is the default, so a
+        /// test that says nothing about refreshing gets a backend without the grant.
         refresh_result: Box<dyn Fn() -> Result<AuthenticationToken, ProtocolError> + Send + Sync>,
         /// The authentication token the last exchange was handed, so a test can tell which
         /// credential the operation actually proceeded with.
@@ -75,8 +74,7 @@ mod tests {
         }
 
         /// The shape an `OpenID` Connect provider produces: the authorization token is the
-        /// authentication token, and the only domain it can name for itself is the
-        /// issuer's.
+        /// authentication token, naming only the issuer's domain.
         fn oidc_shaped(issuer_domain: &'static str) -> Self {
             Self::exchanging(Box::new(move |_| {
                 Ok(AuthorizationToken {
@@ -98,8 +96,7 @@ mod tests {
                     user_id: "user-1".into(),
                     user_name: "user-1".into(),
                     expires_ms: u64::MAX,
-                    // The issuer is all a provider can name; the remote the login was
-                    // performed against is not something it knows.
+                    // The issuer is all a provider can name.
                     acceptable_root_domains: vec!["id.example.com".into()],
                     refresh_token: rotated.clone(),
                 })
@@ -350,14 +347,12 @@ mod tests {
         assert_eq!(user.unwrap().user_id, "id-for-Alice");
     }
 
-    /// A JWT with a far-future expiry and a signature nothing checks -- the credential
-    /// store reads the claims, and the server owns verification.
+    /// A JWT with a far-future expiry and a signature nothing checks.
     fn unsigned_jwt(subject: &str) -> String {
         jwt_expiring_at(subject, 9999999999)
     }
 
-    /// The same token, long since expired: the state a login reaches when it is left alone
-    /// for longer than the provider's token lifetime.
+    /// The same token, long since expired.
     fn expired_jwt(subject: &str) -> String {
         jwt_expiring_at(subject, 1000000000)
     }
@@ -376,13 +371,10 @@ mod tests {
     }
 
     /// Points the credential store at a directory of its own, with the encryption key in a
-    /// file rather than the OS keyring, so a test neither reads nor writes the developer's
-    /// real credentials.
+    /// file rather than the OS keyring.
     ///
     /// One directory for the whole binary, because `LORE_AUTH_PATH` and the loaded token map
-    /// are both process-wide: a directory per test would have concurrently running tests
-    /// writing to each other's store. Tests stay independent by using an auth URL of their
-    /// own instead.
+    /// are both process-wide. Tests stay independent by using an auth URL of their own.
     fn isolated_credential_store() -> &'static TempDir {
         static AUTH_DIR: OnceLock<TempDir> = OnceLock::new();
         AUTH_DIR.get_or_init(|| {
@@ -395,8 +387,7 @@ mod tests {
         })
     }
 
-    /// The state a login leaves behind once its token has expired: the token itself, the
-    /// domains it may be sent to, and -- when the provider issued one -- a refresh token.
+    /// The state a login leaves behind once its token has expired.
     async fn store_expired_login(auth_url: &str, identity: &str, refresh_token: Option<&str>) {
         token_store::store_user_token(
             auth_url,
@@ -426,11 +417,9 @@ mod tests {
 
     /// The token-recipient guard, on the path an explicit identity takes.
     ///
-    /// `exchange` loads the stored authentication token by the *auth service's* domain, so
-    /// nothing in it consults the set of domains that token was stored as acceptable for.
-    /// A remote that advertises the auth URL the user logged in against therefore asks for,
-    /// and under an OIDC passthrough receives, the user's own credential -- which is the
-    /// leak the guard exists to prevent.
+    /// `exchange` loads the stored authentication token by the auth service's domain, so a
+    /// remote advertising the auth URL the user logged in against would otherwise be handed
+    /// that user's credential under an OIDC passthrough.
     #[tokio::test]
     async fn exchange_refuses_a_recipient_the_stored_token_does_not_name() {
         let scheme = "test-exchange-recipient-guard";
@@ -443,8 +432,7 @@ mod tests {
         )
         .unwrap();
 
-        // What a login persists: the issuer, plus the remote the login was performed
-        // against. `repo-b.example.com` is not among them.
+        // What a login persists: the issuer, plus the remote it was performed against.
         token_store::store_user_token(
             &auth_url,
             identity,
@@ -480,9 +468,8 @@ mod tests {
         );
     }
 
-    /// The point of the refresh grant: a token that has expired since the last command is
-    /// traded for a new one, and the operation the user asked for goes through on it rather
-    /// than stopping to demand an interactive login.
+    /// A token that expired since the last command is traded for a new one, and the
+    /// operation goes through on it rather than demanding an interactive login.
     #[tokio::test]
     async fn an_expired_token_is_refreshed_and_the_operation_proceeds() {
         let scheme = "test-refresh-proceeds";
@@ -520,9 +507,7 @@ mod tests {
 
     /// The producer half of the token-recipient guard, on a refreshed token: what a refresh
     /// persists has to be what the login persisted, because the acceptable set names the
-    /// remote the login was performed against and the provider cannot know it. Persist the
-    /// refreshed token's own set and the credential is either unusable at its own remote or,
-    /// worse, usable somewhere it never was.
+    /// remote the login was performed against and the provider cannot know it.
     #[tokio::test]
     async fn a_refreshed_token_keeps_the_recipients_the_login_recorded() {
         let scheme = "test-refresh-recipient-guard";
@@ -600,9 +585,7 @@ mod tests {
         );
     }
 
-    /// An identity whose login can be kept alive is no longer skipped -- which is the
-    /// difference between a command that works and one that sends the user back to
-    /// `lore auth login`.
+    /// An identity whose login can be kept alive is no longer skipped.
     #[tokio::test]
     async fn identity_resolution_refreshes_rather_than_skipping() {
         let scheme = "test-refresh-identity";
@@ -667,8 +650,8 @@ mod tests {
         );
     }
 
-    /// Nothing to refresh with: the identity is skipped exactly as it is today, and the
-    /// stored login is left alone. Failing to refresh is not a new way to fail.
+    /// Nothing to refresh with: the identity is skipped and the stored login is left
+    /// alone.
     #[tokio::test]
     async fn an_expired_token_with_no_refresh_token_is_skipped_as_before() {
         let scheme = "test-refresh-absent";
@@ -705,8 +688,7 @@ mod tests {
         );
     }
 
-    /// A backend without the grant -- `ucs-auth` answers `NotSupported` -- behaves exactly as
-    /// it does today, which is the whole of what this change may do to it.
+    /// A backend without the grant -- `ucs-auth` answers `NotSupported` -- is unaffected.
     #[tokio::test]
     async fn a_backend_without_a_refresh_grant_is_unaffected() {
         let scheme = "test-refresh-not-supported";

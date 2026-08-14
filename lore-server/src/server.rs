@@ -424,15 +424,11 @@ fn compiled_features() -> Vec<String> {
 /// Build the server's `JwtVerifier` from `[server.auth]`, when configured.
 ///
 /// `[server.auth.oidc]` supplies what `jwt_issuer`/`jwt_audience`/`jwk.endpoint`
-/// otherwise ask for twice: at start-up the server fetches the provider's
-/// discovery document — on the net runtime, since it is network I/O — checks
-/// its `issuer` against the configured one, and feeds `jwks_uri` to the same
-/// `JWKService` used everywhere else. An explicit `jwt_issuer`, `jwt_audience`,
-/// or `[server.auth.jwk].endpoint` still wins, which keeps the `file://`
-/// key-set endpoint reachable as an offline escape hatch. Settings validation
-/// (`validate_oidc_config`) has already refused to start a server whose
-/// `[server.auth.oidc]` block omits `authorize_all_repositories`, so reaching
-/// this function with `auth.oidc` set means that grant is intended.
+/// otherwise ask for twice: the server fetches the provider's discovery document
+/// on the net runtime, checks its `issuer` against the configured one, and feeds
+/// `jwks_uri` to the same `JWKService` used everywhere else. An explicit
+/// `jwt_issuer`, `jwt_audience`, or `[server.auth.jwk].endpoint` still wins,
+/// which keeps the `file://` key-set endpoint reachable.
 async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVerifier>> {
     let Some(auth) = auth else {
         return Ok(None);
@@ -453,12 +449,9 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
                 });
             let jwt_issuer = auth.jwt_issuer.clone().or(Some(oidc.issuer.clone()));
 
-            // The audience pin *is* the mode. Without a `resource` the server
-            // pins the client id and reads an ID token, which cannot tell two
-            // deployments behind one provider apart; with one it pins this
-            // deployment's own identifier, and a sibling's token stops
-            // verifying. An explicit `jwt_audience` still wins, per the LEP's
-            // rule that a setting written down beats a derived one.
+            // The audience pin is the mode: without a `resource` the server pins
+            // the client id and reads an ID token, with one it pins this
+            // deployment's own identifier. An explicit `jwt_audience` still wins.
             let acceptance = match oidc.resource.as_ref() {
                 Some(_) => OidcAcceptance::AccessToken,
                 None => OidcAcceptance::IdToken,
@@ -504,16 +497,15 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
 }
 
 /// Derive `auth_url` from `[server.auth.oidc]` when the operator left
-/// `environment.endpoint.auth_url` empty, per the LEP's "Advertising the
-/// provider" section: `oidc+{scheme}://{issuer-without-scheme}?client_id=...`,
-/// with the issuer's own path preserved so stripping the `oidc+` prefix
-/// recovers the issuer string unchanged. An explicit `auth_url` always wins.
+/// `environment.endpoint.auth_url` empty:
+/// `oidc+{scheme}://{issuer-without-scheme}?client_id=...`, with the issuer's own
+/// path preserved so stripping the `oidc+` prefix recovers the issuer string
+/// unchanged. An explicit `auth_url` always wins, and must carry the parameters
+/// itself.
 ///
-/// A configured `resource` is advertised alongside the client id: it is the
-/// only way the client learns to send the RFC 8707 `resource` parameter on its
-/// grant requests, which the provider needs in order to audience-restrict the
-/// token this server demands. An operator who writes `auth_url` by hand must
-/// carry the parameter themselves.
+/// A configured `resource` is advertised alongside the client id: it is the only
+/// way the client learns to send the RFC 8707 `resource` parameter, without which
+/// the provider will not audience-restrict the token this server demands.
 fn derive_oidc_auth_url(oidc: &crate::settings::OidcSettings) -> Option<String> {
     let issuer_url = reqwest::Url::parse(&oidc.issuer).ok()?;
     let scheme = match issuer_url.scheme() {
@@ -606,14 +598,10 @@ async fn launch_grpc_server(
         environment.config = Some(config);
     }
 
-    // Advertise the provider (LEP "Advertising the provider") when the operator
-    // configured OIDC but left the auth endpoint to derive. An explicit
-    // `auth_url` — including an explicitly empty one — always wins.
-    //
-    // This is advertisement only, so it is applied to a clone rather than
-    // `environment` itself: `environment` is also what internal consumers read
-    // (e.g. the ReBAC dial target for repository create/delete), and a derived
-    // `oidc+https://…` string is not a service either of them can dial.
+    // Advertisement only, so the derived URL is applied to a clone: `environment`
+    // is also what internal consumers read (the `ReBAC` dial target for repository
+    // create/delete), and a derived `oidc+https://…` string is not a service any of
+    // them can dial.
     let mut advertised_environment = environment.clone();
     if let Some(oidc) = settings
         .server
@@ -2329,10 +2317,8 @@ mod tests {
             assert_eq!(issuer_part, "https://id.example.com/realms/studio");
         }
 
-        /// Without this, the client never learns to send the RFC 8707 `resource`
-        /// parameter, the provider mints a token audienced to the client id
-        /// instead, and a resource-mode server refuses it: every login would
-        /// succeed and every request would be denied.
+        /// Without this the client never sends the RFC 8707 `resource` parameter,
+        /// and a resource-mode server refuses every token the provider then mints.
         #[test]
         fn a_configured_resource_is_advertised() {
             let derived = derive_oidc_auth_url(&oidc_with_resource(
@@ -2351,8 +2337,6 @@ mod tests {
             );
         }
 
-        /// A resource indicator is an absolute URI, so it carries `:` and `/`
-        /// that have to survive being a query parameter value.
         #[test]
         fn an_advertised_resource_is_percent_encoded() {
             let derived = derive_oidc_auth_url(&oidc_with_resource(
@@ -2367,9 +2351,7 @@ mod tests {
             );
         }
 
-        /// The issuer still has to come back byte for byte with a resource in
-        /// the query, because every issuer check downstream is a byte
-        /// comparison.
+        /// Every issuer check downstream is a byte comparison.
         #[test]
         fn a_resource_does_not_disturb_the_issuer() {
             let derived = derive_oidc_auth_url(&oidc_with_resource(
@@ -2475,10 +2457,6 @@ mod tests {
             );
         }
 
-        /// Two Lore servers behind the same provider share a client id, so
-        /// without a configured `resource` each accepts a token minted for the
-        /// other. Naming a `resource` moves the audience pin from the client id
-        /// to this deployment, which stops that.
         #[tokio::test]
         async fn a_configured_resource_pins_the_audience_to_the_deployment() {
             let (_address, issuer) =
@@ -2577,9 +2555,8 @@ mod tests {
             address
         }
 
-        /// Binds the listener first so the discovery document can name the
-        /// server's own address as its issuer, satisfying the byte-for-byte
-        /// issuer check `fetch_discovery_document` applies.
+        /// Binds the listener first so the discovery document can name the server's
+        /// own address as its issuer, which the byte-for-byte issuer check needs.
         async fn spawn_discovery_and_jwks_server(jwks: &serde_json::Value) -> (SocketAddr, String) {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await

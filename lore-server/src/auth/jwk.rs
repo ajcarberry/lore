@@ -547,16 +547,10 @@ impl InstrumentProvider for JwkServiceImpl {
 
 /// Whether OIDC mode may verify a token signed with `algorithm`.
 ///
-/// The loader already refuses to *infer* a symmetric algorithm and refuses a
-/// key whose declared algorithm belongs to another key type (the
-/// algorithm-confusion forgery). What it still honors is a provider
-/// *declaring* `HS256` on an `oct` key in its own published key set — a
-/// symmetric secret published in a public key set is a signing key for
-/// anyone who can read it. OIDC mode refuses symmetric algorithms outright,
-/// leaving `RS*`, `PS*`, `ES*`, and `EdDSA`. `alg: none` needs no entry here:
-/// `jsonwebtoken::Algorithm` has no such variant, so a token's header naming
-/// it is refused unconditionally, in every mode, before a key is ever looked
-/// up.
+/// The loader still honors a provider declaring `HS256` on an `oct` key in its
+/// own published key set, and a symmetric secret published there is a signing
+/// key for anyone who can read it. OIDC mode refuses symmetric algorithms
+/// outright, leaving `RS*`, `PS*`, `ES*`, and `EdDSA`.
 fn oidc_permits_algorithm(algorithm: jsonwebtoken::Algorithm) -> bool {
     !matches!(
         algorithm,
@@ -566,11 +560,8 @@ fn oidc_permits_algorithm(algorithm: jsonwebtoken::Algorithm) -> bool {
     )
 }
 
-/// Wraps a [`JWKService`] to additionally refuse symmetric signing
-/// algorithms, for `[server.auth.oidc]` verifiers only. Composed onto the
-/// discovery-derived `JwkServiceImpl` at start-up rather than added as a mode
-/// flag on the shared service or verifier types, so a ucs-auth deployment's
-/// verification is unaffected.
+/// Wraps a [`JWKService`] to additionally refuse symmetric signing algorithms,
+/// for `[server.auth.oidc]` verifiers only.
 pub struct OidcJwkService {
     inner: Arc<dyn JWKService>,
 }

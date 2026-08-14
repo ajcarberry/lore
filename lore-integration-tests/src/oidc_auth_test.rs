@@ -5,17 +5,14 @@
 //!
 //! A real `JwtVerifier` (`lore_server::auth::jwt`) is pointed at the `PocketID` instance in
 //! `lore-integration-tests/compose.yaml`, following the discovery document rather than a
-//! hardcoded JWKS path, and wired into an in-process gRPC or HTTP server the same way
-//! `storage_remote_test.rs` and `presign_test.rs` do for an unauthenticated one. The
-//! verifier is built by hand here rather than through `build_jwt_verifier`
+//! hardcoded JWKS path, and wired into an in-process gRPC or HTTP server. The verifier is
+//! built by hand here rather than through `build_jwt_verifier`
 //! (`lore-server/src/server.rs`), which builds the identical verifier from
 //! `[server.auth.oidc]`.
 //!
-//! Raw generated gRPC clients are needed to attach an arbitrary bearer token to a request,
-//! which the higher-level `lore::storage` API does not support directly. That need pulls
-//! in the `tonic` crate, so `integration_tests` now activates the same optional
-//! `tonic`/`tokio-stream` dependencies `grpc_integration_tests` does (see `Cargo.toml`) —
-//! the whole matrix below runs under `integration_tests` alone.
+//! Attaching an arbitrary bearer token needs the raw generated gRPC clients, so
+//! `integration_tests` activates the optional `tonic`/`tokio-stream` dependencies and the
+//! whole matrix below runs under that feature alone.
 
 #[cfg(all(test, feature = "integration_tests"))]
 mod oidc_auth_tests {
@@ -67,8 +64,7 @@ mod oidc_auth_tests {
         (backend_immutable, backend_mutable)
     }
 
-    /// A `JwtVerifier` pointed at `PocketID`'s real JWKS, discovered rather than hardcoded,
-    /// assembled directly from `issuer`, `jwks_uri`, and `client_id` as the audience.
+    /// A `JwtVerifier` pointed at `PocketID`'s real JWKS, discovered rather than hardcoded.
     async fn oidc_jwt_verifier(
         fixture: &oidc_common::OidcFixture,
         audience: &str,
@@ -94,8 +90,7 @@ mod oidc_auth_tests {
         ))
     }
 
-    /// Start a real HTTP server, in process, over fresh in-memory backends — the same
-    /// shape `presign_test.rs` uses for an unauthenticated one.
+    /// Start a real HTTP server, in process, over fresh in-memory backends.
     async fn start_http_server(
         jwt_verifier: Option<JwtVerifier>,
     ) -> (String, tokio::sync::oneshot::Sender<()>) {
@@ -108,8 +103,7 @@ mod oidc_auth_tests {
             presign_config: None,
         };
         let health = ServerHealth::new_without_availability(state.immutable_store.clone());
-        // `test_default` is `#[cfg(test)]` inside `lore-server` itself and not visible from
-        // here; generous timeouts set by hand for the same reason that helper exists.
+        // `test_default` is `#[cfg(test)]` inside `lore-server` and not visible here.
         let settings = LoreHttpServerSettings {
             request_timeout_seconds: 30,
             request_body_timeout_seconds: 30,
@@ -143,10 +137,9 @@ mod oidc_auth_tests {
         (base_url, shutdown_tx)
     }
 
-    /// The one route under the authenticated router that takes the fewest preconditions:
-    /// `PUT /v1/repository/{repository_id}/content`. The repository id only has to be
-    /// valid hex — the auth middleware runs, and decides, before the handler ever parses
-    /// it.
+    /// The route under the authenticated router with the fewest preconditions. The
+    /// repository id only has to be valid hex: the auth middleware runs, and decides,
+    /// before the handler ever parses it.
     fn put_content_url(base_url: &str) -> String {
         let repository_id = lore_base::types::Context::from([0xacu8; 16]);
         format!("{base_url}/v1/repository/{repository_id}/content")
@@ -251,12 +244,9 @@ mod oidc_auth_tests {
         Ok(())
     }
 
-    /// The accepted LEP's authn-only mode (`[server.auth.oidc]`'s
-    /// `authorize_all_repositories`, required with no default) has `JwtVerifier` populate
-    /// the existing `urc-*` wildcard resource onto the in-process `AuthorizationToken` once
-    /// a token verifies against the trusted issuer; `verify_authorization` itself does not
-    /// change. This test asserts only that end behavior, not the verification or
-    /// claim-decode mechanism that produces it.
+    /// In authn-only mode `JwtVerifier` populates the existing `urc-*` wildcard resource
+    /// onto the in-process `AuthorizationToken` once a token verifies, leaving
+    /// `verify_authorization` unchanged. Asserts the end behavior only.
     #[tokio::test]
     async fn http_valid_pocketid_token_is_accepted_for_repository_operations() -> TestResult {
         let fixture = oidc_common::setup().await?;
@@ -289,14 +279,10 @@ mod oidc_auth_tests {
 
     /// `[server.auth.oidc].resource` end to end, over the real HTTP plug point.
     ///
-    /// **`PocketID` 2.6.2 does not implement RFC 8707** — verified against the live instance
-    /// on 2026-08-13: it answers `200` to a `resource` parameter on both the device
-    /// authorization and token requests, ignores it silently, and mints an access token
-    /// audienced to the client id with header `typ: "JWT"`. So the tokens here are minted
-    /// synthetically against a `file://` key set, which is the escape hatch the LEP keeps
-    /// for exactly this class of reason. The client half of resource mode is proven by the
-    /// `lore-transport` unit tests, and the diagnostic it raises against a
-    /// non-implementing provider is proven against live `PocketID` in `oidc_client_test.rs`.
+    /// `PocketID` 2.6.2 does not implement RFC 8707: it answers `200` to a `resource`
+    /// parameter, ignores it, and mints an access token audienced to the client id with
+    /// header `typ: "JWT"`. The tokens here are therefore minted synthetically against a
+    /// `file://` key set.
     mod resource_mode {
         use jsonwebtoken::EncodingKey;
         use jsonwebtoken::Header;
@@ -312,10 +298,8 @@ mod oidc_auth_tests {
 
         /// An Ed25519 signing key and the one-key JWKS that publishes its public half.
         ///
-        /// Generated per test rather than embedded: a private key checked into a
-        /// repository is a private key, whatever it is for. EdDSA because it is in the
-        /// OIDC-mode algorithm allowlist and `ring` will generate one, where it will not
-        /// generate RSA.
+        /// Generated per test rather than embedded. `EdDSA` because it is in the OIDC-mode
+        /// algorithm allowlist and `ring` will generate one, where it will not generate RSA.
         fn signing_key_and_jwks() -> (EncodingKey, String) {
             use base64::Engine;
             use ring::signature::KeyPair;
@@ -336,9 +320,7 @@ mod oidc_auth_tests {
         }
 
         /// A verifier in resource-bound mode over a `file://` key set, assembled the way
-        /// `build_jwt_verifier` assembles one from `[server.auth.oidc]` with a `resource`:
-        /// the `OidcJwkService` wrapper that refuses symmetric algorithms, the issuer
-        /// pinned, and the audience pinned to the resource rather than the client id.
+        /// `build_jwt_verifier` assembles one from `[server.auth.oidc]` with a `resource`.
         fn resource_mode_verifier(jwks: &str) -> (JwtVerifier, tempfile::NamedTempFile) {
             use std::io::Write;
 
@@ -370,8 +352,7 @@ mod oidc_auth_tests {
                 + 3600
         }
 
-        /// A token signed by the test key, with a caller-chosen media type and audience —
-        /// the two things resource mode decides on.
+        /// A token signed by the test key, with a caller-chosen media type and audience.
         fn mint(key: &EncodingKey, typ: &str, audience: &str) -> String {
             let mut header = Header::new(jsonwebtoken::Algorithm::EdDSA);
             header.kid = Some(KID.to_string());
@@ -406,10 +387,8 @@ mod oidc_auth_tests {
                 .status())
         }
 
-        /// The whole point of the mode, over the wire: a token audienced to the *client
-        /// id* — which is every token an ID-token deployment behind the same provider
-        /// hands out, and every token a sibling Lore deployment's users hold — no longer
-        /// opens this server, while one audienced to this deployment does.
+        /// A token audienced to the client id no longer opens this server, while one
+        /// audienced to this deployment does.
         #[tokio::test]
         async fn only_a_token_bound_to_this_deployment_is_admitted() -> TestResult {
             let (key, jwks) = signing_key_and_jwks();
@@ -434,8 +413,8 @@ mod oidc_auth_tests {
             Ok(())
         }
 
-        /// ID-token acceptance is off, and the media type is what turns it off: `typ:
-        /// "JWT"` is what every ID token and every Lore-issued token carries.
+        /// The media type is what turns ID-token acceptance off: `typ: "JWT"` is what
+        /// every ID token and every Lore-issued token carries.
         #[tokio::test]
         async fn a_token_without_the_rfc_9068_media_type_is_refused() -> TestResult {
             let (key, jwks) = signing_key_and_jwks();
@@ -455,8 +434,7 @@ mod oidc_auth_tests {
             Ok(())
         }
 
-        /// A token signed by a key the published set does not contain stays refused, so
-        /// the media type and audience checks are additions to verification rather than a
+        /// The media type and audience checks are additions to verification rather than a
         /// path around it.
         #[tokio::test]
         async fn a_token_from_an_unknown_key_is_still_refused() -> TestResult {
@@ -494,16 +472,9 @@ mod oidc_auth_tests {
         Ok(())
     }
 
-    /// The classic algorithm-confusion forgery, against a real `PocketID` key rather than a
-    /// synthetic one: fetch the real JWKS, take a real `kid`, and sign an HS256 token using
-    /// that key's own public RSA modulus as the HMAC secret. The modulus is public by
-    /// definition — it is what the JWKS publishes — so if the verifier ever let the token's
-    /// header choose the algorithm, this is the forgery that follows. `jwk.rs` already
-    /// tests this against a synthetic key (`a_public_rsa_key_is_never_accepted_as_an_hmac_secret`);
-    /// this is the same defense proven against the real provider this server is pointed at.
-    /// The accepted LEP tightens this further for OIDC mode specifically — no symmetric
-    /// algorithms, no `alg: none` — but the algorithm-confusion pin this exercises is
-    /// already in the tree today, so this test is a regression check, not a red one.
+    /// The algorithm-confusion forgery against a real `PocketID` key: sign an HS256 token
+    /// using a published RSA key's own modulus as the HMAC secret. `jwk.rs` proves the same
+    /// defense against a synthetic key.
     async fn algorithm_confusion_forged_token(
         fixture: &oidc_common::OidcFixture,
         audience: &str,
@@ -548,11 +519,8 @@ mod oidc_auth_tests {
         )?)
     }
 
-    /// A self-signed forgery naming a key id `PocketID` never served and an issuer `PocketID`
-    /// never claimed. The harness has only one real identity provider, so this stands in
-    /// for "a token from a second provider": whatever the verifier's actual rejection
-    /// reason, the signing key can never be found in the real JWKS this server was pointed
-    /// at.
+    /// A self-signed forgery naming a key id `PocketID` never served and an issuer it never
+    /// claimed, standing in for a token from a second provider.
     fn forged_token_with_unknown_kid() -> String {
         use jsonwebtoken::Algorithm;
         use jsonwebtoken::EncodingKey;
@@ -579,11 +547,9 @@ mod oidc_auth_tests {
         .expect("encode forged token")
     }
 
-    /// `PocketID` emits `aud` as a JSON array (`["<client_id>"]`), not a bare string.
-    /// `#[serde_as(as = "OneOrMany<_, PreferMany>")]` on `AuthorizationToken::audience`
-    /// already accepts it. Supplying `env`/`name`/`preferred_username` here isolates the
-    /// `aud`-shape question from the mandatory-claims question, so this test is about
-    /// exactly one thing.
+    /// `PocketID` emits `aud` as a JSON array, not a bare string. Supplying
+    /// `env`/`name`/`preferred_username` isolates the `aud` shape from the mandatory-claims
+    /// question.
     #[test]
     fn pocketid_style_array_audience_deserializes_into_authorization_token() {
         let claims = serde_json::json!({
@@ -603,8 +569,7 @@ mod oidc_auth_tests {
         assert_eq!(token.audience, vec!["lore-integration-tests".to_string()]);
     }
 
-    /// As above, for the plain-authn claim shape (`JWTUserInfo`) the same array `aud` also
-    /// has to pass through.
+    /// The same array `aud`, for the plain-authn claim shape (`JWTUserInfo`).
     #[test]
     fn pocketid_style_array_audience_deserializes_into_jwt_user_info() {
         let claims = serde_json::json!({
@@ -626,8 +591,7 @@ mod oidc_auth_tests {
 
 /// Raw-tonic gRPC coverage of the same matrix, against `StorageService` — the enforcement
 /// point that actually calls `verify_authorization` today (`RepositoryService` runs behind
-/// `JWTAuthnInterceptor`, the still-unfinished `TODO(UCS-13506)` placeholder, and never
-/// calls it at all). See the module doc comment above for why `tonic` is available here.
+/// the still-unfinished `JWTAuthnInterceptor` placeholder and never calls it).
 #[cfg(all(test, feature = "integration_tests"))]
 mod oidc_auth_grpc_tests {
     use std::collections::HashMap;
@@ -686,8 +650,7 @@ mod oidc_auth_grpc_tests {
         (backend_immutable, backend_mutable)
     }
 
-    /// Same discovery-driven construction as the HTTP half; duplicated rather than shared
-    /// because the two halves live in differently-feature-gated modules.
+    /// Same discovery-driven construction as the HTTP half.
     async fn oidc_jwt_verifier(
         fixture: &oidc_common::OidcFixture,
         audience: &str,
@@ -713,9 +676,8 @@ mod oidc_auth_grpc_tests {
         ))
     }
 
-    /// Start a real gRPC server, in process, the same shape `storage_remote_test.rs` uses
-    /// for an unauthenticated one, but with a caller-supplied verifier so `StorageService`
-    /// is reached through `JWTInterceptor` when `Some`.
+    /// Start a real gRPC server, in process, with a caller-supplied verifier so
+    /// `StorageService` is reached through `JWTInterceptor` when `Some`.
     async fn start_grpc_server(
         jwt_verifier: Option<JwtVerifier>,
     ) -> (String, tokio::sync::oneshot::Sender<()>) {
@@ -789,17 +751,13 @@ mod oidc_auth_grpc_tests {
     }
 
     /// An empty `Query` — the lightest unary call `StorageService` exposes — optionally
-    /// bearing a token. The repository id metadata is always set: unlike the auth
-    /// interceptor (which defaults a missing one), the `Query` handler itself requires it
-    /// and answers `InvalidArgument` without it, which would be a false rejection signal
-    /// for the accept-path tests below. The interceptor runs, and decides, before the
-    /// request reaches that handler either way.
+    /// bearing a token. The repository id metadata is always set because the `Query` handler
+    /// answers `InvalidArgument` without it, which would be a false rejection signal.
     fn query_request(token: Option<&str>) -> Request<QueryRequest> {
         let mut request = Request::new(QueryRequest { addresses: vec![] });
 
-        // `lore_transport::grpc::PARTITION_ID_KEY` — inlined rather than imported, since
-        // `lore-transport` is not a dependency of this crate and pulling it in for one
-        // constant is not worth the dependency.
+        // `lore_transport::grpc::PARTITION_ID_KEY`, inlined because `lore-transport` is
+        // not a dependency of this crate.
         const PARTITION_ID_KEY: &str = "lore-partition-bin";
         let repository = lore_base::types::Partition::from([0xacu8; 16]);
         let repository_id = MetadataValue::from_bytes(repository.data());
@@ -900,9 +858,7 @@ mod oidc_auth_grpc_tests {
         Ok(())
     }
 
-    /// Same wildcard-resource-population behavior as
-    /// `http_valid_pocketid_token_is_accepted_for_repository_operations`, exercised over
-    /// gRPC.
+    /// The wildcard-resource population of the HTTP half, exercised over gRPC.
     #[tokio::test]
     async fn grpc_valid_pocketid_token_is_accepted_for_storage_operations() -> TestResult {
         let fixture = oidc_common::setup().await?;
@@ -922,9 +878,8 @@ mod oidc_auth_grpc_tests {
         Ok(())
     }
 
-    /// Quick regression: an unconfigured server (`jwt_verifier: None`) must keep admitting
-    /// anonymous requests to `StorageService`, exactly as `storage_remote_test.rs` already
-    /// relies on elsewhere.
+    /// An unconfigured server (`jwt_verifier: None`) must keep admitting anonymous
+    /// requests to `StorageService`.
     #[tokio::test]
     async fn grpc_unconfigured_server_is_unchanged() -> TestResult {
         let (url, _shutdown) = start_grpc_server(None).await;

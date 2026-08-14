@@ -126,10 +126,8 @@ mod tests {
             verify_jwt_usage_for_remote(&token, "evilepicgames.net").unwrap_err();
         }
 
-        /// A UCS Auth token's acceptable set is `iss` followed by `aud`, and `aud` is a list
-        /// of root domains -- which is the whole reason the JWT-derived derivation works for
-        /// that scheme. Pinned here because the OIDC work made the stored set authoritative
-        /// when an implementation supplies one, and `ucs-auth` supplies none.
+        /// A UCS Auth token's acceptable set is `iss` followed by `aud`, and `aud` is a
+        /// list of root domains, which is why the JWT-derived set works for that scheme.
         #[test]
         fn ucs_auth_derivation_is_unchanged() {
             let token = make_jwt_with_audience(vec!["lore.example.com".to_string()]);
@@ -146,8 +144,7 @@ mod tests {
         }
 
         /// The mismatch that makes the JWT-derived set unusable for `OpenID` Connect: `aud`
-        /// carries a client id and `iss` a URL, and neither is a domain any remote could
-        /// match, so every OIDC login would refuse its own token.
+        /// carries a client id and `iss` a URL, and neither is a domain a remote matches.
         #[test]
         fn oidc_shaped_claims_cannot_derive_their_own_recipients() {
             let mut token = make_jwt_with_audience(vec!["lore".to_string()]);
@@ -157,10 +154,9 @@ mod tests {
             verify_jwt_usage_for_remote(&token, "id.example.com").unwrap_err();
         }
 
-        /// What the implementation-supplied set buys instead: an OIDC token is usable at the
-        /// remote it was obtained for and at its issuer, and nowhere else. The issuer entry
-        /// comes from the OIDC implementation; the remote entry is added by
-        /// `login::interactive`, the only layer that knows it.
+        /// An OIDC token is usable at the remote it was obtained for and at its issuer,
+        /// nowhere else. The issuer entry comes from the implementation, the remote entry
+        /// from `login::interactive`.
         #[test]
         fn oidc_authoritative_domains_admit_the_remote_and_the_issuer_only() {
             let domains = vec!["id.example.com".to_string(), "lore.example.com".to_string()];
@@ -169,8 +165,7 @@ mod tests {
             assert!(domain_in_root_domains("id.example.com", &domains));
             // A subdomain of the remote is still the remote's deployment.
             assert!(domain_in_root_domains("eu.lore.example.com", &domains));
-            // A server the user never logged in to gets nothing, which is the whole threat
-            // the guard exists for.
+            // A server the user never logged in to gets nothing.
             assert!(!domain_in_root_domains("attacker.example.com", &domains));
             assert!(!domain_in_root_domains("evillore.example.com", &domains));
         }

@@ -15,10 +15,10 @@ discussion: <LEP PR — to be opened>
 
 Self-hosted Lore deployments have no way to authenticate users: the only login backend in the tree
 speaks to an Epic-internal service, so every server outside Epic runs open. Operators are asking to
-put Lore behind the identity provider they already run — PocketID, Keycloak, Entra — and their users
-expect `lore login` to work the way `gh auth login` does.
+put Lore behind the identity provider they already run — PocketID, Keycloak, Entra ID, Okta — and
+their users expect `lore login` to work the way `gh auth login` does.
 
-This proposal makes that provider the whole answer, using only standard
+This proposal relies on that provider for authentication end to end, using only standard
 [OpenID Connect](https://openid.net/specs/openid-connect-core-1_0.html) and OAuth 2.0 mechanisms.
 The server verifies the provider's tokens directly: the operator names an issuer and a client id in
 configuration, the server finds the signing keys through

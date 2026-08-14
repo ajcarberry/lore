@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 
 use crate::auth::authentication;
 use crate::types::AuthorizationToken;
+use crate::types::TokenRecipients;
 
 #[error_set]
 pub enum ExchangeError {
@@ -66,37 +67,37 @@ pub fn is_expired(expires: u64) -> bool {
 
 /// The domains an authz token obtained via exchange may be sent to, recorded alongside it
 /// in the token store and later enforced by [`verify_jwt_usage_for_remote`].
-///
-/// `AuthorizationToken::acceptable_root_domains` is authoritative whenever the
-/// `Authentication` implementation filled it in; an empty set falls back to the JWT-derived
-/// domains. An OIDC ID token's own claims name a client id and an issuer, never the
-/// repository's domain, so a derived set could never include it.
 fn acceptable_root_domains(
     authz: &AuthorizationToken,
     recipient_domain: &str,
 ) -> Result<Vec<String>, ExchangeError> {
-    if authz.acceptable_root_domains.is_empty() {
-        let decoded_token = insecure_decode_token(&authz.token)
-            .internal("Could not decode token")
-            .map_err(ExchangeError::from)?;
-        verify_jwt_usage_for_remote(&decoded_token.claims, recipient_domain).map_err(|err| {
-            lore_warn!("{err}");
-            ExchangeError::internal_with_context(
-                err,
-                "The token is not suitable for what you intend to do",
-            )
-        })?;
-        return Ok(decoded_token.claims.acceptable_root_domains());
+    match &authz.recipients {
+        TokenRecipients::SelfDescribing => {
+            let decoded_token = insecure_decode_token(&authz.token)
+                .internal("Could not decode token")
+                .map_err(ExchangeError::from)?;
+            verify_jwt_usage_for_remote(&decoded_token.claims, recipient_domain).map_err(
+                |err| {
+                    lore_warn!("{err}");
+                    ExchangeError::internal_with_context(
+                        err,
+                        "The token is not suitable for what you intend to do",
+                    )
+                },
+            )?;
+            Ok(decoded_token.claims.acceptable_root_domains())
+        }
+        TokenRecipients::Explicit(domains) => {
+            // Added rather than checked for: what says whether this credential may reach the
+            // remote is the authentication token's stored set, which
+            // `tokens_for_auth_service_and_recipient` has already required the recipient to be in.
+            let mut domains = domains.clone();
+            if !domains.iter().any(|domain| domain == recipient_domain) {
+                domains.push(recipient_domain.to_string());
+            }
+            Ok(domains)
+        }
     }
-
-    // Added rather than checked for: what says whether this credential may reach the
-    // remote is the authentication token's stored set, which
-    // `tokens_for_auth_service_and_recipient` has already required the recipient to be in.
-    let mut domains = authz.acceptable_root_domains.clone();
-    if !domains.iter().any(|domain| domain == recipient_domain) {
-        domains.push(recipient_domain.to_string());
-    }
-    Ok(domains)
 }
 
 /// Loads only a stored authentication token that is acceptable both for the auth service
@@ -776,22 +777,21 @@ mod tests {
         )
     }
 
-    fn authz_token(acceptable_root_domains: Vec<String>, jwt: &str) -> AuthorizationToken {
+    fn authz_token(recipients: TokenRecipients, jwt: &str) -> AuthorizationToken {
         AuthorizationToken {
             token: jwt.to_string(),
             expires_ms: 0,
-            acceptable_root_domains,
+            recipients,
         }
     }
 
-    /// A response supplying no domains of its own (`acceptable_root_domains` empty) falls
-    /// back to the JWT-derived set.
+    /// A `SelfDescribing` response falls back to the JWT-derived set.
     #[test]
     fn ucs_auth_shaped_token_keeps_jwt_derived_domains() {
         let jwt = unsigned_jwt(
             r#"{"iss":"auth.example.com","sub":"user-1","exp":9999999999,"aud":["repo.example.com"]}"#,
         );
-        let authz = authz_token(vec![], &jwt);
+        let authz = authz_token(TokenRecipients::SelfDescribing, &jwt);
 
         let domains = acceptable_root_domains(&authz, "repo.example.com").unwrap();
 
@@ -811,7 +811,10 @@ mod tests {
         let jwt = unsigned_jwt(
             r#"{"iss":"https://id.example.com","sub":"user-1","exp":9999999999,"aud":["lore-cli"]}"#,
         );
-        let authz = authz_token(vec!["id.example.com".to_string()], &jwt);
+        let authz = authz_token(
+            TokenRecipients::Explicit(vec!["id.example.com".to_string()]),
+            &jwt,
+        );
 
         let domains = acceptable_root_domains(&authz, "repo.example.com").unwrap();
 
@@ -827,7 +830,10 @@ mod tests {
             r#"{"iss":"https://id.example.com","sub":"user-1","exp":9999999999,"aud":["lore-cli"]}"#,
         );
         let authz = authz_token(
-            vec!["id.example.com".to_string(), "repo.example.com".to_string()],
+            TokenRecipients::Explicit(vec![
+                "id.example.com".to_string(),
+                "repo.example.com".to_string(),
+            ]),
             &jwt,
         );
 

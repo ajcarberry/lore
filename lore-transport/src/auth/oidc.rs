@@ -511,7 +511,7 @@ fn authentication_token(
         expires_ms: expires.saturating_mul(1000),
         // The issuer already holds the token. The orchestration layer adds the remote the
         // login was performed against.
-        acceptable_root_domains: vec![parts.issuer_domain.clone()],
+        recipients: TokenRecipients::Explicit(vec![parts.issuer_domain.clone()]),
         refresh_token: tokens.refresh_token,
     })
 }
@@ -1114,7 +1114,7 @@ impl OidcAuthentication {
         Ok(AuthorizationToken {
             token: authn_token.to_string(),
             expires_ms: claims.exp.saturating_mul(1000),
-            acceptable_root_domains: vec![parts.issuer_domain],
+            recipients: TokenRecipients::Explicit(vec![parts.issuer_domain]),
         })
     }
 }
@@ -1604,7 +1604,10 @@ mod tests {
         assert_eq!(token.user_name, "Ada Lovelace");
         assert_eq!(token.expires_ms, 1_000_000);
         assert_eq!(token.refresh_token.as_deref(), Some("the-refresh-token"));
-        assert_eq!(token.acceptable_root_domains, vec!["id.example.com"]);
+        assert_eq!(
+            token.recipients,
+            TokenRecipients::Explicit(vec!["id.example.com".to_string()])
+        );
     }
 
     #[test]
@@ -1951,7 +1954,10 @@ mod tests {
 
         assert_eq!(authz.token, id_token);
         assert_eq!(authz.expires_ms, 1_000_000);
-        assert_eq!(authz.acceptable_root_domains, vec!["id.example.com"]);
+        assert_eq!(
+            authz.recipients,
+            TokenRecipients::Explicit(vec!["id.example.com".to_string()])
+        );
     }
 
     #[tokio::test]

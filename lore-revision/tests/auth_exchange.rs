@@ -31,6 +31,7 @@ mod tests {
     use lore_transport::LoginFlow;
     use lore_transport::ProtocolError;
     use lore_transport::ResolvedUser;
+    use lore_transport::TokenRecipients;
     use lore_transport::auth::authentication;
 
     include!("helper.rs");
@@ -68,7 +69,7 @@ mod tests {
                 Ok(AuthorizationToken {
                     token: "authz-token".into(),
                     expires_ms: u64::MAX,
-                    acceptable_root_domains: vec![],
+                    recipients: TokenRecipients::SelfDescribing,
                 })
             }))
         }
@@ -80,7 +81,7 @@ mod tests {
                 Ok(AuthorizationToken {
                     token: unsigned_jwt("user-1"),
                     expires_ms: u64::MAX,
-                    acceptable_root_domains: vec![issuer_domain.to_string()],
+                    recipients: TokenRecipients::Explicit(vec![issuer_domain.to_string()]),
                 })
             }))
         }
@@ -97,7 +98,7 @@ mod tests {
                     user_name: "user-1".into(),
                     expires_ms: u64::MAX,
                     // The issuer is all a provider can name.
-                    acceptable_root_domains: vec!["id.example.com".into()],
+                    recipients: TokenRecipients::Explicit(vec!["id.example.com".into()]),
                     refresh_token: rotated.clone(),
                 })
             });

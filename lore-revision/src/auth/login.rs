@@ -13,6 +13,7 @@ use lore_error_set::prelude::*;
 use lore_transport::Authentication;
 use lore_transport::AuthenticationToken;
 use lore_transport::LoginFlow;
+use lore_transport::TokenRecipients;
 use lore_transport::auth::authentication;
 use tokio::time::sleep;
 use url::Url;
@@ -354,34 +355,27 @@ pub async fn interactive(
 
 /// The domains a freshly obtained token may be sent to, which is what the credential store
 /// records alongside it and what [`verify_jwt_usage_for_remote`] later enforces.
-///
-/// [`AuthenticationToken::acceptable_root_domains`] is authoritative when the
-/// implementation filled it in, because only the implementation knows its own tokens'
-/// audience semantics. An `OpenID` Connect provider issues `aud` as a client id and `iss`
-/// as a URL, neither of which a remote could match, so a JWT-derived set would make every
-/// OIDC login refuse its own token. This layer adds the remote the login was performed
-/// against, which the implementation cannot know.
-///
-/// `ucs-auth` returns an empty vector and keeps the JWT-derived behavior: its `aud` is a
-/// list of root domains, so the token itself says where it may go.
 fn acceptable_root_domains(
     authn: &AuthenticationToken,
     remote_domain: &str,
 ) -> Result<Vec<String>, InteractiveLoginError> {
-    if authn.acceptable_root_domains.is_empty() {
-        let decoded_token = insecure_decode_token(&authn.token).internal("decoding token")?;
-        verify_jwt_usage_for_remote(&decoded_token.claims, remote_domain)
-            .forward::<InteractiveLoginError>("verifying JWT usage for remote")?;
-        return Ok(decoded_token.claims.acceptable_root_domains());
+    match &authn.recipients {
+        TokenRecipients::SelfDescribing => {
+            let decoded_token = insecure_decode_token(&authn.token).internal("decoding token")?;
+            verify_jwt_usage_for_remote(&decoded_token.claims, remote_domain)
+                .forward::<InteractiveLoginError>("verifying JWT usage for remote")?;
+            Ok(decoded_token.claims.acceptable_root_domains())
+        }
+        TokenRecipients::Explicit(domains) => {
+            // Added rather than checked for, so the invariant holds by construction and
+            // can't drift from what gets stored.
+            let mut domains = domains.clone();
+            if !domains.iter().any(|domain| domain == remote_domain) {
+                domains.push(remote_domain.to_string());
+            }
+            Ok(domains)
+        }
     }
-
-    // Added rather than checked for, so the invariant holds by construction and
-    // can't drift from what gets stored.
-    let mut domains = authn.acceptable_root_domains.clone();
-    if !domains.iter().any(|domain| domain == remote_domain) {
-        domains.push(remote_domain.to_string());
-    }
-    Ok(domains)
 }
 
 async fn poll_interactive_session(
@@ -410,13 +404,13 @@ async fn poll_interactive_session(
 mod tests {
     use super::*;
 
-    fn authn_token(acceptable_root_domains: Vec<String>, token: &str) -> AuthenticationToken {
+    fn authn_token(recipients: TokenRecipients, token: &str) -> AuthenticationToken {
         AuthenticationToken {
             token: token.to_string(),
             user_id: "user-1".to_string(),
             user_name: "user-1".to_string(),
             expires_ms: 0,
-            acceptable_root_domains,
+            recipients,
             refresh_token: None,
         }
     }
@@ -425,7 +419,10 @@ mod tests {
     /// `exchange` later requires the recipient to be in.
     #[test]
     fn an_oidc_login_may_be_used_at_its_remote_and_its_issuer() {
-        let authn = authn_token(vec!["id.example.com".to_string()], "not-decoded");
+        let authn = authn_token(
+            TokenRecipients::Explicit(vec!["id.example.com".to_string()]),
+            "not-decoded",
+        );
 
         let domains = acceptable_root_domains(&authn, "repo.example.com").unwrap();
 

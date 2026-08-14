@@ -202,6 +202,16 @@ pub struct AuthSession {
     pub login_url: String,
 }
 
+/// How the domains a token may be sent to are determined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenRecipients {
+    /// The token's own claims name where it may go; the recipient is verified
+    /// against them and rejected if absent.
+    SelfDescribing,
+    /// These domains are authoritative; the recipient is added if absent.
+    Explicit(Vec<String>),
+}
+
 /// Authentication token with user identity metadata.
 ///
 /// Returned from login flows (interactive, token exchange, refresh).
@@ -218,8 +228,8 @@ pub struct AuthenticationToken {
     pub user_name: String,
     /// Expiry as milliseconds since UNIX epoch.
     pub expires_ms: u64,
-    /// Root domains this token is valid for.
-    pub acceptable_root_domains: Vec<String>,
+    /// How the domains this token may be sent to are determined.
+    pub recipients: TokenRecipients,
     /// One-time-use refresh token for obtaining a new authentication token
     /// without re-authenticating. `None` if the auth backend does not support
     /// refresh. Consumed on use -- the next refresh returns a new one.
@@ -237,8 +247,8 @@ pub struct AuthorizationToken {
     pub token: String,
     /// Expiry as milliseconds since UNIX epoch.
     pub expires_ms: u64,
-    /// Root domains this token is valid for.
-    pub acceptable_root_domains: Vec<String>,
+    /// How the domains this token may be sent to are determined.
+    pub recipients: TokenRecipients,
 }
 
 /// Resolved user identity information.

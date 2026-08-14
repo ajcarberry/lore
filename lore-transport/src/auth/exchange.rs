@@ -28,7 +28,6 @@ use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 
 use crate::auth::authentication;
-use crate::types::AuthorizationToken;
 use crate::types::TokenRecipients;
 
 #[error_set]
@@ -68,12 +67,13 @@ pub fn is_expired(expires: u64) -> bool {
 /// The domains an authz token obtained via exchange may be sent to, recorded alongside it
 /// in the token store and later enforced by [`verify_jwt_usage_for_remote`].
 fn acceptable_root_domains(
-    authz: &AuthorizationToken,
+    recipients: &TokenRecipients,
+    token: &str,
     recipient_domain: &str,
 ) -> Result<Vec<String>, ExchangeError> {
-    match &authz.recipients {
+    match recipients {
         TokenRecipients::SelfDescribing => {
-            let decoded_token = insecure_decode_token(&authz.token)
+            let decoded_token = insecure_decode_token(token)
                 .internal("Could not decode token")
                 .map_err(ExchangeError::from)?;
             verify_jwt_usage_for_remote(&decoded_token.claims, recipient_domain).map_err(
@@ -336,11 +336,11 @@ pub async fn exchange(
             }
         })?;
 
-    if authz.token.is_empty() {
+    let token = authz.token;
+    if token.is_empty() {
         return Err(ExchangeError::internal("Empty token response"));
     }
-    let domains = acceptable_root_domains(&authz, &recipient_domain)?;
-    let token = authz.token;
+    let domains = acceptable_root_domains(&authz.recipients, &token, &recipient_domain)?;
 
     lore_trace!(
         "Authorization with user token successful in {} ms",
@@ -485,11 +485,11 @@ pub async fn exchange_custom_resource(
             }
         })?;
 
-    if authz.token.is_empty() {
+    let token = authz.token;
+    if token.is_empty() {
         return Err(ExchangeError::internal("Empty token response"));
     }
-    let domains = acceptable_root_domains(&authz, &recipient_domain)?;
-    let token = authz.token;
+    let domains = acceptable_root_domains(&authz.recipients, &token, &recipient_domain)?;
 
     lore_trace!(
         "Authorization with user token successful in {} ms",
@@ -764,6 +764,7 @@ async fn auth_exchange_custom_resource_for_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AuthorizationToken;
 
     /// A JWT with the given claims and a signature nothing checks.
     fn unsigned_jwt(claims: &str) -> String {
@@ -793,7 +794,8 @@ mod tests {
         );
         let authz = authz_token(TokenRecipients::SelfDescribing, &jwt);
 
-        let domains = acceptable_root_domains(&authz, "repo.example.com").unwrap();
+        let domains =
+            acceptable_root_domains(&authz.recipients, &authz.token, "repo.example.com").unwrap();
 
         assert_eq!(
             domains,
@@ -816,7 +818,8 @@ mod tests {
             &jwt,
         );
 
-        let domains = acceptable_root_domains(&authz, "repo.example.com").unwrap();
+        let domains =
+            acceptable_root_domains(&authz.recipients, &authz.token, "repo.example.com").unwrap();
 
         assert!(domains.contains(&"id.example.com".to_string()));
         assert!(domains.contains(&"repo.example.com".to_string()));
@@ -837,7 +840,8 @@ mod tests {
             &jwt,
         );
 
-        let domains = acceptable_root_domains(&authz, "repo.example.com").unwrap();
+        let domains =
+            acceptable_root_domains(&authz.recipients, &authz.token, "repo.example.com").unwrap();
 
         assert_eq!(
             domains,

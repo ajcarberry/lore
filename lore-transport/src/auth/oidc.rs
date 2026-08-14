@@ -3,7 +3,7 @@
 //! `OpenID` Connect authentication for the `oidc+https` and `oidc+http` schemes.
 //!
 //! The provider is named by the auth URL the server advertises, such as
-//! `oidc+https://id.example.com/realms/studio?client_id=lore&resource=lore.example.com`.
+//! `oidc+https://id.example.com/realms/studio?client_id=lore&resource=https://lore.example.com`.
 //! Stripping `oidc+` leaves the issuer identifier byte for byte, which every issuer check
 //! downstream compares as bytes; an issuer identifier carries no query or fragment
 //! (`OpenID` Connect Discovery 1.0 §2), so the parameters are safe to append.
@@ -1472,16 +1472,17 @@ mod tests {
 
     #[test]
     fn auth_url_parses_the_issuer_client_id_and_resource() {
-        let parsed =
-            parse_auth_url("oidc+https://id.example.com?client_id=lore&resource=lore.example.com")
-                .expect("auth URL should parse");
+        let parsed = parse_auth_url(
+            "oidc+https://id.example.com?client_id=lore&resource=https://lore.example.com",
+        )
+        .expect("auth URL should parse");
         assert_eq!(
             parsed,
             AuthUrlParts {
                 issuer: "https://id.example.com".to_string(),
                 issuer_domain: "id.example.com".to_string(),
                 client_id: "lore".to_string(),
-                resource: Some("lore.example.com".to_string()),
+                resource: Some("https://lore.example.com".to_string()),
             }
         );
     }

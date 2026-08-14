@@ -219,6 +219,8 @@ jwt_audience = ["lore-service"]
 endpoint = "https://accounts.example.com/.well-known/jwks.json"
 ```
 
+When a `[server.auth.oidc]` block is also present, `jwt_issuer`, `jwt_audience`, and `[server.auth.jwk].endpoint` each override the value that block would otherwise derive. Setting one explicitly is how a static `file://` key set or a hand-configured issuer stays in use; setting `jwt_issuer` to a value that disagrees with the provider's own issuer makes the server verify against that value rather than the discovered one, so leave it unset unless the override is deliberate.
+
 `[server.auth.oidc]`: direct verification of a standard OpenID Connect provider's tokens, configured with an issuer and a client id. At startup the server fetches `{issuer}/.well-known/openid-configuration`, checks the document's `issuer` against the configured one, and feeds `jwks_uri` to the same key-set machinery `[server.auth.jwk]` uses directly.
 
 The `oidc` block does not replace `jwt_issuer`, `jwt_audience`, and `[server.auth.jwk].endpoint`; it derives them. When one of those is set explicitly, the explicit value always wins over the derived one — so a `file://` key set stays usable without network access, and an operator who points the server at a static JWKS by hand keeps doing so. An explicit `jwt_issuer` that disagrees with the provider's own issuer also wins, and the server then verifies against it rather than the discovered value, so leave it unset unless that is deliberate.

@@ -92,10 +92,6 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
 
 /// Creates the appropriate authorizer from an optional auth URL.
 /// Returns `AllowAllRepositoryAuthorizer` when no URL is configured.
-///
-/// A configured `auth_url` always names a real authorization service: the OIDC login URL
-/// is derived and applied only in the `EnvironmentGet` response, so the internal `auth_url`
-/// is never an `oidc+…` scheme and needs no scheme gate here.
 pub fn repository_authorizer(auth_url: Option<String>) -> Arc<dyn RepositoryAuthorizer> {
     match auth_url {
         Some(url) => Arc::new(AuthClientAuthorizer::new(url)),

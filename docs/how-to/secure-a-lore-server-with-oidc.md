@@ -70,7 +70,7 @@ A Lore server with no authentication serves anyone who can reach the port: every
     ```
 
     > [!WARNING]
-    > The device flow's weak point is the human, not the protocol: approving on one device something started on another is also what a phishing message needs. Only approve a code you retrieved yourself from a `lore login --no-browser` you ran yourself, and check that it matches the code on your provider's approval page.
+    > Only approve a code you retrieved yourself from a `lore login --no-browser` you ran yourself, and check that it matches the code on your provider's approval page.
 
     Lore stores the token in the encrypted credential store and refreshes it as it expires, so day-to-day commands don't ask you to log in again until the provider revokes the session.
 

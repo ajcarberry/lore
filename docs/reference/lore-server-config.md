@@ -181,17 +181,12 @@ This field is optional. When it's absent, the server starts with the presigned U
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `auth_url` | none | The endpoint clients use to authenticate. Clients read its scheme to select an authentication backend (`ucs-auth`, `oidc+https`, ...). When `[server.auth.oidc]` is set and this is empty, the server derives it as `oidc+https://{issuer}?client_id={client_id}` (`oidc+http` for an `http://` issuer); an explicit value always wins. Leaving both this and the OIDC block unset is what makes a token-verifying server report no authentication to clients — set one of them. |
+| `auth_url` | none | The endpoint clients use to authenticate. Clients read its scheme to select an authentication backend (`ucs-auth`, `oidc+https`, ...). When `[server.auth.oidc]` is set and this is empty, the server derives it as `oidc+https://{issuer}?client_id={client_id}` (`oidc+http` for an `http://` issuer); an explicit value always wins. Leaving both this and the OIDC block unset is what makes a token-verifying server report no authentication to clients. |
 | `repository_url` | none | Repository-management service endpoint. |
 | `storage_url` | none | Storage service endpoint. |
 | `revision_url` | none | Revision-graph service endpoint. |
 | `lock_url` | none | Lock service endpoint. |
 | `notification_url` | none | Notification service endpoint. |
-
-```toml
-[environment.endpoint]
-auth_url = "oidc+https://id.example.com?client_id=lore"
-```
 
 ### Authentication
 

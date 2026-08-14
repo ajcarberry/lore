@@ -188,11 +188,12 @@ mod tests {
     const TEST_AUDIENCE: &str = "lore-test";
 
     fn make_verifier(jwk_service: MockTestJWKService) -> JwtVerifier {
-        JwtVerifier::new(
-            Arc::new(jwk_service),
-            None,
-            Some(vec![TEST_AUDIENCE.to_string()]),
-        )
+        JwtVerifier {
+            jwk_service: Arc::new(jwk_service),
+            jwt_issuer: None,
+            jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+            mode: Default::default(),
+        }
     }
 
     fn make_jwt(resources: Option<Vec<ResourcePermission>>) -> String {

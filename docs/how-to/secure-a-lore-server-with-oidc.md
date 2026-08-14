@@ -1,28 +1,26 @@
 # Secure a Lore server with OpenID Connect
 
-A Lore server with no authentication configured serves anyone who can reach the port: every identity is anonymous, and every repository is readable and writable. Pointing the server at an OpenID Connect provider replaces that with the directory you already run.
-
-In this guide, you'll register Lore as a client with your provider, turn on authentication in the server config, and log in with `lore login`, so that only your provider's users can reach your repositories. Any conformant provider works; the examples use [PocketID](https://github.com/pocket-id/pocket-id), which is self-hosted and quick to stand up alongside Lore.
+A Lore server with no authentication serves anyone who can reach the port: every identity is anonymous, and every repository is readable and writable. Point the server at an OpenID Connect provider to replace that with the directory you already run, so only your provider's users get in. Any conformant provider works; the examples use [PocketID](https://github.com/pocket-id/pocket-id), which is self-hosted and quick to stand up alongside Lore.
 
 ## Prerequisites
 
 - A running `loreserver` you can restart and reconfigure. See [Deploy a local Lore Server](deploy-local-lore-server.md).
 - The `lore` CLI on your PATH. See [Install the Lore CLI](install-lore-cli.md).
-- An OpenID Connect provider reachable from both the server and your workstation, with admin access to register a client.
+- An OpenID Connect provider reachable from the server and your workstation, with admin access to register a client.
 
 ## Steps
 
 1. **Register a public client for Lore.**
 
-    Lore is a native CLI, not a web app, so it registers as a public client using PKCE — there's no client secret to store or leak. In PocketID's admin UI, create an OIDC client with:
+    Lore is a native CLI, not a web app, so it registers as a public client with PKCE — no client secret to store or leak. In your provider, create an OIDC client with:
 
     - **Public client** enabled, with no client secret.
     - **PKCE** enabled.
-    - A callback address of `http://127.0.0.1:*/callback`, where the browser login flow's loopback listener receives the redirect. PocketID accepts a wildcard port; other providers may need a fixed port or a range.
+    - A callback address of `http://127.0.0.1:*/callback`, where the browser login's loopback listener receives the redirect. PocketID accepts a wildcard port; other providers may need a fixed port or a range.
 
-    Set the ID-token lifetime in minutes rather than hours — that's the token Lore presents. Lore holds no revocation list — a verified token works until it expires — so a short lifetime bounds how long a revoked user keeps access. Clients refresh without prompting, so it costs users nothing.
+    Set the ID-token lifetime in minutes, not hours. Lore presents that token and holds no revocation list, so a verified token works until it expires — a short lifetime bounds how long a revoked user keeps access. Clients refresh without prompting, so it costs users nothing.
 
-    Note the client id and your provider's issuer address for the next step.
+    Note the client id and the provider's issuer address for the next step.
 
 2. **Turn on authentication in the server config.**
 
@@ -35,15 +33,15 @@ In this guide, you'll register Lore as a client with your provider, turn on auth
     authorize_all_repositories = true
     ```
 
-    `issuer` must match the value your provider publishes in its own tokens' `iss` claim, byte for byte. The server checks it against the provider's discovery document at startup and refuses to start on a mismatch.
+    `issuer` must match the value your provider publishes in its tokens' `iss` claim, byte for byte. The server checks it against the provider's discovery document at startup and refuses to start on a mismatch.
 
     > [!IMPORTANT]
-    > `authorize_all_repositories = true` is the whole authorization model this mode offers: any identity your provider admits can read and write **every** repository on the server — no per-repository distinction, no read-only identity, no administrative separation. Run one server per trust boundary when repositories need different audiences. The setting has no default, so omitting it or setting it to `false` fails startup rather than deciding for you.
+    > `authorize_all_repositories = true` is the entire authorization model this mode offers: any identity your provider admits can read and write **every** repository on the server — no per-repository distinction, no read-only identity, no administrative separation. Run one server per trust boundary. The setting has no default, so omitting it fails startup rather than deciding for you.
 
     > [!NOTE]
-    > A token's `aud` claim names the client id, which identifies the application rather than the server. Two deployments sharing an issuer and a client id therefore share a credential-store bucket and accept each other's tokens — logging in to one evicts the other's token. Register a distinct client id per deployment to keep them apart.
+    > A token's `aud` claim names the client id, which identifies the application rather than the server. Two deployments that share an issuer and a client id share a credential-store bucket and accept each other's tokens — logging in to one evicts the other's token. Register a distinct client id per deployment.
 
-3. **Restart the server and confirm it now requires a token.**
+3. **Restart the server and confirm it requires a token.**
 
     ```bash
     ~/.local/bin/loreserver --config /opt/loreserver/config
@@ -55,7 +53,7 @@ In this guide, you'll register Lore as a client with your provider, turn on auth
     lore repository list lore://your-server.example.com:41337
     ```
 
-    If it succeeds instead, the server isn't picking up the config change — check the config path and restart again.
+    If it succeeds instead, the server isn't picking up the config change — check the config path and restart.
 
 4. **Log in.**
 
@@ -65,7 +63,7 @@ In this guide, you'll register Lore as a client with your provider, turn on auth
     lore login lore://your-server.example.com:41337/
     ```
 
-    On a headless host, print a code to approve from any other device instead:
+    On a headless host, print a code to approve from another device instead:
 
     ```bash
     lore login lore://your-server.example.com:41337/ --no-browser
@@ -74,7 +72,7 @@ In this guide, you'll register Lore as a client with your provider, turn on auth
     > [!WARNING]
     > The device flow's weak point is the human, not the protocol: approving on one device something started on another is also what a phishing message needs. Only approve a code you retrieved yourself from a `lore login --no-browser` you ran yourself, and check that it matches the code on your provider's approval page.
 
-    Either way, Lore stores the token in the encrypted credential store and refreshes it as it expires, so day-to-day commands don't ask you to log in again until the provider revokes the session.
+    Lore stores the token in the encrypted credential store and refreshes it as it expires, so day-to-day commands don't ask you to log in again until the provider revokes the session.
 
 5. **Confirm who you're logged in as.**
 
@@ -82,7 +80,7 @@ In this guide, you'll register Lore as a client with your provider, turn on auth
     lore auth info
     ```
 
-    This prints the identity your provider's token carries. `lore auth logout` and `lore auth clear` remove stored tokens the same way they do for any other authentication scheme.
+    This prints the identity your provider's token carries. `lore auth logout` and `lore auth clear` remove stored tokens.
 
 ## Result
 

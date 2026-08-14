@@ -35,7 +35,7 @@ import threading
 import urllib.parse
 
 import pytest
-from error_types import NotAuthenticatedError
+from error_types import LoreException, NotAuthenticatedError
 
 from lore import Lore
 from lore_server import (
@@ -205,7 +205,7 @@ class TestOidcAuth:
 
         repo.repository_create()  # must not raise
 
-    def test_auth_info_then_logout_revokes_access(
+    def test_auth_info_then_logout_removes_the_local_credential(
         self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
     ):
         """`auth info` reports the logged-in identity, and after `logout` the
@@ -232,7 +232,7 @@ class TestOidcAuth:
         self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
     ):
         """`repository delete` never dials the ReBAC service under OIDC (see
-        lore-server/src/grpc/handlers/repository_delete.rs): it falls back to
+        lore-server/src/grpc/repository/v1/repository_delete.rs): it falls back to
         the same creator-ownership check an unconfigured server uses. This is
         the coverage for that fallback -- proving it completes cleanly rather
         than protocol-erroring the way an unguarded ReBAC dial would."""
@@ -241,4 +241,9 @@ class TestOidcAuth:
         assert returncode == 0
         repo.repository_create()
 
-        repo.repository_delete()  # must not raise
+        repo.repository_delete()
+
+        # A delete that silently did nothing also "does not raise", so the
+        # server has to stop answering for the repository afterwards.
+        with pytest.raises(LoreException):
+            repo.repository_info()

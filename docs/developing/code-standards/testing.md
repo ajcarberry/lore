@@ -35,7 +35,7 @@ mod tests {
 
 **Frameworks:** `tokio`, `mockall`, `async-trait`
 
-All async tests use the `LORE_CONTEXT.scope()` pattern:
+Async tests over context-dependent code use the `LORE_CONTEXT.scope()` pattern:
 
 ```rust
 #[tokio::test]
@@ -47,6 +47,27 @@ async fn test_example() {
         .await;
 }
 ```
+
+### When the scope is required
+
+The scope is required whenever the code under test reads the context: anything calling
+`execution_context()`, any store or repository operation, and any handler that sets up its
+own execution from a request.
+
+Pure functions and the server-side construction paths around them — claim validation, URL
+derivation, JWT verification, config parsing — read no context, and their tests omit the
+scope:
+
+```rust
+#[tokio::test]
+async fn a_token_for_another_audience_is_refused() {
+    // no LORE_CONTEXT: nothing on this path reads it
+}
+```
+
+Omitting it there is deliberate. The `lore_spawn!` family falls back to the current runtime
+when no context is set, so a handler test without an outer context also proves the handler
+does not depend on inheriting one.
 
 ### Test independence
 
@@ -134,6 +155,19 @@ uv run pytest scripts/test/ -n auto
 uv run pytest scripts/test/ --disable-local-server --lore-remote-url=lore://host:port
 ```
 
+### The OIDC provider dependency
+
+The OIDC smoke tests, and the feature-gated integration tests in
+`lore-integration-tests/`, drive a real PocketID provider rather than a fixture. Start it
+before running them:
+
+```bash
+docker compose --file lore-integration-tests/compose.yaml up --detach
+```
+
+CI starts it as part of `pr-validate.yml`, so this step is local only. Leave it running
+between runs — the suites share the one instance and create their own users.
+
 ### Command-line options
 
 | Option | Default | Description |
@@ -163,7 +197,7 @@ Lore has a load-testing suite that exercises concurrent clone, commit, sync, loc
 ## 5. Best practices
 
 1. **All Lore commands must have smoke tests** in `scripts/test/`.
-2. **Use `LORE_CONTEXT.scope()`** for all async Rust tests.
+2. **Use `LORE_CONTEXT.scope()`** for async Rust tests whose code under test reads the context.
 3. **Keep tests independent** — Avoid `#[serial]` and test dependencies; use isolated fixtures.
 4. **Use the `new_lore_repo` fixture** for smoke tests (handles cleanup).
 5. **Mark tests** with `@pytest.mark.smoke` for smoke test runs.

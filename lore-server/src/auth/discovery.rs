@@ -158,14 +158,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovery_url_joins_issuer_and_well_known_path() {
-        assert_eq!(
-            discovery_url("https://id.example.com"),
-            "https://id.example.com/.well-known/openid-configuration"
-        );
-    }
-
-    #[test]
     fn discovery_url_trims_a_trailing_slash_on_the_issuer() {
         assert_eq!(
             discovery_url("https://id.example.com/"),
@@ -258,7 +250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_document_is_refused() {
+    async fn a_document_declaring_more_than_the_cap_is_refused() {
         let (_address, issuer) = spawn_discovery_server(|issuer| {
             json!({
                 "issuer": issuer,

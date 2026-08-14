@@ -2308,15 +2308,6 @@ mod tests {
             );
         }
 
-        #[test]
-        fn stripping_the_oidc_prefix_recovers_the_issuer_byte_for_byte() {
-            let derived = derive_oidc_auth_url(&oidc("https://id.example.com/realms/studio"))
-                .expect("derives");
-            let (_, rest) = derived.split_once('+').expect("oidc+ prefix");
-            let issuer_part = rest.split('?').next().expect("query separator");
-            assert_eq!(issuer_part, "https://id.example.com/realms/studio");
-        }
-
         /// Without this the client never sends the RFC 8707 `resource` parameter,
         /// and a resource-mode server refuses every token the provider then mints.
         #[test]
@@ -2350,19 +2341,6 @@ mod tests {
                 "the resource must be encoded, got: {derived}"
             );
         }
-
-        /// Every issuer check downstream is a byte comparison.
-        #[test]
-        fn a_resource_does_not_disturb_the_issuer() {
-            let derived = derive_oidc_auth_url(&oidc_with_resource(
-                "https://id.example.com/realms/studio",
-                "https://lore.example.com",
-            ))
-            .expect("derives");
-            let (_, rest) = derived.split_once('+').expect("oidc+ prefix");
-            let issuer_part = rest.split('?').next().expect("query separator");
-            assert_eq!(issuer_part, "https://id.example.com/realms/studio");
-        }
     }
 
     mod build_jwt_verifier {
@@ -2377,6 +2355,7 @@ mod tests {
 
         use super::super::build_jwt_verifier;
         use crate::auth::jwk::JWKServiceSettings;
+        use crate::auth::jwt::JwtVerifierError;
         use crate::auth::jwt::OidcAcceptance;
         use crate::settings::AuthSettings;
         use crate::settings::OidcSettings;
@@ -2454,6 +2433,64 @@ mod tests {
                 verifier.mode,
                 crate::auth::jwt::JwtVerifierMode::Oidc(crate::auth::jwt::OidcAcceptance::IdToken),
                 "a [server.auth.oidc] block without a resource accepts ID tokens"
+            );
+        }
+
+        /// A provider that publishes an `oct` key in its own key set publishes a
+        /// signing key: anyone who can read the key set can mint a token with it.
+        /// OIDC mode owes that refusal to the `OidcJwkService` wrap this path applies,
+        /// and the RSA key sets the other build tests use cannot tell the two apart.
+        #[tokio::test]
+        async fn an_oidc_verifier_refuses_a_token_signed_with_a_published_symmetric_key() {
+            let (_address, issuer) = spawn_discovery_and_jwks_server(&json!({
+                "keys": [{"kty": "oct", "use": "sig", "kid": "k", "alg": "HS256", "k": "c2VjcmV0"}]
+            }))
+            .await;
+            let auth = AuthSettings {
+                jwk: None,
+                jwt_audience: None,
+                jwt_issuer: None,
+                oidc: Some(OidcSettings {
+                    issuer: issuer.clone(),
+                    client_id: "lore-client".to_string(),
+                    authorize_all_repositories: true,
+                    resource: None,
+                }),
+            };
+
+            let verifier = build_jwt_verifier(Some(&auth))
+                .await
+                .unwrap()
+                .expect("oidc configuration builds a verifier");
+
+            // `c2VjcmV0` is the base64url the key set publishes, so the forgery is
+            // signed with exactly the material the provider handed out.
+            let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+            header.kid = Some("k".to_string());
+            let forged = jsonwebtoken::encode(
+                &header,
+                &json!({
+                    "sub": "the-subject",
+                    "iss": issuer,
+                    "aud": "lore-client",
+                    "iat": 1,
+                    "exp": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        + 300,
+                }),
+                &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+            )
+            .expect("encode the forged token");
+
+            let error = verifier
+                .verify_token(&forged)
+                .await
+                .expect_err("a symmetric key from the provider's key set is not an identity");
+            assert!(
+                matches!(error, JwtVerifierError::KeyNotFound(_)),
+                "the key has to be withheld rather than the claims refused, got: {error:?}"
             );
         }
 

@@ -347,10 +347,23 @@ mod oidc_client_tests {
             authz, expired,
             "The expired credential was presented, so the server would refuse the operation"
         );
-        fixture
+        let claims = fixture
             .validate_token(&authz, CLIENT_ID)
             .await
-            .expect("The refreshed credential did not verify against the issuer's JWKS");
+            .expect("The refreshed credential did not verify against the issuer's JWKS")
+            .claims;
+
+        // A different token is not necessarily a live one: only `exp` says the refresh
+        // bought the caller time.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("The clock is before the epoch")
+            .as_secs() as i64;
+        assert!(
+            claims.exp > now,
+            "The refreshed credential expired at {} and it is now {now}",
+            claims.exp
+        );
 
         // Rotated, and kept: PocketID retires the refresh token it was given, so storing
         // the new one is what makes the next expiry survivable too.

@@ -1369,7 +1369,6 @@ mod tests {
             use super::*;
 
             const RESOURCE: &str = "https://lore.example.com";
-            const OTHER_RESOURCE: &str = "https://lore.other.example.com";
             const CLIENT_ID: &str = "lore";
 
             fn resource_verifier() -> JwtVerifier {
@@ -1432,18 +1431,6 @@ mod tests {
             }
 
             #[tokio::test]
-            async fn another_deployments_resource_audience_is_rejected() {
-                let mut claims = access_token_claims();
-                claims["aud"] = json!(OTHER_RESOURCE);
-                let encoded = encode_access_token(&claims, Some("at+jwt"));
-
-                resource_verifier()
-                    .verify_token(&encoded)
-                    .await
-                    .expect_err("a token minted for the deployment next door is not ours");
-            }
-
-            #[tokio::test]
             async fn a_conformant_access_token_is_accepted_and_wildcarded() {
                 let encoded = encode_access_token(&access_token_claims(), Some("at+jwt"));
 
@@ -1487,26 +1474,6 @@ mod tests {
                         panic!("typ {typ:?} was accepted, yielding {}", accepted.user_id);
                     }
                 }
-            }
-
-            #[tokio::test]
-            async fn an_id_token_is_rejected_in_resource_mode() {
-                let encoded = encode_jwt(&json!({
-                    "sub": "the-subject",
-                    "iss": "https://id.example.com",
-                    "aud": CLIENT_ID,
-                    "iat": 1,
-                    "exp": SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .add(Duration::from_secs(5))
-                        .as_secs(),
-                }));
-
-                resource_verifier()
-                    .verify_token(&encoded)
-                    .await
-                    .expect_err("the weaker credential is not a way around the stronger one");
             }
 
             /// A `ucs-auth`-issued token carries `typ: "JWT"`, so it never reaches

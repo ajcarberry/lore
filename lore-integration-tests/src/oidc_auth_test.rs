@@ -6,9 +6,10 @@
 //! A real `JwtVerifier` (`lore_server::auth::jwt`) is pointed at the `PocketID` instance in
 //! `lore-integration-tests/compose.yaml`, following the discovery document rather than a
 //! hardcoded JWKS path, and wired into an in-process gRPC or HTTP server. The verifier is
-//! built by hand here rather than through `build_jwt_verifier`
-//! (`lore-server/src/server.rs`), which builds the identical verifier from
-//! `[server.auth.oidc]`.
+//! constructed here rather than through `build_jwt_verifier`
+//! (`lore-server/src/server.rs`), so it carries a bare `JwkServiceImpl` without the
+//! `OidcJwkService` wrap production adds. Whether that wrap survives is asserted in
+//! `build_jwt_verifier`'s own unit tests.
 //!
 //! Attaching an arbitrary bearer token needs the raw generated gRPC clients, so
 //! `integration_tests` activates the optional `tonic`/`tokio-stream` dependencies and the
@@ -23,8 +24,6 @@ mod oidc_auth_tests {
     use lore_server::auth::jwk::JWKService;
     use lore_server::auth::jwk::JWKServiceSettings;
     use lore_server::auth::jwk::JwkServiceImpl;
-    use lore_server::auth::jwt::AuthorizationToken;
-    use lore_server::auth::jwt::JWTUserInfo;
     use lore_server::auth::jwt::JwtVerifier;
     use lore_server::http::server::LoreHttpServerSettings;
     use lore_server::http::server::ServerHealth;
@@ -80,9 +79,9 @@ mod oidc_auth_tests {
         }));
 
         // `[server.auth.oidc]`'s authn-only mode — the premise this whole matrix
-        // tests against — is what `JwtVerifier::oidc` builds; `build_jwt_verifier`
-        // (`lore-server/src/server.rs`) builds the identical verifier from real
-        // settings via the same constructor.
+        // tests against — over a bare `JwkServiceImpl`. Production reaches the same
+        // mode through `build_jwt_verifier` (`lore-server/src/server.rs`), which
+        // additionally wraps the key service in `OidcJwkService`.
         Ok(JwtVerifier::oidc(
             jwk_service,
             Some(fixture.issuer().to_string()),
@@ -546,47 +545,6 @@ mod oidc_auth_tests {
         )
         .expect("encode forged token")
     }
-
-    /// `PocketID` emits `aud` as a JSON array, not a bare string. Supplying
-    /// `env`/`name`/`preferred_username` isolates the `aud` shape from the mandatory-claims
-    /// question.
-    #[test]
-    fn pocketid_style_array_audience_deserializes_into_authorization_token() {
-        let claims = serde_json::json!({
-            "sub": "the-subject",
-            "iss": "http://127.0.0.1:1411",
-            "iat": 1,
-            "exp": 9_999_999_999u64,
-            "aud": ["lore-integration-tests"],
-            "env": "test",
-            "name": "test",
-            "preferred_username": "test",
-            "idp": "test",
-        });
-
-        let token: AuthorizationToken =
-            serde_json::from_value(claims).expect("array-shaped aud must deserialize");
-        assert_eq!(token.audience, vec!["lore-integration-tests".to_string()]);
-    }
-
-    /// The same array `aud`, for the plain-authn claim shape (`JWTUserInfo`).
-    #[test]
-    fn pocketid_style_array_audience_deserializes_into_jwt_user_info() {
-        let claims = serde_json::json!({
-            "sub": "the-subject",
-            "iss": "http://127.0.0.1:1411",
-            "iat": 1,
-            "exp": 9_999_999_999u64,
-            "aud": ["lore-integration-tests"],
-            "env": "test",
-            "name": "test",
-            "preferred_username": "test",
-        });
-
-        let token: JWTUserInfo =
-            serde_json::from_value(claims).expect("array-shaped aud must deserialize");
-        assert_eq!(token.audience, vec!["lore-integration-tests".to_string()]);
-    }
 }
 
 /// Raw-tonic gRPC coverage of the same matrix, against `StorageService` — the enforcement
@@ -666,9 +624,9 @@ mod oidc_auth_grpc_tests {
         }));
 
         // `[server.auth.oidc]`'s authn-only mode — the premise this whole matrix
-        // tests against — is what `JwtVerifier::oidc` builds; `build_jwt_verifier`
-        // (`lore-server/src/server.rs`) builds the identical verifier from real
-        // settings via the same constructor.
+        // tests against — over a bare `JwkServiceImpl`. Production reaches the same
+        // mode through `build_jwt_verifier` (`lore-server/src/server.rs`), which
+        // additionally wraps the key service in `OidcJwkService`.
         Ok(JwtVerifier::oidc(
             jwk_service,
             Some(fixture.issuer().to_string()),

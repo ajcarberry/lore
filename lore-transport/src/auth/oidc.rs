@@ -1454,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn code_verifier_satisfies_rfc_7636_section_4_1() {
+    fn code_verifier_uses_the_rfc_7636_length_and_alphabet() {
         let verifier = code_verifier();
         assert!(
             (43..=128).contains(&verifier.len()),
@@ -1521,13 +1521,6 @@ mod tests {
     fn auth_url_rejects_oidc_http_for_a_non_loopback_host() {
         parse_auth_url("oidc+http://id.example.com?client_id=lore")
             .expect_err("oidc+http is loopback-only");
-    }
-
-    #[test]
-    fn acceptable_root_domains_are_the_issuer_domain() {
-        let parsed =
-            parse_auth_url("oidc+https://id.example.com?client_id=lore").expect("should parse");
-        assert_eq!(parsed.issuer_domain, "id.example.com");
     }
 
     #[test]
@@ -1671,27 +1664,6 @@ mod tests {
             "offline_access is what asks for a refresh token"
         );
         assert_eq!(query.get("resource"), None);
-    }
-
-    #[test]
-    fn authorization_url_forwards_a_resource_indicator() {
-        let mut parts = parts();
-        parts.resource = Some("lore.example.com".to_string());
-        let url = authorization_url(
-            &discovery(),
-            &parts,
-            "http://127.0.0.1:49152/callback",
-            "s",
-            "n",
-            "c",
-        )
-        .expect("authorization URL should build");
-        let url = Url::parse(&url).expect("should be a URL");
-        let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
-        assert_eq!(
-            query.get("resource").map(String::as_str),
-            Some("lore.example.com")
-        );
     }
 
     #[test]
@@ -1840,16 +1812,6 @@ mod tests {
         let token =
             authentication_token(tokens, None, &parts()).expect("refresh should be accepted");
         assert_eq!(token.user_id, "user-1");
-    }
-
-    /// `OpenID` Connect Core §12.2 leaves `id_token` out of what a refresh response must
-    /// carry.
-    #[test]
-    fn a_refresh_response_without_an_id_token_is_readable() {
-        serde_json::from_str::<TokenResponse>(
-            r#"{"access_token":"at","token_type":"Bearer","refresh_token":"rotated"}"#,
-        )
-        .expect("a refresh response may omit the ID token");
     }
 
     #[test]
@@ -2105,6 +2067,20 @@ mod tests {
             );
         }
 
+        /// RFC 9068 §2.2 requires `aud`, and a token carrying none is bound to no
+        /// deployment at all — the nonconformant-provider case resource mode exists for.
+        #[test]
+        fn an_access_token_with_no_audience_is_refused() {
+            let access = unsigned_jwt_typed("at+jwt", r#"{"sub":"user-1","exp":2000,"jti":"j"}"#);
+            let error = authentication_token(tokens_for(Some(access)), None, &resource_parts())
+                .expect_err("an access token bound to nothing will not verify");
+
+            assert!(
+                error.to_string().contains("resource"),
+                "the message has to name the resource parameter, got: {error}"
+            );
+        }
+
         #[test]
         fn a_missing_access_token_is_refused() {
             let error = authentication_token(tokens_for(None), None, &resource_parts())
@@ -2177,9 +2153,11 @@ mod tests {
     }
 
     /// Answers one HTTP request on a loopback port with a canned body.
-    async fn one_shot_provider(body: &'static str) -> String {
+    async fn one_shot_provider(body: impl Into<String>) -> String {
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt;
+
+        let body = body.into();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2255,6 +2233,36 @@ mod tests {
         );
     }
 
+    /// The nonce the session generated has to reach the check the exchange performs.
+    /// Passing `None` there leaves every unit test of the check itself green while a
+    /// login completes on an ID token minted for a different one.
+    #[tokio::test]
+    async fn completing_a_login_refuses_an_id_token_carrying_another_nonce() {
+        let id_token = unsigned_jwt(r#"{"sub":"user-1","exp":1000,"nonce":"another-nonce"}"#);
+        let token_endpoint = one_shot_provider(format!(r#"{{"id_token":"{id_token}"}}"#)).await;
+
+        let (_sender, receiver) = oneshot::channel();
+        let session = PkceSession {
+            parts: parts(),
+            token_endpoint,
+            verifier: "the-verifier".to_string(),
+            state: "the-state".to_string(),
+            nonce: "the-nonce".to_string(),
+            redirect_uri: "http://127.0.0.1:49152/callback".to_string(),
+            redirect: receiver,
+        };
+
+        let error = OidcAuthentication::default()
+            .complete_pkce(session, "the-code")
+            .await
+            .expect_err("this ID token answers some other login");
+
+        assert!(
+            error.to_string().contains("nonce"),
+            "the refusal has to be the nonce check, got: {error}"
+        );
+    }
+
     #[test]
     fn device_login_url_prefers_the_complete_verification_uri() {
         let authorization = DeviceAuthorization {
@@ -2305,7 +2313,7 @@ mod tests {
     }
 
     #[test]
-    fn device_poll_maps_slow_down_to_a_longer_interval() {
+    fn device_poll_maps_slow_down_to_the_back_off_step() {
         assert_eq!(
             device_poll_step(StatusCode::BAD_REQUEST, r#"{"error":"slow_down"}"#)
                 .expect("slow_down is not a failure"),

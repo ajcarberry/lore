@@ -547,16 +547,24 @@ impl InstrumentProvider for JwkServiceImpl {
 
 /// Whether OIDC mode may verify a token signed with `algorithm`.
 ///
-/// The loader still honors a provider declaring `HS256` on an `oct` key in its
-/// own published key set, and a symmetric secret published there is a signing
-/// key for anyone who can read it. OIDC mode refuses symmetric algorithms
-/// outright, leaving `RS*`, `PS*`, `ES*`, and `EdDSA`.
+/// A symmetric secret published in a key set is a signing key for anyone who can
+/// read it, so OIDC mode admits only the asymmetric families. This is an
+/// allowlist rather than a denial of the HMAC variants so a signing algorithm
+/// added to `jsonwebtoken` in a later release is refused until it is reviewed
+/// and added here, not admitted by default.
 fn oidc_permits_algorithm(algorithm: jsonwebtoken::Algorithm) -> bool {
-    !matches!(
+    use jsonwebtoken::Algorithm::ES256;
+    use jsonwebtoken::Algorithm::ES384;
+    use jsonwebtoken::Algorithm::EdDSA;
+    use jsonwebtoken::Algorithm::PS256;
+    use jsonwebtoken::Algorithm::PS384;
+    use jsonwebtoken::Algorithm::PS512;
+    use jsonwebtoken::Algorithm::RS256;
+    use jsonwebtoken::Algorithm::RS384;
+    use jsonwebtoken::Algorithm::RS512;
+    matches!(
         algorithm,
-        jsonwebtoken::Algorithm::HS256
-            | jsonwebtoken::Algorithm::HS384
-            | jsonwebtoken::Algorithm::HS512
+        RS256 | RS384 | RS512 | PS256 | PS384 | PS512 | ES256 | ES384 | EdDSA
     )
 }
 

@@ -56,22 +56,25 @@ pub struct Encryption {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IdentityToken {
+    /// User identity
     user_id: String,
-    /// Base64-encoded, encrypted authentication token.
+    /// Base64 encoded (encrypted) authentication token
     token: String,
-    /// Root domains this token may be sent to.
+    /// The root domains this token can be given to without security concerns
     #[serde(default)]
     acceptable_root_domains: Vec<String>,
-    /// Base64-encoded, encrypted one-time-use refresh token; consumed and replaced
-    /// atomically on use.
+    /// Base64 encoded (encrypted) one-time-use refresh token.
+    /// Stored separately from the auth token because it has a different
+    /// lifecycle: consumed on use and replaced atomically.
     #[serde(default)]
     refresh_token: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RemoteIdentity {
-    /// Auth service URL.
+    /// Auth service remote URL
     remote: String,
+    /// Token info
     token: Vec<IdentityToken>,
 }
 
@@ -91,8 +94,9 @@ static TOKEN_MAP: OnceLock<Mutex<Option<TokenMap>>> = OnceLock::new();
 
 pub fn tokens_only_for_recipient_domain(domain: String) -> impl FnMut(&&IdentityToken) -> bool {
     move |item: &&IdentityToken| {
-        // Old stored tokens have no acceptable_root_domains; treat that as unrestricted
-        // for backward compatibility.
+        // backwards compatibility with old `IdentityToken` that don't have the acceptable_root_domains
+        // Once end users are using the latest version of Lore then we can remove this case. Without
+        // this check, new Lore clients with old tokens will have to run login again
         if item.acceptable_root_domains.is_empty() {
             true
         } else {
@@ -101,8 +105,8 @@ pub fn tokens_only_for_recipient_domain(domain: String) -> impl FnMut(&&Identity
     }
 }
 
-/// Returns every token unfiltered. See `urc-core::auth`'s Check Token Recipient note
-/// before using this.
+/// No filter on the tokens you get back. Use with caution.
+/// See comment at top of `urc-core::auth` - Check Token Recipient
 pub fn vulnerable_all_tokens() -> impl FnMut(&&IdentityToken) -> bool {
     move |_item: &&IdentityToken| true
 }
@@ -111,7 +115,9 @@ fn token_map() -> &'static Mutex<Option<TokenMap>> {
     TOKEN_MAP.get_or_init(|| Mutex::new(None))
 }
 
-/// Base directory for the auth store files, overridable via `LORE_AUTH_PATH`.
+/// Base directory holding the auth store files (`tokens.toml` and the
+/// encryption-key fallback). The `LORE_AUTH_PATH` environment variable
+/// overrides the default per-user configuration directory.
 fn base_path(create_dir: bool) -> Result<PathBuf, TokenStoreError> {
     if let Ok(path) = std::env::var("LORE_AUTH_PATH")
         && !path.is_empty()
@@ -162,10 +168,13 @@ pub struct StoredIdentityInfo {
 
 /// Splits a token store key into (`auth_url`, `resource_id`).
 ///
-/// Authorization tokens use `"{auth_url}/{32-char-hex-id}"` (or legacy
-/// `"{auth_url}/urc-{id}"`); authentication tokens are just `auth_url`. Matches only the
-/// URL path, so a hostname like `urc-auth.example.com` is never mistaken for the legacy
-/// prefix.
+/// Authorization tokens are stored under `"{auth_url}/{repository_id}"` where
+/// `repository_id` is a 32-character hex string. Legacy entries may use
+/// `"{auth_url}/urc-{repository_id}"` with a `urc-` prefix.
+/// Authentication tokens use just the `auth_url` with no resource suffix.
+///
+/// Only considers the path portion of the URL to avoid matching hostnames
+/// like `urc-auth.example.com`.
 fn split_remote_resource(store_key: &str) -> (String, String) {
     if let Ok(url) = url::Url::parse(store_key) {
         let path = url.path();
@@ -187,8 +196,9 @@ fn split_remote_resource(store_key: &str) -> (String, String) {
     (store_key.to_string(), String::new())
 }
 
-/// Loads all stored identities across all remotes, decrypting tokens to get expiry (and
-/// the token itself when `include_token` is true).
+/// Load all stored identities across all remotes, decrypting tokens to extract expiry.
+///
+/// When `include_token` is true, the decrypted token string is included in the result.
 pub async fn load_all_identities(
     include_token: bool,
 ) -> Result<Vec<StoredIdentityInfo>, TokenStoreError> {
@@ -254,8 +264,9 @@ pub async fn reset_tokens() -> Result<(), TokenStoreError> {
     Ok(())
 }
 
-/// Open options for the store files; on Windows the share mode allows concurrent readers
-/// but blocks other writers, even ones that skip the store lock.
+/// Open options for the store files. On Windows the share mode admits
+/// concurrent readers but denies other writers for as long as the file is
+/// open, excluding even processes that do not take the store lock.
 fn store_open_options() -> fs::OpenOptions {
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut options = fs::OpenOptions::new();
@@ -267,8 +278,10 @@ fn store_open_options() -> fs::OpenOptions {
     options
 }
 
-/// Cross-process lock via the `<file>.lock` sidecar, released when the guard drops. Hold
-/// it across the whole load-modify-store span so updates cannot interleave.
+/// Serializes store file access across lore processes via the `<file>.lock`
+/// sidecar, released when the returned guard drops. Hold the guard across a
+/// whole load -> modify -> store span (not just the individual file
+/// operations) so concurrent processes cannot interleave their updates.
 async fn lock_store_file(path: &Path) -> Result<FSLock, TokenStoreError> {
     FSLock::acquire_file_lock(path).await.map_err(|e| {
         lore_warn!("Failed to lock store file: {e}");
@@ -282,8 +295,9 @@ async fn lock_token_map() -> Result<FSLock, TokenStoreError> {
     lock_store_file(token_map_path(true)?.as_path()).await
 }
 
-/// Refreshes the in-memory token map from disk before a mutation, since another process
-/// may have updated the file. Callers hold the store lock, so it cannot change again.
+/// Refreshes the in-memory token map from disk ahead of a mutation: another
+/// process may have updated the file since it was cached. Callers hold the
+/// store lock, so the reloaded state cannot change before it is written back.
 fn reload_token_map(guard: &FSLock, store: &mut Option<TokenMap>) {
     if let Ok(loaded_map) = load_token_map(guard) {
         store.replace(loaded_map);
@@ -352,7 +366,8 @@ fn store_token_map(_guard: &FSLock, token_map: &TokenMap) -> Result<(), TokenSto
         }
     };
 
-    // Truncate only once the write guard is held, so no reader observes a partial write.
+    // Truncate only after the write guard is held, so a concurrent reader
+    // can never observe a partially written file.
     config_file
         .set_len(0)
         .and_then(|()| config_file.write_all(config_string.as_bytes()))
@@ -377,8 +392,13 @@ fn store_fallback_path(name: &str, create_dir: bool) -> Result<PathBuf, TokenSto
 
 static KEYRING_ENTRY: OnceLock<Option<Arc<keyring::Entry>>> = OnceLock::new();
 
-/// Cached encryption key and next-use nonce. The lock serializes encrypts so two cannot
-/// reuse a nonce — AES-GCM nonce reuse is a key-recovery vulnerability.
+/// In-memory cache of the loaded encryption key + next-use nonce counter.
+///
+/// The encryption key is invariant for the lifetime of the secure-store
+/// entry; only the nonce advances on each encrypt. Caching avoids hitting
+/// the OS keyring on every encrypt/decrypt and serializes the encrypt path
+/// so two concurrent encrypts cannot reserve the same nonce (AES-GCM nonce
+/// reuse is a key-recovery vulnerability).
 static ENCRYPTION_CACHE: OnceLock<Mutex<Option<Encryption>>> = OnceLock::new();
 
 fn encryption_cache() -> &'static Mutex<Option<Encryption>> {
@@ -420,8 +440,10 @@ pub async fn store_user_token(
 ) -> Result<(), TokenStoreError> {
     let auth_endpoint = auth_endpoint.trim_end_matches('/');
 
-    // The issuing endpoint is always an acceptable recipient; also works around Auth
-    // Service's issuer being a keyword rather than a domain.
+    // If we got the token from this endpoint it stands to reason we can
+    // also send it back to that endpoint if we need to.
+    // This is a work-around for Auth Service's issuer being just a keyword rather
+    // than a domain
     let auth_domain = get_domain_or_empty(auth_endpoint);
     acceptable_root_domains.push(auth_domain);
 
@@ -497,10 +519,10 @@ pub async fn store_user_token(
     }
 }
 
-/// Loads the first token for `identity` from the shared store matching `base_filter`.
+/// Load the first suitable token for the given identity from the shared store
 ///
-/// `base_filter` should reject tokens invalid for the target domain; see `urc-core::auth`'s
-/// Check Token Recipient note.
+/// filter - You almost certainly want to filter out tokens that are invalid for the domain you want
+/// to use them against. See comment at top of `urc-core::auth` - Check Token Recipient
 pub async fn load_user_token<P>(
     auth_endpoint: &str,
     identity: &str,
@@ -557,8 +579,8 @@ where
     }
 }
 
-/// True if `remote` is `auth_url` itself or one of its resource-scoped entries (new
-/// hex-id or legacy `urc-` format).
+/// Returns true if `remote` is the base `auth_url` or a resource-scoped entry
+/// under it (either new `"{auth_url}/{hex_id}"` or legacy `"{auth_url}/urc-*"` format).
 fn is_entry_for_auth_url(remote: &str, auth_url: &str) -> bool {
     if remote == auth_url {
         return true;
@@ -579,8 +601,11 @@ fn is_entry_for_auth_url(remote: &str, auth_url: &str) -> bool {
     false
 }
 
-/// Removes `identity`'s tokens from the base `auth_url` entry and all its resource-scoped
-/// entries (both new and legacy key formats).
+/// Remove a user's tokens from the given auth URL and all its resource-scoped entries.
+///
+/// Removes the identity from both the base `auth_url` entry (authentication token)
+/// and all resource-scoped entries (authorization tokens), matching both new
+/// `"{auth_url}/{repository_id}"` and legacy `"{auth_url}/urc-*"` key formats.
 pub async fn remove_user_tokens_for_auth_url(
     auth_url: &str,
     identity: &str,
@@ -635,8 +660,10 @@ pub async fn remove_user_tokens_for_auth_url(
     Ok(())
 }
 
-/// Removes all tokens under `auth_url`: the base entry and all its resource-scoped
-/// entries (both new and legacy key formats).
+/// Remove all tokens for the given auth URL and all its resource-scoped entries.
+///
+/// Removes all identities from both the base `auth_url` entry and all
+/// resource-scoped entries (both new and legacy key formats).
 pub async fn remove_all_tokens_for_auth_url(auth_url: &str) -> Result<(), TokenStoreError> {
     let auth_url = auth_url.trim_end_matches('/');
 
@@ -742,8 +769,10 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
     Ok(identities)
 }
 
-/// Encrypts and stores (or replaces) the refresh token for an identity, overwriting any
-/// existing one atomically.
+/// Encrypts and stores (or replaces) the refresh token for an identity.
+///
+/// Called by orchestration after login or successful refresh. Overwrites
+/// any existing refresh token atomically.
 pub async fn store_refresh_token(
     auth_endpoint: &str,
     identity: &str,
@@ -842,8 +871,9 @@ pub async fn store_refreshed_user_token(
     }
 }
 
-/// Loads and decrypts the refresh token for an identity, returning
-/// `TokenStoreError::TokenNotFound` if none is stored.
+/// Loads and decrypts the refresh token for an identity.
+///
+/// Returns `TokenStoreError::TokenNotFound` if no refresh token is stored.
 pub async fn load_refresh_token(
     auth_endpoint: &str,
     identity: &str,
@@ -884,16 +914,17 @@ pub async fn load_refresh_token(
 async fn encrypt_token(user_token: &str) -> Result<String, TokenStoreError> {
     lore_trace!("Encrypting user token");
 
-    // Hold the lock across read, reserve, persist, and update so concurrent encrypts
-    // cannot reuse a nonce.
+    // Hold the cache lock across read -> reserve nonce -> persist -> update,
+    // so concurrent encrypts cannot seal two blobs with the same nonce.
     let mut guard = encryption_cache().lock().await;
     if guard.is_none() {
         *guard = Some(load_or_init_encryption().await?);
     }
     let encryption = guard.as_ref().expect("just initialized").clone();
     let new_nonce = encryption.nonce + 1;
-    // Persist before updating the cache, so a failed write retries with the same nonce
-    // instead of skipping ahead and risking reuse.
+    // Persist before updating the cache: a failed write leaves the cache at
+    // the old nonce so the next attempt retries with the same value, rather
+    // than skipping ahead and risking nonce reuse on a later success.
     set_secret_in_store(
         ENCRYPTION_KEY_TARGET,
         get_encryption_key_with_nonce(encryption.key.clone(), new_nonce),
@@ -916,9 +947,11 @@ async fn encrypt_token(user_token: &str) -> Result<String, TokenStoreError> {
             TokenStoreError::internal_with_context(e, "Failed to encrypt user token")
         })?;
 
+    // Add nonce to front of encoded token.
     let mut encrypted_token_with_nonce = encryption.nonce.as_bytes().to_vec();
     encrypted_token_with_nonce.append(&mut encrypted_token);
 
+    // Encode to base 64 for cleaner storage.
     Ok(BASE64_STANDARD.encode(encrypted_token_with_nonce))
 }
 
@@ -926,11 +959,13 @@ async fn decrypt_token(token: String) -> Result<String, TokenStoreError> {
     lore_trace!("Decrypting user token");
     let encryption = get_token_encryption_key().await?;
 
+    // Decode the base 64 value before decrypting aes.
     let encrypted_token_with_nonce = BASE64_STANDARD.decode(token).map_err(|e| {
         lore_warn!("Failed to decrypt user token: {e}");
         TokenStoreError::internal_with_context(e, "Failed to decrypt user token")
     })?;
 
+    // Get nonce from front of encoded token and use that to generate opening key.
     let (nonce_bytes, encrypted_token) = encrypted_token_with_nonce.split_at(NONCE_SIZE_U32);
     let nonce: [u8; NONCE_SIZE_U32] = nonce_bytes.try_into().map_err(|e| {
         lore_warn!("Failed to decrypt user token: {e}");
@@ -951,7 +986,7 @@ async fn decrypt_token(token: String) -> Result<String, TokenStoreError> {
         })?
         .to_vec();
 
-    // Drop the TAG_LEN placeholder appended before sealing.
+    // Truncate the empty values that are due to the in place tag usage.
     if decrypted_token.len() >= TAG_LEN {
         decrypted_token.truncate(decrypted_token.len() - TAG_LEN);
     }
@@ -963,8 +998,10 @@ async fn decrypt_token(token: String) -> Result<String, TokenStoreError> {
 }
 
 async fn get_token_encryption_key() -> Result<Encryption, TokenStoreError> {
-    // Decrypt-side accessor: returns the cached key, loading it on first use. Decrypt
-    // doesn't mutate the nonce, so a brief lock to clone is enough.
+    // Decrypt-side accessor: returns the cached key (loading from the secure
+    // store on first use). Decrypt does not mutate the nonce, so holding
+    // the lock briefly to clone is enough — concurrent decrypts run in
+    // parallel after the first load.
     let mut guard = encryption_cache().lock().await;
     if guard.is_none() {
         *guard = Some(load_or_init_encryption().await?);
@@ -972,9 +1009,10 @@ async fn get_token_encryption_key() -> Result<Encryption, TokenStoreError> {
     Ok(guard.as_ref().expect("just initialized").clone())
 }
 
-/// Loads the encryption key from the secure store, generating and persisting a new one
-/// (and resetting stored tokens) if none exists. Callers must hold the
-/// [`ENCRYPTION_CACHE`] lock.
+/// Loads the encryption key from the secure store, generating and persisting
+/// a new one (and resetting any existing tokens) if no key is stored.
+/// Callers must serialize this with respect to other writers — it is intended
+/// to be invoked only while holding the [`ENCRYPTION_CACHE`] lock.
 async fn load_or_init_encryption() -> Result<Encryption, TokenStoreError> {
     let encryption_key_nonce = get_secret_from_store(ENCRYPTION_KEY_TARGET).await?;
     if let Ok(encryption) = get_encryption(encryption_key_nonce) {
@@ -988,6 +1026,7 @@ async fn load_or_init_encryption() -> Result<Encryption, TokenStoreError> {
     let encryption_key_nonce = generate_encryption_key_nonce();
     reset_tokens().await?;
 
+    // Set encryption key nonce.
     set_secret_in_store(ENCRYPTION_KEY_TARGET, encryption_key_nonce.clone()).await?;
 
     get_encryption(encryption_key_nonce)

@@ -20,7 +20,7 @@ In this guide, you'll register Lore as a client with your provider, turn on auth
     - **PKCE** enabled.
     - A callback address of `http://127.0.0.1:*/callback`, where the browser login flow's loopback listener receives the redirect. PocketID accepts a wildcard port; other providers may need a fixed port or a range.
 
-    Set the ID-token lifetime in minutes rather than hours — that's the token Lore presents by default. Lore holds no revocation list — a verified token works until it expires — so a short lifetime bounds how long a revoked user keeps access. Clients refresh without prompting, so it costs users nothing. If you bind tokens to a resource (step 3), shorten the access-token lifetime too, since that becomes the credential.
+    Set the ID-token lifetime in minutes rather than hours — that's the token Lore presents. Lore holds no revocation list — a verified token works until it expires — so a short lifetime bounds how long a revoked user keeps access. Clients refresh without prompting, so it costs users nothing.
 
     Note the client id and your provider's issuer address for the next step.
 
@@ -40,26 +40,10 @@ In this guide, you'll register Lore as a client with your provider, turn on auth
     > [!IMPORTANT]
     > `authorize_all_repositories = true` is the whole authorization model this mode offers: any identity your provider admits can read and write **every** repository on the server — no per-repository distinction, no read-only identity, no administrative separation. Run one server per trust boundary when repositories need different audiences. The setting has no default, so omitting it or setting it to `false` fails startup rather than deciding for you.
 
-3. **Bind tokens to this deployment.**
+    > [!NOTE]
+    > A token's `aud` claim names the client id, which identifies the application rather than the server. Two deployments sharing an issuer and a client id therefore share a credential-store bucket and accept each other's tokens — logging in to one evicts the other's token. Register a distinct client id per deployment to keep them apart.
 
-    By default the token's `aud` claim names the client id, which identifies the application rather than the server: every deployment behind the same issuer and client id accepts every other one's tokens, and they share one credential-store bucket, so logging in to one evicts the other's token. Setting `resource` to this deployment's own address ends both. The server then requires an [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) access token whose `aud` names that value, and the client asks the provider for one using [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource indicators:
-
-    ```toml
-    [server.auth.oidc]
-    issuer = "https://id.example.com"
-    client_id = "lore"
-    authorize_all_repositories = true
-    resource = "https://lore-prod.example.com"
-    ```
-
-    Use it wherever your provider supports it, and treat it as required where a deployment shares an issuer with another Lore server. The value must be an absolute URI with no fragment — a bare hostname such as `lore-prod.example.com` is rejected at startup — and it's an identifier, so the server never dials it.
-
-    > [!IMPORTANT]
-    > Your provider must implement both RFCs, and one that doesn't won't tell you so — it accepts the request and mints an ordinary token whose `aud` names the client id. Lore checks the token it gets back and fails the login with a message naming what the provider didn't do. **PocketID 2.6.2 ignores the parameter** (verified 2026-08-13): leave `resource` unset there, and register a distinct client id per deployment instead to restore the audience distinction. Keycloak, Entra ID, and Auth0 support resource indicators or an equivalent audience parameter; test a login outside production first.
-
-    The server advertises `resource` to clients on its own. If you write `environment.endpoint.auth_url` by hand, carry the parameter yourself, or clients won't ask for a resource-bound token and every request is refused. See the [server config reference](../reference/lore-server-config.md#authentication) for the encoded form.
-
-4. **Restart the server and confirm it now requires a token.**
+3. **Restart the server and confirm it now requires a token.**
 
     ```bash
     ~/.local/bin/loreserver --config /opt/loreserver/config
@@ -73,7 +57,7 @@ In this guide, you'll register Lore as a client with your provider, turn on auth
 
     If it succeeds instead, the server isn't picking up the config change — check the config path and restart again.
 
-5. **Log in.**
+4. **Log in.**
 
     On a machine with a browser, `lore login` opens your provider's login page:
 
@@ -92,7 +76,7 @@ In this guide, you'll register Lore as a client with your provider, turn on auth
 
     Either way, Lore stores the token in the encrypted credential store and refreshes it as it expires, so day-to-day commands don't ask you to log in again until the provider revokes the session.
 
-6. **Confirm who you're logged in as.**
+5. **Confirm who you're logged in as.**
 
     ```bash
     lore auth info
@@ -111,5 +95,5 @@ Every repository operation on the server — gRPC, HTTP, and QUIC alike — now 
 
 - [Lore Server config reference](../reference/lore-server-config.md#authentication) — every `[server.auth]` and `[server.auth.oidc]` field.
 - [Lore CLI command reference](../reference/lore-cli-commands.md) — the full `lore auth` subcommand surface.
-- [OIDC authentication proposal](../proposals/2026-08-13-oidc-authentication.md) — the design, its threat model, and what resource binding does and doesn't prevent.
+- [OIDC authentication proposal](../proposals/2026-08-13-oidc-authentication.md) — the design and its threat model.
 - [Deploy a local Lore Server](deploy-local-lore-server.md) — get a server running before securing it.

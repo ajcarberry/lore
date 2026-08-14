@@ -78,13 +78,10 @@ pub struct AuthorizationToken {
     pub idp: String,
 }
 
-/// The claim shape a provider-issued token is read into, in either OIDC mode.
+/// The claim shape a provider-issued ID token is read into in OIDC mode.
 ///
 /// It requires only what RFC 7519 and `OpenID` Connect Core guarantee — `iss`,
-/// `sub`, `aud`, `exp`, `iat` — so a conformant ID token satisfies it. The same
-/// shape serves an [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) JWT access
-/// token: §2.2 adds `client_id` and `jti`, which §4 does not require of a
-/// resource server and Lore does not read.
+/// `sub`, `aud`, `exp`, `iat` — so a conformant ID token satisfies it.
 #[serde_as]
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 struct OidcTokenClaims {
@@ -147,43 +144,25 @@ pub enum JwtVerifierError {
     ValidationFailed(#[from] jsonwebtoken::errors::Error),
     #[error("JWT authorization failed")]
     NotAuthorized,
-    #[error("JWT is not an RFC 9068 access token")]
-    NotAnAccessToken,
 }
 
 /// Which claim shapes `verify_token_internal` accepts, and whether a
 /// successfully-decoded token is granted the all-repositories wildcard.
 ///
 /// Only a verifier built from a configured `[server.auth.oidc]` block, via
-/// [`JwtVerifier::oidc`] or [`JwtVerifier::oidc_resource`], is `Oidc`. That gate
-/// is what keeps the third, minimal claim decode from widening the token set a
-/// `[server.auth.jwk]`-only deployment accepts.
+/// [`JwtVerifier::oidc`], is `Oidc`. That gate is what keeps the third, minimal
+/// claim decode from widening the token set a `[server.auth.jwk]`-only
+/// deployment accepts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum JwtVerifierMode {
     /// Only Lore's own claim shapes (`AuthorizationToken`, `JWTUserInfo`)
     /// verify.
     #[default]
     LoreClaims,
-    /// `[server.auth.oidc]`'s authn-only mode. The expected credential decides
-    /// both which claim shape verifies and what `aud` is pinned to.
-    Oidc(OidcAcceptance),
-}
-
-/// Which of the provider's two tokens a `[server.auth.oidc]` deployment accepts.
-///
-/// The distinction is `[server.auth.oidc].resource`: absent, the deployment
-/// accepts an ID token; present, it is strict.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OidcAcceptance {
-    /// No `resource` configured: a conformant `OpenID` Connect ID token, whose
-    /// `aud` names the client rather than the server, so two deployments sharing
-    /// an issuer and a client id accept each other's tokens.
-    IdToken,
-    /// `resource` configured: an [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068)
-    /// JWT access token, whose `aud` is pinned to the configured resource
-    /// identifier. ID tokens are refused outright, so the weaker credential is
-    /// not a way around the stronger one.
-    AccessToken,
+    /// `[server.auth.oidc]`'s authn-only mode: a conformant `OpenID` Connect ID
+    /// token, whose `aud` names the client rather than the server, so two
+    /// deployments sharing an issuer and a client id accept each other's tokens.
+    Oidc,
 }
 
 #[derive(Clone)]
@@ -220,22 +199,7 @@ impl JwtVerifier {
             jwk_service,
             jwt_issuer,
             jwt_audience,
-            mode: JwtVerifierMode::Oidc(OidcAcceptance::IdToken),
-        }
-    }
-
-    /// `[server.auth.oidc]`'s resource-bound mode: an RFC 9068 JWT access token
-    /// and nothing else. `jwt_audience` is the configured resource identifier.
-    pub fn oidc_resource(
-        jwk_service: Arc<dyn JWKService>,
-        jwt_issuer: Option<String>,
-        jwt_audience: Option<Vec<String>>,
-    ) -> Self {
-        Self {
-            jwk_service,
-            jwt_issuer,
-            jwt_audience,
-            mode: JwtVerifierMode::Oidc(OidcAcceptance::AccessToken),
+            mode: JwtVerifierMode::Oidc,
         }
     }
 }
@@ -252,14 +216,6 @@ fn key_may_be_stale(error: &JwtVerifierError) -> bool {
         jsonwebtoken::errors::ErrorKind::InvalidSignature
             | jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
     ))
-}
-
-/// Whether a `typ` header declares an RFC 9068 JWT access token.
-///
-/// §4 step 1 accepts both spellings §2.1 defines, and `typ` is a media type, so
-/// the comparison is case-insensitive (RFC 9110 §8.3.1).
-fn is_jwt_access_token_type(typ: &str) -> bool {
-    typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
 }
 
 /// Log a claim-decode failure at the level its kind deserves, and carry it on.
@@ -357,13 +313,6 @@ impl JwtVerifier {
 
         debug!("Decoding JWT token");
 
-        // Resource-bound mode accepts one credential and stops: leaving Lore's own
-        // claim shapes or the ID-token shape reachable would leave a weaker
-        // credential as a way around the stronger one.
-        if self.mode == JwtVerifierMode::Oidc(OidcAcceptance::AccessToken) {
-            return Self::verify_access_token(token, key, &validation);
-        }
-
         if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {
             debug!(
                 sub = %token_data.claims.user_id,
@@ -394,37 +343,13 @@ impl JwtVerifier {
             // Reached only once both Lore-specific claim shapes above have failed
             // to deserialize, and only in OIDC mode: a `[server.auth.jwk]`-only
             // verifier stops here.
-            Err(_) if matches!(self.mode, JwtVerifierMode::Oidc(_)) => {
+            Err(_) if self.mode == JwtVerifierMode::Oidc => {
                 decode::<OidcTokenClaims>(token, key, &validation)
                     .map_err(decode_failure)
                     .map(|token_data| token_data.claims.into())
             }
             Err(error) => Err(decode_failure(error)),
         }
-    }
-
-    /// Verifies an RFC 9068 JWT access token (§4): `typ`, signature, `iss`, `aud`,
-    /// `exp`, the last four through the `Validation` the caller assembled.
-    ///
-    /// The `typ` check runs before signature verification so a mistyped token never
-    /// triggers a key refetch.
-    fn verify_access_token(
-        token: &str,
-        key: &DecodingKey,
-        validation: &Validation,
-    ) -> Result<AuthorizationToken, JwtVerifierError> {
-        let header = decode_header(token).map_err(JwtVerifierError::ValidationFailed)?;
-        if !header.typ.as_deref().is_some_and(is_jwt_access_token_type) {
-            debug!(
-                typ = ?header.typ,
-                "Refusing a token that does not declare the RFC 9068 media type"
-            );
-            return Err(JwtVerifierError::NotAnAccessToken);
-        }
-
-        decode::<OidcTokenClaims>(token, key, validation)
-            .map_err(decode_failure)
-            .map(|token_data| token_data.claims.into())
     }
 }
 
@@ -1359,240 +1284,6 @@ mod tests {
                          env/name/preferred_username, however well it verifies otherwise",
                 );
                 assert!(matches!(error, JwtVerifierError::ValidationFailed(_)));
-            }
-        }
-
-        /// `[server.auth.oidc].resource`: the provider audience-restricts an
-        /// RFC 9068 access token to the name the deployment configured
-        /// (RFC 8707 §2), and the server accepts nothing else.
-        mod resource_mode {
-            use super::*;
-
-            const RESOURCE: &str = "https://lore.example.com";
-            const CLIENT_ID: &str = "lore";
-
-            fn resource_verifier() -> JwtVerifier {
-                let mut service = MockTestJWKService::new();
-                service.expect_get_key().returning(|_| {
-                    Ok((
-                        DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
-                        AGREED_UPON_ALGORITHM,
-                    ))
-                });
-                service.expect_refresh_key().returning(|_| Ok(None));
-
-                JwtVerifier::oidc_resource(
-                    Arc::new(service),
-                    Some("https://id.example.com".to_string()),
-                    Some(vec![RESOURCE.to_string()]),
-                )
-            }
-
-            /// RFC 9068 §2.2's required claim set, audience-restricted to this
-            /// deployment's resource identifier.
-            fn access_token_claims() -> serde_json::Value {
-                json!({
-                    "sub": "the-subject",
-                    "iss": "https://id.example.com",
-                    "aud": RESOURCE,
-                    "client_id": CLIENT_ID,
-                    "iat": 1,
-                    "jti": "the-token-id",
-                    "exp": SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .add(Duration::from_secs(5))
-                        .as_secs(),
-                })
-            }
-
-            /// `encode` writes `typ: "JWT"`, so the RFC 9068 media type has to be
-            /// set deliberately.
-            fn encode_access_token(claims: &serde_json::Value, typ: Option<&str>) -> String {
-                let jwt_key = EncodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref());
-                let mut header = Header::new(AGREED_UPON_ALGORITHM);
-                header.kid = Some("the kid".into());
-                header.typ = typ.map(str::to_string);
-                encode(&header, claims, &jwt_key).unwrap()
-            }
-
-            /// A token audienced to the client id is refused even though it is
-            /// signed by the pinned issuer and unexpired.
-            #[tokio::test]
-            async fn a_client_id_audience_token_is_rejected() {
-                let mut claims = access_token_claims();
-                claims["aud"] = json!(CLIENT_ID);
-                let encoded = encode_access_token(&claims, Some("at+jwt"));
-
-                resource_verifier().verify_token(&encoded).await.expect_err(
-                    "a token audienced to the client id authorizes every deployment \
-                     sharing that client — which is the risk resource mode removes",
-                );
-            }
-
-            #[tokio::test]
-            async fn a_conformant_access_token_is_accepted_and_wildcarded() {
-                let encoded = encode_access_token(&access_token_claims(), Some("at+jwt"));
-
-                let token = resource_verifier()
-                    .verify_token(&encoded)
-                    .await
-                    .expect("an RFC 9068 access token for this resource is accepted");
-
-                assert_eq!(token.user_id, "the-subject");
-                assert_eq!(token.issuer, "https://id.example.com");
-                assert_eq!(token.idp, "https://id.example.com");
-                assert_eq!(token.audience, vec![RESOURCE.to_string()]);
-                let resources = token.resources.expect("wildcard resource is populated");
-                assert!(resources[0].is_wildcard_resource());
-            }
-
-            /// RFC 9068 §4 step 1 accepts both spellings, and a media type is
-            /// compared case-insensitively.
-            #[tokio::test]
-            async fn both_spellings_of_the_media_type_are_accepted() {
-                for typ in [
-                    "at+jwt",
-                    "application/at+jwt",
-                    "AT+JWT",
-                    "Application/AT+JWT",
-                ] {
-                    let encoded = encode_access_token(&access_token_claims(), Some(typ));
-                    resource_verifier()
-                        .verify_token(&encoded)
-                        .await
-                        .unwrap_or_else(|e| panic!("typ '{typ}' must be accepted: {e}"));
-                }
-            }
-
-            /// RFC 9068 §4 step 1: "reject tokens carrying any other value".
-            #[tokio::test]
-            async fn a_plain_jwt_media_type_is_rejected() {
-                for typ in [Some("JWT"), Some("oauth-access-token"), Some(""), None] {
-                    let encoded = encode_access_token(&access_token_claims(), typ);
-                    if let Ok(accepted) = resource_verifier().verify_token(&encoded).await {
-                        panic!("typ {typ:?} was accepted, yielding {}", accepted.user_id);
-                    }
-                }
-            }
-
-            /// A `ucs-auth`-issued token carries `typ: "JWT"`, so it never reaches
-            /// a claim decode here however well it verifies otherwise.
-            #[tokio::test]
-            async fn a_lore_shaped_token_is_rejected_in_resource_mode() {
-                let mut claims = access_token_claims();
-                claims["env"] = json!("the env");
-                claims["name"] = json!("the name");
-                claims["preferred_username"] = json!("pu");
-                let encoded = encode_jwt(&claims);
-
-                resource_verifier()
-                    .verify_token(&encoded)
-                    .await
-                    .expect_err("resource mode accepts the RFC 9068 shape and nothing else");
-            }
-
-            /// `sub` and `iat` are RFC 9068 §2.2 REQUIRED claims that Lore reads.
-            #[tokio::test]
-            async fn a_token_missing_sub_or_iat_is_rejected() {
-                for claim in ["sub", "iat"] {
-                    let mut claims = access_token_claims();
-                    claims.as_object_mut().expect("claims object").remove(claim);
-                    let encoded = encode_access_token(&claims, Some("at+jwt"));
-
-                    if resource_verifier().verify_token(&encoded).await.is_ok() {
-                        panic!("a token without '{claim}' must be refused");
-                    }
-                }
-            }
-
-            /// RFC 9068 §2.2 requires `jti` and `client_id` of the authorization
-            /// server, but §4 does not require them of a resource server and Lore
-            /// reads neither.
-            #[tokio::test]
-            async fn a_token_without_jti_or_client_id_is_still_accepted() {
-                let mut claims = access_token_claims();
-                let object = claims.as_object_mut().expect("claims object");
-                object.remove("jti");
-                object.remove("client_id");
-                let encoded = encode_access_token(&claims, Some("at+jwt"));
-
-                resource_verifier()
-                    .verify_token(&encoded)
-                    .await
-                    .expect("leniency on claims the resource server does not read");
-            }
-
-            #[tokio::test]
-            async fn wrong_issuer_and_expiry_are_still_rejected() {
-                let mut wrong_issuer = access_token_claims();
-                wrong_issuer["iss"] = json!("https://not-the-configured-issuer.invalid");
-                resource_verifier()
-                    .verify_token(&encode_access_token(&wrong_issuer, Some("at+jwt")))
-                    .await
-                    .expect_err("the issuer pin holds in resource mode too");
-
-                let mut expired = access_token_claims();
-                expired["exp"] = json!(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs()
-                        - 3600
-                );
-                resource_verifier()
-                    .verify_token(&encode_access_token(&expired, Some("at+jwt")))
-                    .await
-                    .expect_err("the expiry check holds in resource mode too");
-            }
-
-            /// A `typ` this server does not accept is the token's own fault, so it
-            /// must not be a way to drive outbound key fetches.
-            #[tokio::test]
-            async fn a_wrong_media_type_never_asks_for_a_refresh() {
-                let service = Arc::new(RotatingJWKService::new(
-                    AGREED_UPON_SIGNING_SECRET,
-                    Some(AGREED_UPON_SIGNING_SECRET),
-                ));
-                let verifier = JwtVerifier::oidc_resource(
-                    service.clone(),
-                    Some("https://id.example.com".to_string()),
-                    Some(vec![RESOURCE.to_string()]),
-                );
-                let encoded = encode_access_token(&access_token_claims(), Some("JWT"));
-
-                verifier
-                    .verify_token(&encoded)
-                    .await
-                    .expect_err("the wrong media type stays rejected");
-                verifier
-                    .try_verify_token_cached(&encoded)
-                    .expect_err("and is rejected outright, not deferred");
-
-                assert_eq!(service.refreshes(), 0);
-            }
-
-            #[tokio::test]
-            async fn an_access_token_shape_still_verifies_in_id_token_mode() {
-                let mut service = MockTestJWKService::new();
-                service.expect_get_key().returning(|_| {
-                    Ok((
-                        DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
-                        AGREED_UPON_ALGORITHM,
-                    ))
-                });
-                let id_token_verifier = JwtVerifier::oidc(
-                    Arc::new(service),
-                    Some("https://id.example.com".to_string()),
-                    Some(vec![CLIENT_ID.to_string()]),
-                );
-                let mut claims = access_token_claims();
-                claims["aud"] = json!(CLIENT_ID);
-
-                id_token_verifier
-                    .verify_token(&encode_access_token(&claims, Some("at+jwt")))
-                    .await
-                    .expect("ID-token mode is unchanged: it never looked at typ");
             }
         }
 

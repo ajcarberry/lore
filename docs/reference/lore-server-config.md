@@ -180,7 +180,7 @@ This field is optional. When it's absent, the server starts with the presigned U
 | Field | Default | Description |
 | --- | --- | --- |
 | `jwt_issuer` | none | Expected JWT `iss` claim. When set, tokens with a different issuer are rejected; when unset, issuer validation is skipped. Derived from `[server.auth.oidc].issuer` when that block is present and this is unset. |
-| `jwt_audience` | none | Array of accepted JWT `aud` values. A token's audience must match one entry; when unset, audience validation is skipped. Derived from `[server.auth.oidc]` when that block is present and this is unset — from its `resource` if one is set, otherwise from its `client_id`. |
+| `jwt_audience` | none | Array of accepted JWT `aud` values. A token's audience must match one entry; when unset, audience validation is skipped. Derived from `[server.auth.oidc].client_id` when that block is present and this is unset. |
 | `jwk` | none | The `[server.auth.jwk]` sub-table below. Its presence enables JWT verification. Derived from `[server.auth.oidc]`'s discovery document when that block is present and this is unset. |
 | `oidc` | none | The `[server.auth.oidc]` sub-table below: direct verification of a standard OpenID Connect provider's tokens. |
 
@@ -206,23 +206,17 @@ endpoint = "https://accounts.example.com/.well-known/jwks.json"
 | `issuer` | none (required) | The provider's issuer identifier, exactly as it publishes it — the same string it puts in the `iss` claim. |
 | `client_id` | none (required) | The public client id registered for Lore with the provider. |
 | `authorize_all_repositories` | none (required) | Has no default. A configured block that omits this, or sets it to `false`, fails startup validation: a verified token authorizes every repository on the server, and per-repository authorization from provider claims is not implemented, so an operator has to say explicitly that the coarse grant is what they want. |
-| `resource` | none | This deployment's own [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource indicator. See below. |
 
 ```toml
 [server.auth.oidc]
 issuer = "https://id.example.com"
 client_id = "lore"
 authorize_all_repositories = true
-resource = "https://lore-prod.example.com"  # optional; recommended where the provider supports it
 ```
 
-#### `resource`
+When `[server.auth.oidc]` is configured and `environment.endpoint.auth_url` is empty, the server derives that field as `oidc+https://{issuer}?client_id={client_id}` (`oidc+http` for an `http://` issuer). An explicitly configured `auth_url` always wins.
 
-This field is optional. When it's absent, the server verifies an ID token whose `aud` names the client id. When it's set, it must be an absolute URI with no fragment component ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) §2) — a bare hostname fails startup validation — and the server instead verifies an [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) JWT access token (header `typ` of `at+jwt` or `application/at+jwt`) whose `aud` names this value. Deployments sharing an issuer then stop accepting each other's tokens. Requires a provider that implements both RFCs.
-
-When `[server.auth.oidc]` is configured and `environment.endpoint.auth_url` is empty, the server derives that field as `oidc+https://{issuer}?client_id={client_id}` (`oidc+http` for an `http://` issuer). A configured `resource` is appended as a percent-encoded `resource` query parameter. An explicitly configured `auth_url` always wins, and must carry the `resource` parameter itself when `resource` is set, or clients will obtain tokens this server refuses.
-
-See [Secure a Lore server with OpenID Connect](../how-to/secure-a-lore-server-with-oidc.md) for when to turn `resource` on and how to check whether your provider supports it.
+See [Secure a Lore server with OpenID Connect](../how-to/secure-a-lore-server-with-oidc.md) for a full walkthrough.
 
 ## Store settings
 

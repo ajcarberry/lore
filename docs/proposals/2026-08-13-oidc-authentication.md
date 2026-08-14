@@ -29,11 +29,8 @@ deciding who gets in is the provider's job. The CLI gains one new scheme in its 
 authentication registry, implementing three standard flows — authorization code with PKCE
 ([RFC 7636](https://www.rfc-editor.org/rfc/rfc7636)) where there's a browser, the device
 authorization grant ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) where there isn't, and the
-refresh grant so a session outlives its first token. A deployment whose provider supports resource
-indicators ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707)) can additionally bind tokens to
-itself alone, accepting only JWT access tokens ([RFC 9068](https://www.rfc-editor.org/rfc/rfc9068))
-audienced to it. Nothing new is deployed — no broker, no sidecar, no Lore-minted tokens — and a
-server that doesn't configure this is unchanged.
+refresh grant so a session outlives its first token. Nothing new is deployed — no broker, no
+sidecar, no Lore-minted tokens — and a server that doesn't configure this is unchanged.
 
 ## Motivation
 
@@ -155,7 +152,7 @@ the only token OpenID Connect guarantees: guaranteed to exist, to be a signed JW
 client id in `aud`, which is the value the server pins. Access tokens may be opaque
 ([RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) §1.4), so requiring a verifiable access token
 would reintroduce exactly the provider coupling this proposal exists to avoid. **Drawbacks** records
-the cost; **Binding tokens to one deployment** is the standards-track route out of it.
+the cost, and **Future work** names the standards-track route out of it.
 
 Verification therefore needs a claim shape a conformant ID token satisfies. The verifier today tries
 two claim structs, both demanding the Lore-specific `env`, `name`, and `preferred_username`, so a
@@ -233,7 +230,7 @@ The server advertises the provider through the existing `EnvironmentGet` `auth_u
 
 ```text
 oidc+https://id.example.com?client_id=lore
-oidc+https://id.example.com/realms/studio?client_id=lore&resource=https://lore.example.com
+oidc+https://id.example.com/realms/studio?client_id=lore
 ```
 
 When the OIDC block is configured and `environment.endpoint.auth_url` is empty, the server derives
@@ -246,12 +243,9 @@ The scheme is the dispatch key. `authentication::find` splits on the first `://`
 up in the registry, so `oidc+https` registers as one entry and `oidc+http` as another the
 implementation accepts only for a loopback issuer. The `+` composition follows Git's convention for
 transport-qualified remotes (`git+https`, `svn+ssh`), and stripping the prefix yields the issuer
-unchanged, which matters because issuer validation is a byte comparison. Query parameters are safe to
-append, an issuer identifier being forbidden a query or fragment component (Discovery §2):
-`client_id` is not a secret, this being a public client using PKCE, and `resource` appears exactly
-when configured, doing two jobs — advertisement is the only channel by which a client learns to ask
-for a resource-bound token, and distinct resources give two deployments sharing an issuer distinct
-auth URLs, which the credential store keys on.
+unchanged, which matters because issuer validation is a byte comparison. The `client_id` parameter is
+safe to append, an issuer identifier being forbidden a query or fragment component (Discovery §2),
+and is not a secret, this being a public client using PKCE.
 
 **The server reads this field too, in six places**, and every one of them wants a dial target for
 Epic's relationship-based authorization service, so advertising an `oidc+https://…` URL unguarded
@@ -359,57 +353,11 @@ consequence is visible to users: the store keys tokens by `(auth_url, identity)`
 pair, so two deployments sharing an issuer and a client id share a bucket, and logging in to one
 evicts the other's token.
 
-### Binding tokens to one deployment, where the provider allows it
-
-`aud` names the client, so it cannot tell two Lore deployments apart: every deployment registered
-behind the same issuer and client id — staging beside production, the ordinary case — accepts every
-other one's tokens. **Security Considerations** states what follows.
-
-The standards-track answer is a pair: [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource
-indicators, which let a client ask for a token bound to a named resource server, and
-[RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) JWT access tokens, which are what such a token is.
-This proposal ships both as an opt-in that is strict when enabled, because mandatory would be
-unshippable: a provider is obliged to implement neither, and PocketID 2.6.2 implements neither.
-
-```toml
-resource = "https://lore-prod.example.com"
-```
-
-Its value is an RFC 8707 resource indicator — an absolute URI with no fragment (§2), enforced at
-start-up, because the alternative failure is the worst kind: a server pinning an audience no provider
-will mint, so every login succeeds and every request is refused. It is an identifier, not an
-endpoint; nothing dials it.
-
-**What the server then requires.** `aud` pins to the resource rather than the client id, and the
-accepted credential becomes an RFC 9068 JWT access token, validated by §4's list plus `sub` and `iat`
-because the server reads them. It accepts a token omitting `client_id` or `jti`, following the
-specification's own division of labor: §2.2 binds the authorization server issuing a token, while §4
-— the resource server's list — names neither, and Lore consumes neither. ID-token acceptance is
-**off** in this mode, and §4's `typ` check is what turns it off, since every ID token and every
-`ucs-auth` token carries `typ: "JWT"`; leaving the weaker credential reachable would leave a way
-around the stronger one, which is the reason an operator turned this on.
-
-**What the client does.** RFC 8707 §2 puts the `resource` parameter on the authorization request and
-on the token request of every grant type, so the client sends it on all five legs — authorization,
-code exchange, device authorization, device poll, and refresh — and then presents the **access
-token**, the ID token staying the identity assertion that carries `nonce` and the display claims. It
-also checks what it got back, because a provider that does not implement RFC 8707 is under no
-obligation to say so: PocketID 2.6.2 answers `200` on every leg, ignores the parameter, and mints an
-ordinary client-audienced token, which unchecked would store a credential and then have every
-repository operation refused with the cause two layers away. So the client verifies that the access
-token is a JWT of the right media type whose `aud` names the resource, and fails the login naming
-what the provider did not do — a diagnostic, not a security control, since the server verifies the
-token itself and its verdict is the only one that decides anything.
-
-Absent `resource`, no parameter is sent and the ID token is the credential, which is what makes this
-an opt-in rather than a migration.
-
 ### Goal tracing
 
 Goal 1 → **Server configuration**. Goal 2 → **Discovery** and **Advertising the provider**. Goal 3 →
 **One authorization mode**. Goal 4 → **The enforcement points**. Goal 5 → **The client
-implementation**. Goal 6 → **Keeping the token-recipient guard** and **Binding tokens to one
-deployment**. Goal 7 → **Compatibility**, below.
+implementation**. Goal 6 → **Keeping the token-recipient guard**. Goal 7 → **Compatibility**, below.
 
 ## Compatibility
 
@@ -447,9 +395,8 @@ deployment**. Goal 7 → **Compatibility**, below.
   authorization client for", identical for every deployment today.
 
 - **Configuration** — Additive and backward-compatible. `[server.auth.oidc]` is a new optional block,
-  and the three existing `AuthSettings` fields keep their meanings when set explicitly. Two new
-  start-up failures, both by design: a block without `authorize_all_repositories = true` refuses to
-  start, and a `resource` that is not an absolute URI without a fragment refuses to start.
+  and the three existing `AuthSettings` fields keep their meanings when set explicitly. One new
+  start-up failure, by design: a block without `authorize_all_repositories = true` refuses to start.
 
 ## Non-Functional Considerations
 
@@ -536,20 +483,19 @@ already go: the existing credential store, encrypted, with the OS keyring holdin
 rotated on use. Failures stay non-oracular: the gRPC interceptor collapses every verification failure
 into a uniform `permission_denied`, and the OIDC path adds failure modes and no responses.
 
-**Two residual risks, named rather than buried.** *Token confusion between deployments* is narrowed
-by `resource`, not removed. In the default mode any deployment behind the same issuer and client id
-accepts any other's tokens, a harvested token opens all of them, and a malicious server advertising a
-real deployment's issuer and client id collects, from a user who points `lore login` at it, a token
-the real server would also accept. The recipient guard neither prevents this nor is meant to; it
-prevents the *stored* token from a different remote leaking, which it still does. Configuring
-`resource` ends cross-deployment interchange and untargeted replay, but not the targeted variant: an
-attacker who advertises *your* resource identifier and persuades a user to log in still receives a
-token your server accepts, because the user asked their provider for a token for that resource and
-got one. No audience restriction can distinguish that from a legitimate login — it is the phishing
-premise, not a gap in RFC 8707 — and what bounds it is that the user chose the remote. Where the mode
-is unavailable, the baseline mitigation is a distinct `client_id` per deployment. *Presenting an ID
-token as a bearer credential to a resource server*, second, is a compromise the standards discourage,
-recorded in **Drawbacks** rather than argued away, and configuring `resource` retires it.
+**Two residual risks, named rather than buried.** *Token confusion between deployments* is inherent to
+ID-token verification. `aud` names the client id, which identifies the application rather than the
+server, so any deployment behind the same issuer and client id accepts any other's tokens, a harvested
+token opens all of them, and a malicious server advertising a real deployment's issuer and client id
+collects, from a user who points `lore login` at it, a token the real server would also accept. The
+recipient guard neither prevents this nor is meant to; it prevents the *stored* token from a different
+remote leaking, which it still does. The mitigation is a distinct `client_id` per deployment, which
+gives each its own audience and its own credential-store bucket. Binding a token to one deployment
+with RFC 8707/9068 would narrow the residual further — to the targeted variant alone, where an
+attacker advertises *your* identifier and the user still chooses to log in, which no audience
+restriction can distinguish from a legitimate login — and **Future work** describes that route and why
+it is deferred. *Presenting an ID token as a bearer credential to a resource server*, second, is a
+compromise the standards discourage, recorded in **Drawbacks** rather than argued away.
 
 ## Privacy Considerations
 
@@ -608,8 +554,8 @@ clear` already remove stored tokens, and refresh tokens go with them.
   shipped:* the two mechanisms in **Advertising the provider**, plus integration and end-to-end
   coverage against a live provider, which is what turned a design assumption into a caught bug.
 - **Risk:** two deployments sharing an issuer and client id share one credential-store bucket, so
-  logging in to one evicts the other's token — *mitigation:* distinct `resource` values give distinct
-  auth URLs and distinct buckets; documented in the operator guide.
+  logging in to one evicts the other's token — *mitigation:* a distinct `client_id` per deployment
+  gives distinct auth URLs and distinct buckets; documented in the operator guide.
 - **Risk:** an unauthenticated caller drives outbound key-set fetches by cycling unknown key ids —
   *mitigation:* already bounded and tested — the minimum refresh interval throttles fetches once any
   key is cached, the refresh mutex collapses concurrent misses, and a failure no key could rescue
@@ -629,10 +575,8 @@ clear` already remove stored tokens, and refresh tokens go with them.
 - The all-repositories grant is too coarse for any operator needing different access to different
   repositories, and they must wait for the follow-up LEP.
 - Presenting an ID token as a bearer credential to a resource server is a compromise the standards
-  discourage, taken because it is the only token OpenID Connect guarantees is verifiable — and the
-  deployments left on it are exactly those whose provider cannot offer the `resource` alternative.
-- The resource-bound mode's requirements land entirely on the provider, and one that does not meet
-  them says nothing, so the failure surfaces as a Lore-side diagnostic rather than a protocol error.
+  discourage, taken because it is the only token OpenID Connect guarantees is verifiable; **Future
+  work** names the standards-track alternative and why it is deferred.
 - A second authentication scheme means every `lore auth` subcommand has two implementations to behave
   consistently across, and one of them cannot answer `get_user_info`.
 
@@ -760,3 +704,25 @@ produces an error naming the scheme and listing the ones the client knows.
   rebuilt `lore` faces an authorization prompt on the next read and the store waits with no timeout.
   This is not new, but OIDC login is the first flow putting a store read in front of ordinary
   self-hosted users, where an indefinite wait is indistinguishable from a hung login.
+
+## Future work
+
+**Binding tokens to one deployment ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) /
+[RFC 9068](https://www.rfc-editor.org/rfc/rfc9068)).** The design is an opt-in `resource` setting
+naming this deployment's own identifier: the client asks the provider for a token bound to that
+resource (RFC 8707 resource indicators, sent on every grant leg), the provider issues an RFC 9068
+`at+jwt` access token whose `aud` is that identifier, and the server accepts only that token,
+audience-pinned to itself rather than to the client id. The security value is real but narrow — it
+retires cross-deployment interchange and untargeted replay of a harvested token, narrowing the
+audience-confusion residual named in **Security Considerations** to the targeted-phishing variant
+alone, which no audience restriction can prevent.
+
+It is deferred because the value is unrealizable today: the mechanism lands entirely on the provider,
+and no provider a self-hoster is likely to run supports RFC 8707 — PocketID 2.6.2 ignores the
+parameter (verified 2026-08-13), and neither Okta nor Auth0 implements it; Keycloak is adding it, and
+the Model Context Protocol's adoption of RFC 8707 for its own authorization is the ecosystem forcing
+function. A provider that ignores the parameter says nothing, so a mandatory mode would be
+unshippable and an opt-in one would protect no deployment an operator actually runs. When provider
+support is common, this becomes the standards-track answer to the audience-confusion residual, layered
+on the shipped ID-token mode without changing it. Until then the mitigation is a distinct `client_id`
+per deployment.

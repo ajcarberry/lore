@@ -229,35 +229,6 @@ fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> 
         ));
     }
 
-    if let Some(resource) = oidc.resource.as_deref() {
-        validate_resource_indicator(resource)?;
-    }
-
-    Ok(())
-}
-
-/// RFC 8707 §2 on `server.auth.oidc.resource`: "Its value MUST be an absolute URI,
-/// as specified by Section 4.3 of [RFC3986]. The URI MUST NOT include a fragment
-/// component." A query component is permitted, since §2 only says clients SHOULD
-/// NOT include one.
-///
-/// Checked at start-up because a malformed indicator otherwise pins the server to
-/// an audience no provider will ever mint: every login succeeds and every request
-/// is refused.
-fn validate_resource_indicator(resource: &str) -> Result<(), config::ConfigError> {
-    let malformed = |reason: &str| {
-        config::ConfigError::Message(format!(
-            "server.auth.oidc.resource '{resource}' is not a usable RFC 8707 resource \
-             indicator: {reason}. Use an absolute URI identifying this deployment, \
-             for example 'https://lore.example.com'"
-        ))
-    };
-
-    let url = reqwest::Url::parse(resource).map_err(|e| malformed(&e.to_string()))?;
-    if url.fragment().is_some() {
-        return Err(malformed("RFC 8707 §2 forbids a fragment component"));
-    }
-
     Ok(())
 }
 
@@ -299,16 +270,6 @@ pub struct OidcSettings {
     /// startup validation, because no other mode is implemented.
     #[serde(default)]
     pub authorize_all_repositories: bool,
-    /// This deployment's own identifier, as an
-    /// [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource indicator —
-    /// for example `https://lore.example.com`.
-    ///
-    /// Setting it turns on resource-bound mode: the server requires an
-    /// [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) JWT access token whose
-    /// `aud` names this value, instead of an ID token whose `aud` names the client
-    /// id. It requires a provider that honors resource indicators; leaving it unset
-    /// keeps the ID-token behavior.
-    pub resource: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -721,85 +682,6 @@ mod tests {
             let settings: Settings = toml::from_str(CONFIG).expect("parses");
 
             assert!(validate_oidc_config(&settings).is_ok());
-        }
-
-        /// RFC 8707 §2 constrains a resource indicator's syntax, and a malformed
-        /// one pins the server to an audience no provider will ever mint.
-        mod resource_indicator {
-            use super::*;
-
-            #[test]
-            fn an_absolute_uri_is_accepted() {
-                for resource in [
-                    "https://lore.example.com",
-                    "https://lore.example.com/team",
-                    "http://127.0.0.1:8080",
-                    "urn:example:lore",
-                ] {
-                    validate_resource_indicator(resource)
-                        .unwrap_or_else(|e| panic!("'{resource}' is a valid indicator: {e}"));
-                }
-            }
-
-            /// RFC 8707 §2: "Its value MUST be an absolute URI".
-            #[test]
-            fn a_relative_reference_is_rejected() {
-                for resource in ["lore.example.com", "/lore", ""] {
-                    let error = validate_resource_indicator(resource)
-                        .expect_err("a relative reference is not a resource indicator");
-                    assert!(error.to_string().contains("resource"), "{error}");
-                }
-            }
-
-            /// RFC 8707 §2: "The URI MUST NOT include a fragment component."
-            #[test]
-            fn a_fragment_is_rejected() {
-                let error = validate_resource_indicator("https://lore.example.com#team")
-                    .expect_err("§2 forbids a fragment");
-                assert!(error.to_string().contains("fragment"), "{error}");
-            }
-
-            /// RFC 8707 §2 only says a client SHOULD NOT send a query component.
-            #[test]
-            fn a_query_component_is_permitted() {
-                validate_resource_indicator("https://lore.example.com?tenant=studio")
-                    .expect("§2 permits a query component where it is necessary");
-            }
-
-            #[test]
-            fn a_malformed_resource_fails_startup_validation() {
-                const CONFIG: &str = r#"
-                    [server]
-                    runtime_shutdown_timeout_seconds = 0
-
-                    [server.auth.oidc]
-                    issuer = "https://id.example.com"
-                    client_id = "lore"
-                    authorize_all_repositories = true
-                    resource = "lore.example.com"
-
-                    [immutable_store]
-                    mode = "local"
-
-                    [immutable_store.local]
-                    path = "/tmp/immutable"
-                    flush_delay_seconds = 5
-
-                    [mutable_store]
-                    mode = "local"
-
-                    [mutable_store.local]
-                    path = "/tmp/mutable"
-                    flush_delay_seconds = 5
-                "#;
-                let settings: Settings = toml::from_str(CONFIG).expect("parses");
-
-                let error = validate_oidc_config(&settings).expect_err("must fail closed");
-                assert!(
-                    error.to_string().contains("server.auth.oidc.resource"),
-                    "{error}"
-                );
-            }
         }
     }
 

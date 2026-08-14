@@ -21,6 +21,7 @@ mod oidc_auth_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use lore_base::runtime::LORE_CONTEXT;
     use lore_server::auth::jwk::JWKService;
     use lore_server::auth::jwk::JWKServiceSettings;
     use lore_server::auth::jwk::JwkServiceImpl;
@@ -33,6 +34,7 @@ mod oidc_auth_tests {
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
     use crate::common::oidc::oidc_common;
+    use crate::setup_execution;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -40,27 +42,33 @@ mod oidc_auth_tests {
         Arc<dyn lore_storage::ImmutableStore>,
         Arc<dyn lore_storage::MutableStore>,
     ) {
-        let backend_immutable = lore_storage::local::immutable_store::create(
-            None::<&str>,
-            ImmutableStoreCreateOptions::none(),
-            false,
-            ImmutableStoreSettings {
-                implicit_durable_stored: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let backend_immutable = lore_storage::local::immutable_store::create(
+                    None::<&str>,
+                    ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings {
+                        implicit_durable_stored: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
 
-        let backend_mutable = lore_storage::local::mutable_store::create(
-            None::<&str>,
-            lore_storage::MutableStoreSettings::default(),
-            backend_immutable.clone(),
-        )
-        .await
-        .unwrap();
+                let backend_mutable: Arc<dyn lore_storage::MutableStore> =
+                    lore_storage::local::mutable_store::create(
+                        None::<&str>,
+                        lore_storage::MutableStoreSettings::default(),
+                        backend_immutable.clone(),
+                    )
+                    .await
+                    .unwrap();
 
-        (backend_immutable, backend_mutable)
+                (backend_immutable, backend_mutable)
+            })
+            .await
     }
 
     /// A `JwtVerifier` pointed at `PocketID`'s real JWKS, discovered rather than hardcoded.
@@ -383,6 +391,7 @@ mod oidc_auth_grpc_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use lore_base::runtime::LORE_CONTEXT;
     use lore_proto::lore::storage::v1::QueryRequest;
     use lore_proto::lore::storage::v1::storage_service_client::StorageServiceClient;
     use lore_revision::environment::EnvironmentConfig;
@@ -401,6 +410,7 @@ mod oidc_auth_grpc_tests {
     use tonic::transport::Channel;
 
     use crate::common::oidc::oidc_common;
+    use crate::setup_execution;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -408,29 +418,35 @@ mod oidc_auth_grpc_tests {
         Arc<dyn lore_storage::ImmutableStore>,
         Arc<dyn lore_storage::MutableStore>,
     ) {
-        let backend_immutable = lore_storage::local::immutable_store::create(
-            None::<&str>,
-            ImmutableStoreCreateOptions::none(),
-            false,
-            ImmutableStoreSettings {
-                allow_partial_fragment: false,
-                protect_local_fragment: false,
-                implicit_durable_stored: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let backend_immutable = lore_storage::local::immutable_store::create(
+                    None::<&str>,
+                    ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings {
+                        allow_partial_fragment: false,
+                        protect_local_fragment: false,
+                        implicit_durable_stored: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
 
-        let backend_mutable = lore_storage::local::mutable_store::create(
-            None::<&str>,
-            lore_storage::MutableStoreSettings::default(),
-            backend_immutable.clone(),
-        )
-        .await
-        .unwrap();
+                let backend_mutable: Arc<dyn lore_storage::MutableStore> =
+                    lore_storage::local::mutable_store::create(
+                        None::<&str>,
+                        lore_storage::MutableStoreSettings::default(),
+                        backend_immutable.clone(),
+                    )
+                    .await
+                    .unwrap();
 
-        (backend_immutable, backend_mutable)
+                (backend_immutable, backend_mutable)
+            })
+            .await
     }
 
     /// Same discovery-driven construction as the HTTP half.

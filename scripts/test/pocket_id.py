@@ -104,23 +104,34 @@ class PocketIdClient:
             ) from e
 
     def wait_until_ready(self, retries: int = 30, delay: float = 1.0) -> None:
-        """Poll /healthz until the container serves. Compose's healthcheck already
-        gates startup, but a manually started container has nothing waiting on it."""
+        """Wait until PocketID serves and accepts the admin API key.
+
+        /healthz answering does not mean the STATIC_API_KEY admin has been
+        provisioned, so an admin call issued at healthz can still get a 401. Both
+        conditions are polled: the readiness contract every caller relies on is
+        that the admin API works, not just that the port is open."""
+        healthy = False
         for attempt in range(1, retries + 1):
             try:
-                self._request("GET", "/healthz")
+                if not healthy:
+                    self._request("GET", "/healthz")
+                    healthy = True
+                # An authenticated read the admin user is provisioned for. A 401
+                # here means the admin does not exist yet; anything else means the
+                # key is accepted and the API is usable.
+                self._request("GET", "/api/oidc/clients", admin=True)
                 logger.info("PocketID ready on attempt %d", attempt)
                 return
-            except (PocketIdError, OSError, json.JSONDecodeError) as e:
-                # /healthz answers 204 with no body, so a JSON decode error means
-                # it answered — that is ready, not a failure.
-                if isinstance(e, json.JSONDecodeError):
-                    return
+            except json.JSONDecodeError:
+                # /healthz answers 204 with no body, so a decode error is the
+                # healthz probe answering. Fall through to the admin probe.
+                healthy = True
+            except (PocketIdError, OSError) as e:
                 logger.debug("PocketID not ready on attempt %d: %s", attempt, e)
             sleep(delay)
 
         raise PocketIdError(
-            f"PocketID at {self.base_url} did not become healthy. Start it with: "
+            f"PocketID at {self.base_url} did not become ready. Start it with: "
             "docker compose --file lore-integration-tests/compose.yaml up --detach pocket-id"
         )
 

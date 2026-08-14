@@ -29,7 +29,6 @@ use super::repository_query::repository_query_name;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
-use crate::authnz::repository_authorizer::is_auth_client_scheme;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -236,9 +235,7 @@ async fn repository_create(
         };
     }
 
-    // `auth_url` also carries the OIDC provider's advertisement URL, so only a
-    // `ucs-auth`/`https` value names the `ReBAC` service this call registers with.
-    if let Some(auth_url) = auth_url.filter(|url| is_auth_client_scheme(url)) {
+    if let Some(auth_url) = auth_url {
         let client = Box::new(grpc_get_rebac_client(auth_url).await?);
         repository_create_auth_resource(client, authorization, repository.id, name).await?;
     }

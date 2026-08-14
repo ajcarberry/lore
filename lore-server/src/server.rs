@@ -576,27 +576,29 @@ async fn launch_grpc_server(
         environment.config = Some(config);
     }
 
-    // Advertisement only, so the derived URL is applied to a clone: `environment`
-    // is also what internal consumers read (the `ReBAC` dial target for repository
-    // create/delete), and a derived `oidc+https://…` string is not a service any of
-    // them can dial.
-    let mut advertised_environment = environment.clone();
-    if let Some(oidc) = settings
+    // Applied only in the `EnvironmentGet` response (never to `environment`, which is
+    // what internal consumers read — the `ReBAC` dial target for repository
+    // create/delete): a derived `oidc+https://…` string is not a service any of them
+    // can dial. `None` unless `[server.auth.oidc]` is set and the operator left
+    // `environment.endpoint.auth_url` empty.
+    let advertised_auth_url = settings
         .server
         .auth
         .as_ref()
         .and_then(|auth| auth.oidc.as_ref())
-    {
-        let mut endpoint = advertised_environment.endpoint.unwrap_or_default();
-        if endpoint.auth_url.as_deref().unwrap_or_default().is_empty() {
-            endpoint.auth_url = derive_oidc_auth_url(oidc);
-        }
-        advertised_environment.endpoint = Some(endpoint);
-    }
+        .filter(|_| {
+            environment
+                .endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.auth_url.as_deref())
+                .unwrap_or_default()
+                .is_empty()
+        })
+        .and_then(derive_oidc_auth_url);
 
     GrpcServerBuilder::new()
         .with_environment(environment)
-        .with_advertised_environment(advertised_environment)
+        .with_advertised_auth_url(advertised_auth_url)
         .with_feature(feature)
         .with_immutable_store(immutable_store, local_store)
         .with_mutable_store(mutable_store)

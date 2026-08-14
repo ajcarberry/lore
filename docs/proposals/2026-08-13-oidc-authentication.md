@@ -87,6 +87,12 @@ natural next step for anyone adopting Lore, not a niche request, and nothing in 
 
 - **Per-repository authorization from provider claims or groups.** No standard claim carries it, and
   mapping one is a design of its own; a follow-up LEP owns it.
+- **Deferring per-repository checks to an authorization service under OIDC.** Authentication (which
+  identity a token proves) and authorization (which repositories that identity may touch) are separate
+  axes: an OIDC deployment may still point `environment.endpoint.auth_url` at Epic's
+  relationship-based authorization service, and this proposal keeps `authorize_all_repositories = true`
+  the only supported OIDC mode. Extending `authorize_all_repositories = false` to route per-repository
+  checks to that service is a follow-up LEP; it is **not** implemented here.
 - **Replacing or removing `ucs-auth`.** The two schemes coexist in the registry, and Epic's
   deployment is unaffected.
 - **Server-minted tokens or token exchange.** Lore issues nothing and signs nothing.
@@ -203,12 +209,11 @@ revisiting seven call sites.
 
 **Repository delete is the one operation this mode does not reach.** It is the only repository
 operation whose authorization does not run through `verify_authorization`: it asks the
-relationship-based authorization service when `auth_url` names one, and otherwise checks that the
-caller is the repository's recorded creator. Under OIDC it takes that second path, so delete runs
-*narrower* than the grant — the safer of two answers rather than a designed one, since dialing the
-identity provider as though it were the authorization service is not an option, and letting any
-identity delete any repository as a side effect of a scheme check is wider than this proposal argues
-for anywhere else. **Unresolved Questions** asks which it should settle into.
+relationship-based authorization service when one is configured, and otherwise checks that the
+caller is the repository's recorded creator. Under OIDC alone no authorization service is configured,
+so delete takes that second path and runs *narrower* than the grant — the safer of two answers rather
+than a designed one, since letting any verified identity delete any repository is wider than this
+proposal argues for anywhere else. **Unresolved Questions** asks which it should settle into.
 
 ### The enforcement points (Goal 4)
 
@@ -247,20 +252,17 @@ unchanged, which matters because issuer validation is a byte comparison. The `cl
 safe to append, an issuer identifier being forbidden a query or fragment component (Discovery §2),
 and is not a secret, this being a public client using PKCE.
 
-**The server reads this field too, in six places**, and every one of them wants a dial target for
-Epic's relationship-based authorization service, so advertising an `oidc+https://…` URL unguarded
-would point all six at the identity provider and fail repository create, delete, query, list, and
-metadata alike. Two mechanisms keep advertisement and dialing apart, and the design needs both. The
-derived URL never reaches an internal consumer, because the server derives the advertisement into a
-clone: the configured environment stays what internal consumers read, leaving their dial target
-`None` for a deployment configuring OIDC and nothing else. And each consumer gates on the scheme as
-well, because an operator may still set `auth_url` by hand. `is_auth_client_scheme` is that single
-predicate, written as an exclusion rather than an allowlist: an `oidc+` scheme gives up the
-authorization check and **every other scheme keeps it**. An allowlist would silently drop the check
-for any deployment spelling its auth URL differently — plain `http` to a service behind a mesh being
-the obvious one — and a dropped authorization check is the failure nobody notices from outside,
-because every operation still succeeds. That the prefix makes these two cases distinguishable at all
-is the strongest argument against putting a bare issuer URL in the field.
+**Advertisement is the only thing that ever sees the derived URL.** The server also reads `auth_url`
+internally as a dial target for Epic's relationship-based authorization service — repository create,
+delete, and list each dial it — so an `oidc+https://…` string reaching any of those would point it at
+the identity provider and fail the operation. The design keeps that impossible by construction rather
+than by guarding each reader: the login URL is derived and applied *only* in the `EnvironmentGet`
+response, set on the outgoing `Environment` clone and never written back to the `environment` internal
+consumers read. For a deployment configuring OIDC and nothing else, that internal `auth_url` stays
+empty, so every consumer's dial target is `None` and no per-consumer scheme test exists. Authorization
+then keys on whether an authorization service is configured, not on how a URL is spelled: a configured
+`auth_url` is always a real authorization service, because the one string that is not — the derived
+OIDC login URL — appears at the response boundary and nowhere else.
 
 ### The client implementation (Goal 5)
 
@@ -389,10 +391,10 @@ implementation**. Goal 6 → **Keeping the token-recipient guard**. Goal 7 → *
 - **Rust crate surfaces** — Four changes, none altering an existing behavior and none crossing the C
   or JavaScript boundary. `JWTUserInfo.name` becomes `Option<String>`, strictly widening what
   deserializes. `Authentication::start_auth_session` gains a `LoginFlow` argument whose value comes
-  from the existing `--no-browser` flag. The gRPC server builder takes the advertised environment as
-  a second argument, and passing the same value twice is today's behavior. `repository_authorizer`
-  keeps its signature and changes its selection rule to "a scheme this server implements an
-  authorization client for", identical for every deployment today.
+  from the existing `--no-browser` flag. The gRPC server builder gains a `with_advertised_auth_url`
+  step carrying the derived OIDC login URL, an `Option<String>` that is `None` for every deployment
+  today. `repository_authorizer` keeps both its signature and its rule — an authorization client for a
+  configured `auth_url`, allow-all without one — unchanged from today.
 
 - **Configuration** — Additive and backward-compatible. `[server.auth.oidc]` is a new optional block,
   and the three existing `AuthSettings` fields keep their meanings when set explicitly. One new
@@ -551,8 +553,10 @@ clear` already remove stored tokens, and refresh tokens go with them.
   provider — *materialized during implementation:* the design assumed one such consumer and there are
   six, because repository create and delete each have two independent implementations that dial the
   service themselves, and repository list dials it to enumerate what a user may see. *Mitigation, as
-  shipped:* the two mechanisms in **Advertising the provider**, plus integration and end-to-end
-  coverage against a live provider, which is what turned a design assumption into a caught bug.
+  shipped:* the derived URL is confined to the `EnvironmentGet` response boundary and never enters the
+  environment internal consumers read (see **Advertising the provider**), so no consumer can receive
+  it, however many there are; plus integration and end-to-end coverage against a live provider, which
+  is what turned a design assumption into a caught bug.
 - **Risk:** two deployments sharing an issuer and client id share one credential-store bucket, so
   logging in to one evicts the other's token — *mitigation:* a distinct `client_id` per deployment
   gives distinct auth URLs and distinct buckets; documented in the operator guide.

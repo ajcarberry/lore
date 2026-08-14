@@ -22,7 +22,6 @@ use tracing::info;
 
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
-use crate::authnz::repository_authorizer::is_auth_client_scheme;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -75,10 +74,7 @@ pub async fn handler(
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
-            // A `ucs-auth`/`https` auth_url defers to the external `ReBAC` service; any
-            // other scheme falls through to the creator-ownership check used when none
-            // is configured.
-            if let Some(auth_url) = auth_url.filter(|url| is_auth_client_scheme(url)) {
+            if let Some(auth_url) = auth_url {
                 repository_delete_auth_resource(auth_url, authorization, id).await?;
             } else if metadata.creator != user_id && !bypass_protection {
                 info!(
@@ -153,81 +149,4 @@ pub async fn handler(
             }))
         })
         .await
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_revision::repository::RepositoryMetadata;
-
-    use super::*;
-    use crate::store::test_store_create;
-
-    const REPOSITORY_ID: [u8; 16] = [7u8; 16];
-    const CREATOR: &str = "the-oidc-subject";
-
-    struct TestInstrumentProvider;
-
-    impl InstrumentProvider for TestInstrumentProvider {
-        fn namespace(&self) -> &'static str {
-            "test"
-        }
-    }
-
-    async fn seed_repository(
-        immutable: Arc<dyn lore_storage::ImmutableStore>,
-        mutable: Arc<dyn lore_storage::MutableStore>,
-    ) {
-        let repository = Arc::new(RepositoryContext::new_server_context(
-            immutable,
-            mutable,
-            Context::from(REPOSITORY_ID).into(),
-        ));
-        let hash = repository::metadata_store(
-            repository.clone(),
-            RepositoryMetadata {
-                name: "test".to_string(),
-                creator: CREATOR.to_string(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        repository::metadata_store_hash(repository, hash)
-            .await
-            .unwrap();
-    }
-
-    /// An `oidc+` auth URL names an identity provider, not a relationship-based
-    /// authorization service, so the creator-ownership check is what governs the
-    /// delete. Dropping the scheme filter sends the delete to a gRPC endpoint that
-    /// is not there.
-    #[tokio::test]
-    async fn an_oidc_auth_url_keeps_the_delete_on_the_creator_check() {
-        let (immutable, mutable, execution) = test_store_create().await.unwrap();
-        LORE_CONTEXT
-            .scope(execution, async {
-                seed_repository(immutable.clone(), mutable.clone()).await;
-            })
-            .await;
-
-        let mut request = Request::new(RepositoryDeleteRequest {
-            id: bytes::Bytes::from(lore_base::types::Context::from(REPOSITORY_ID)),
-        });
-        request
-            .extensions_mut()
-            .insert(crate::auth::jwt::AuthorizationToken {
-                user_id: CREATOR.to_string(),
-                ..Default::default()
-            });
-
-        handler(
-            request,
-            Some("oidc+https://id.example.com".to_string()),
-            immutable,
-            mutable,
-            &TestInstrumentProvider,
-        )
-        .await
-        .expect("the creator deletes their own repository without an authorization service");
-    }
 }

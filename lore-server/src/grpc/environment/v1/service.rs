@@ -58,13 +58,21 @@ fn environment_to_proto(
 #[derive(Clone)]
 pub struct LoreEnvironmentV1Service {
     environment: Environment,
+    /// OIDC login URL to advertise when the environment carries no `auth_url` of its
+    /// own. Derived from `[server.auth.oidc]` and applied only in the `EnvironmentGet`
+    /// response, so the `oidc+https://…` string never reaches an internal consumer.
+    advertised_auth_url: Option<String>,
     maintenance: bool,
 }
 
 impl LoreEnvironmentV1Service {
-    pub fn new(environment: lore_revision::environment::EnvironmentConfig) -> Self {
+    pub fn new(
+        environment: lore_revision::environment::EnvironmentConfig,
+        advertised_auth_url: Option<String>,
+    ) -> Self {
         Self {
             environment: environment_to_proto(&environment),
+            advertised_auth_url,
             maintenance: false,
         }
     }
@@ -72,6 +80,7 @@ impl LoreEnvironmentV1Service {
     pub fn maintenance(environment: lore_revision::environment::EnvironmentConfig) -> Self {
         Self {
             environment: environment_to_proto(&environment),
+            advertised_auth_url: None,
             maintenance: true,
         }
     }
@@ -87,8 +96,15 @@ impl EnvironmentService for LoreEnvironmentV1Service {
         if self.maintenance {
             return Err(Status::unavailable("Server is in maintenance"));
         }
+        let mut environment = self.environment.clone();
+        if let Some(auth_url) = &self.advertised_auth_url {
+            let endpoint = environment.endpoint.get_or_insert_with(Default::default);
+            if endpoint.auth_url.is_empty() {
+                endpoint.auth_url = auth_url.clone();
+            }
+        }
         Ok(Response::new(EnvironmentGetResponse {
-            environment: Some(self.environment.clone()),
+            environment: Some(environment),
         }))
     }
 }

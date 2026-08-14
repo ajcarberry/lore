@@ -123,25 +123,46 @@ pub(crate) mod oidc_common {
             format!("{}{path}", self.base_url)
         }
 
-        /// Polls `/healthz` until the container serves, since a manually started container
-        /// has no `depends_on` gate.
+        /// Waits until the container serves and accepts the admin API key. `/healthz`
+        /// answering does not mean the static admin has been provisioned, so an admin call
+        /// issued at healthz can still get a 401 — both conditions are polled.
         async fn wait_until_ready(&self) -> Result<(), Box<dyn Error + 'static>> {
+            let mut healthy = false;
             for attempt in 1..=30 {
-                match self.client.get(self.url("/healthz")).send().await {
-                    Ok(response) if response.status().is_success() => return Ok(()),
-                    Ok(response) => {
-                        info!(
+                if !healthy {
+                    match self.client.get(self.url("/healthz")).send().await {
+                        Ok(response) if response.status().is_success() => healthy = true,
+                        Ok(response) => info!(
                             "PocketID health check returned {} on attempt {attempt}",
                             response.status()
-                        );
+                        ),
+                        Err(e) => info!("PocketID not reachable on attempt {attempt}: {e}"),
                     }
-                    Err(e) => info!("PocketID not reachable on attempt {attempt}: {e}"),
+                }
+                if healthy {
+                    // An authenticated read the admin user is provisioned for. A 401 means
+                    // the admin does not exist yet; anything else means the key is accepted.
+                    match self
+                        .client
+                        .get(self.url("/api/oidc/clients"))
+                        .header("X-API-KEY", API_KEY)
+                        .send()
+                        .await
+                    {
+                        Ok(response) if response.status() != reqwest::StatusCode::UNAUTHORIZED => {
+                            return Ok(());
+                        }
+                        Ok(_) => info!("PocketID admin API not ready on attempt {attempt}"),
+                        Err(e) => {
+                            info!("PocketID admin API not reachable on attempt {attempt}: {e}")
+                        }
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
 
             Err(anyhow::anyhow!(
-                "PocketID at {} did not become healthy. Start it with: \
+                "PocketID at {} did not become ready. Start it with: \
                  docker compose --file lore-integration-tests/compose.yaml up --detach pocket-id",
                 self.base_url
             )

@@ -171,19 +171,31 @@ impl GrpcServerBuilder<WantsEnvironment> {
     pub fn new() -> Self {
         Self(WantsEnvironment(()))
     }
-    /// `environment` is what internal consumers read for a dialable endpoint;
-    /// `advertised_environment` is what `EnvironmentGet` returns to clients. They start
-    /// equal but diverge when `[server.auth.oidc]` derives an `auth_url`, which is for
-    /// advertisement only and must never reach an internal consumer.
+    /// Sets the environment internal consumers read and, by default, the one
+    /// `EnvironmentGet` advertises to clients. Override the advertised copy with
+    /// [`GrpcServerBuilder::<WantsFeature>::with_advertised_environment`] where they must
+    /// differ: `[server.auth.oidc]` derives an `auth_url` for advertisement only, which
+    /// must never reach an internal consumer.
     pub fn with_environment(
         self,
         environment: EnvironmentConfig,
-        advertised_environment: EnvironmentConfig,
     ) -> GrpcServerBuilder<WantsFeature> {
         GrpcServerBuilder(WantsFeature {
+            advertised_environment: environment.clone(),
             environment,
-            advertised_environment,
         })
+    }
+}
+
+impl GrpcServerBuilder<WantsFeature> {
+    /// Overrides the environment advertised to clients, leaving the one internal consumers
+    /// read unchanged.
+    pub fn with_advertised_environment(
+        mut self,
+        advertised_environment: EnvironmentConfig,
+    ) -> Self {
+        self.0.advertised_environment = advertised_environment;
+        self
     }
 }
 

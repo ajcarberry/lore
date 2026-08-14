@@ -1,19 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Integration tests for OIDC-secured server mode, exercised against a real `PocketID`
-//! instance.
+//! Integration tests for OIDC-secured server mode, against a real `PocketID` instance.
 //!
-//! A real `JwtVerifier` (`lore_server::auth::jwt`) is pointed at the `PocketID` instance in
-//! `lore-integration-tests/compose.yaml`, following the discovery document rather than a
-//! hardcoded JWKS path, and wired into an in-process gRPC or HTTP server. The verifier is
-//! constructed here rather than through `build_jwt_verifier`
-//! (`lore-server/src/server.rs`), so it carries a bare `JwkServiceImpl` without the
-//! `OidcJwkService` wrap production adds. Whether that wrap survives is asserted in
+//! Builds `JwtVerifier` (`lore_server::auth::jwt`) from the `PocketID` discovery document
+//! rather than a hardcoded JWKS path, wired into an in-process gRPC or HTTP server. Unlike
+//! production's `build_jwt_verifier` (`lore-server/src/server.rs`), this carries a bare
+//! `JwkServiceImpl` with no `OidcJwkService` wrap; that wrap is covered by
 //! `build_jwt_verifier`'s own unit tests.
 //!
-//! Attaching an arbitrary bearer token needs the raw generated gRPC clients, so
-//! `integration_tests` activates the optional `tonic`/`tokio-stream` dependencies and the
-//! whole matrix below runs under that feature alone.
+//! Runs only under the `integration_tests` feature, which also pulls in the raw gRPC
+//! clients needed to attach an arbitrary bearer token.
 
 #[cfg(all(test, feature = "integration_tests"))]
 mod oidc_auth_tests {
@@ -86,10 +82,8 @@ mod oidc_auth_tests {
             endpoint: jwks_uri,
         }));
 
-        // `[server.auth.oidc]`'s authn-only mode — the premise this whole matrix
-        // tests against — over a bare `JwkServiceImpl`. Production reaches the same
-        // mode through `build_jwt_verifier` (`lore-server/src/server.rs`), which
-        // additionally wraps the key service in `OidcJwkService`.
+        // Authn-only mode — this matrix's premise — over a bare `JwkServiceImpl`; production
+        // additionally wraps the key service in `OidcJwkService` via `build_jwt_verifier`.
         Ok(JwtVerifier::oidc(
             jwk_service,
             Some(fixture.issuer().to_string()),
@@ -144,9 +138,8 @@ mod oidc_auth_tests {
         (base_url, shutdown_tx)
     }
 
-    /// The route under the authenticated router with the fewest preconditions. The
-    /// repository id only has to be valid hex: the auth middleware runs, and decides,
-    /// before the handler ever parses it.
+    /// The authenticated route with the fewest preconditions: the repository id only
+    /// needs valid hex, since auth runs before the handler parses it.
     fn put_content_url(base_url: &str) -> String {
         let repository_id = lore_base::types::Context::from([0xacu8; 16]);
         format!("{base_url}/v1/repository/{repository_id}/content")
@@ -251,9 +244,9 @@ mod oidc_auth_tests {
         Ok(())
     }
 
-    /// In authn-only mode `JwtVerifier` populates the existing `urc-*` wildcard resource
-    /// onto the in-process `AuthorizationToken` once a token verifies, leaving
-    /// `verify_authorization` unchanged. Asserts the end behavior only.
+    /// In authn-only mode, a verified token gets the `urc-*` wildcard resource on the
+    /// in-process `AuthorizationToken`, leaving `verify_authorization` unchanged; this
+    /// asserts the end behavior only.
     #[tokio::test]
     async fn http_valid_pocketid_token_is_accepted_for_repository_operations() -> TestResult {
         let fixture = oidc_common::setup().await?;
@@ -284,8 +277,8 @@ mod oidc_auth_tests {
         Ok(())
     }
 
-    /// Quick regression: an unconfigured server (`jwt_verifier: None`) must keep behaving
-    /// exactly as it does today, on the same route the tests above exercise.
+    /// Regression: an unconfigured server (`jwt_verifier: None`) must behave unchanged on
+    /// the same route the tests above exercise.
     #[tokio::test]
     async fn http_unconfigured_server_is_unchanged() -> TestResult {
         let (base_url, _shutdown) = start_http_server(None).await;
@@ -304,9 +297,9 @@ mod oidc_auth_tests {
         Ok(())
     }
 
-    /// The algorithm-confusion forgery against a real `PocketID` key: sign an HS256 token
-    /// using a published RSA key's own modulus as the HMAC secret. `jwk.rs` proves the same
-    /// defense against a synthetic key.
+    /// Algorithm-confusion forgery against a real `PocketID` key: an HS256 token signed
+    /// using a published RSA key's own modulus as the HMAC secret. `jwk.rs` proves the
+    /// same defense synthetically.
     async fn algorithm_confusion_forged_token(
         fixture: &oidc_common::OidcFixture,
         audience: &str,
@@ -351,8 +344,8 @@ mod oidc_auth_tests {
         )?)
     }
 
-    /// A self-signed forgery naming a key id `PocketID` never served and an issuer it never
-    /// claimed, standing in for a token from a second provider.
+    /// A self-signed forgery naming an unknown kid and issuer, standing in for a token
+    /// from another provider.
     fn forged_token_with_unknown_kid() -> String {
         use jsonwebtoken::Algorithm;
         use jsonwebtoken::EncodingKey;
@@ -380,9 +373,9 @@ mod oidc_auth_tests {
     }
 }
 
-/// Raw-tonic gRPC coverage of the same matrix, against `StorageService` — the enforcement
-/// point that actually calls `verify_authorization` today (`RepositoryService` runs behind
-/// the still-unfinished `JWTAuthnInterceptor` placeholder and never calls it).
+/// Raw-tonic gRPC coverage of the same matrix, against `StorageService`: the enforcement
+/// point that calls `verify_authorization` today (`RepositoryService` sits behind the
+/// unfinished `JWTAuthnInterceptor` and doesn't).
 #[cfg(all(test, feature = "integration_tests"))]
 mod oidc_auth_grpc_tests {
     use std::collections::HashMap;
@@ -464,10 +457,8 @@ mod oidc_auth_grpc_tests {
             endpoint: jwks_uri,
         }));
 
-        // `[server.auth.oidc]`'s authn-only mode — the premise this whole matrix
-        // tests against — over a bare `JwkServiceImpl`. Production reaches the same
-        // mode through `build_jwt_verifier` (`lore-server/src/server.rs`), which
-        // additionally wraps the key service in `OidcJwkService`.
+        // Authn-only mode — this matrix's premise — over a bare `JwkServiceImpl`; production
+        // additionally wraps the key service in `OidcJwkService` via `build_jwt_verifier`.
         Ok(JwtVerifier::oidc(
             jwk_service,
             Some(fixture.issuer().to_string()),
@@ -475,8 +466,8 @@ mod oidc_auth_grpc_tests {
         ))
     }
 
-    /// Start a real gRPC server, in process, with a caller-supplied verifier so
-    /// `StorageService` is reached through `JWTInterceptor` when `Some`.
+    /// Starts a real gRPC server in process; a `Some` verifier routes `StorageService`
+    /// through `JWTInterceptor`.
     async fn start_grpc_server(
         jwt_verifier: Option<JwtVerifier>,
     ) -> (String, tokio::sync::oneshot::Sender<()>) {
@@ -499,7 +490,7 @@ mod oidc_auth_grpc_tests {
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default(), EnvironmentConfig::default())
+                .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
                 .with_immutable_store(backend_immutable.clone(), backend_immutable)
                 .with_mutable_store(backend_mutable)
@@ -550,13 +541,13 @@ mod oidc_auth_grpc_tests {
     }
 
     /// An empty `Query` — the lightest unary call `StorageService` exposes — optionally
-    /// bearing a token. The repository id metadata is always set because the `Query` handler
-    /// answers `InvalidArgument` without it, which would be a false rejection signal.
+    /// bearing a token; repository id metadata is always set, since its absence gives
+    /// `InvalidArgument`, a false rejection signal.
     fn query_request(token: Option<&str>) -> Request<QueryRequest> {
         let mut request = Request::new(QueryRequest { addresses: vec![] });
 
-        // `lore_transport::grpc::PARTITION_ID_KEY`, inlined because `lore-transport` is
-        // not a dependency of this crate.
+        // `lore_transport::grpc::PARTITION_ID_KEY`, inlined since `lore-transport` isn't a
+        // dependency here.
         const PARTITION_ID_KEY: &str = "lore-partition-bin";
         let repository = lore_base::types::Partition::from([0xacu8; 16]);
         let repository_id = MetadataValue::from_bytes(repository.data());
@@ -677,8 +668,8 @@ mod oidc_auth_grpc_tests {
         Ok(())
     }
 
-    /// An unconfigured server (`jwt_verifier: None`) must keep admitting anonymous
-    /// requests to `StorageService`.
+    /// An unconfigured server (`jwt_verifier: None`) must keep admitting anonymous requests
+    /// to `StorageService`.
     #[tokio::test]
     async fn grpc_unconfigured_server_is_unchanged() -> TestResult {
         let (url, _shutdown) = start_grpc_server(None).await;

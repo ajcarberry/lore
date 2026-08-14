@@ -595,7 +595,8 @@ async fn launch_grpc_server(
     }
 
     GrpcServerBuilder::new()
-        .with_environment(environment, advertised_environment)
+        .with_environment(environment)
+        .with_advertised_environment(advertised_environment)
         .with_feature(feature)
         .with_immutable_store(immutable_store, local_store)
         .with_mutable_store(mutable_store)

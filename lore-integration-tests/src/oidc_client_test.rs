@@ -7,7 +7,7 @@
 //! The client binds `127.0.0.1:0` per RFC 8252 §7.3, so the test client is registered once
 //! with the wildcard `http://127.0.0.1:*/callback`. `PocketID`'s only interactive login is a
 //! passkey ceremony, so `OidcFixture::follow_authorization_url` stands in for the browser.
-#[cfg(all(test, feature = "integration_tests"))]
+#[cfg(all(test, feature = "oidc_integration_tests"))]
 mod oidc_client_tests {
     use std::error::Error;
     use std::time::Duration;

@@ -41,5 +41,6 @@ lore-transport = { workspace = true }
 uuid = { workspace = true }
 
 [features]
-integration_tests = ["dep:tokio-stream", "dep:tonic"]
+integration_tests = []
+oidc_integration_tests = ["integration_tests", "dep:tokio-stream", "dep:tonic"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]

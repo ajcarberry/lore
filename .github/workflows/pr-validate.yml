@@ -125,7 +125,7 @@ jobs:
           AWS_REGION: us-east-1
         run: >
           cargo test --package lore-integration-tests
-          --features integration_tests --verbose
+          --features oidc_integration_tests --verbose
 
       - name: Dump service logs on failure
         if: failure()

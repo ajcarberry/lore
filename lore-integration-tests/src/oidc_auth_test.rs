@@ -11,7 +11,7 @@
 //! Runs only under the `integration_tests` feature, which also pulls in the raw gRPC
 //! clients needed to attach an arbitrary bearer token.
 
-#[cfg(all(test, feature = "integration_tests"))]
+#[cfg(all(test, feature = "oidc_integration_tests"))]
 mod oidc_auth_tests {
     use std::error::Error;
     use std::sync::Arc;
@@ -376,7 +376,7 @@ mod oidc_auth_tests {
 /// Raw-tonic gRPC coverage of the same matrix, against `StorageService`: the enforcement
 /// point that calls `verify_authorization` today (`RepositoryService` sits behind the
 /// unfinished `JWTAuthnInterceptor` and doesn't).
-#[cfg(all(test, feature = "integration_tests"))]
+#[cfg(all(test, feature = "oidc_integration_tests"))]
 mod oidc_auth_grpc_tests {
     use std::collections::HashMap;
     use std::error::Error;

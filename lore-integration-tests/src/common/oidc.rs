@@ -6,7 +6,7 @@
 //! admin API instead: a one-time access token substitutes for the passkey session cookie,
 //! which then drives the same `authorize` endpoint the web UI and device-grant approval use.
 //! Every token returned is minted and signed by the real `PocketID` instance.
-#[cfg(all(test, feature = "integration_tests"))]
+#[cfg(all(test, feature = "oidc_integration_tests"))]
 pub(crate) mod oidc_common {
     use std::error::Error;
 

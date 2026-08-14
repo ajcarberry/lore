@@ -3,24 +3,24 @@
 //! The client-side OIDC flows against a real provider.
 //!
 //! Everything here drives `lore_transport::auth::oidc::OidcAuthentication` through the
-//! `Authentication` trait, exactly as `lore login` does, against the PocketID container in
+//! `Authentication` trait, exactly as `lore login` does, against the `PocketID` container in
 //! `compose.yaml`. Nothing is stubbed: the discovery document, the authorization code, the
 //! PKCE verification, the device grant, and the refresh grant are all the provider's.
 //!
 //! Two harness problems are worth naming, because both are properties of the flows rather
 //! than of the tests.
 //!
-//! **The loopback port is dynamic, and PocketID validates redirect URIs.** RFC 8252 §7.3
+//! **The loopback port is dynamic, and `PocketID` validates redirect URIs.** RFC 8252 §7.3
 //! has the client bind `127.0.0.1:0` and let the kernel choose, so the redirect URI is not
 //! known until the flow starts — and no client registration written ahead of time can name
-//! it. PocketID accepts a wildcard in a callback URL, so the test client is registered once
+//! it. `PocketID` accepts a wildcard in a callback URL, so the test client is registered once
 //! with `http://127.0.0.1:*/callback` and every run's port matches it. That is the whole
 //! solution; no bind-then-register ordering is needed.
 //!
-//! **The test has to be the browser.** PocketID's only interactive login is a passkey
+//! **The test has to be the browser.** `PocketID`'s only interactive login is a passkey
 //! ceremony, so `OidcFixture::follow_authorization_url` stands in for the browser: it is
 //! handed the authorization URL the implementation produced, completes the consent leg over
-//! PocketID's JSON API, and returns the URL the provider would have redirected to. The test
+//! `PocketID`'s JSON API, and returns the URL the provider would have redirected to. The test
 //! then fetches that URL, which is what delivers the code to the implementation's loopback
 //! listener.
 #[cfg(all(test, feature = "integration_tests"))]
@@ -315,7 +315,7 @@ mod oidc_client_tests {
     /// an ordinary repository operation whose stored login has aged out. What the user sees
     /// is the operation going through; what they do not see is a browser.
     ///
-    /// Expiry is staged rather than waited for -- PocketID's token lifetimes are measured in
+    /// Expiry is staged rather than waited for -- `PocketID`'s token lifetimes are measured in
     /// hours. The client verifies no signatures (the server owns verification), so a stored
     /// token whose `exp` has been moved into the past is expired as far as every client-side
     /// check is concerned, which is the state this exercises.
@@ -467,9 +467,9 @@ mod oidc_client_tests {
             .expect("The passed-through token did not verify against the issuer's JWKS");
     }
 
-    /// **PocketID 2.6.2 does not implement RFC 8707.**
+    /// **`PocketID` 2.6.2 does not implement RFC 8707.**
     ///
-    /// The parameter is sent on every leg of the grant, and PocketID answers `200` to all
+    /// The parameter is sent on every leg of the grant, and `PocketID` answers `200` to all
     /// of them, ignores it, and mints an access token audienced to the client id with
     /// header `typ: "JWT"` — no `invalid_target`, no warning, nothing in the response that
     /// says the request was not honored. That silence is the reason the client checks the
@@ -479,7 +479,7 @@ mod oidc_client_tests {
     /// nowhere in sight.
     ///
     /// So this asserts the failure is the *right* failure — raised at login, naming what
-    /// the provider did not do. If PocketID gains RFC 8707 support, this test starts
+    /// the provider did not do. If `PocketID` gains RFC 8707 support, this test starts
     /// failing and should become the end-to-end success case.
     ///
     /// Requires the compose stack (see above).

@@ -145,7 +145,7 @@ mod tests {
             verify_jwt_usage_for_remote(&token, "my_test_issuer.example.com").unwrap();
         }
 
-        /// The mismatch that makes the JWT-derived set unusable for OpenID Connect: `aud`
+        /// The mismatch that makes the JWT-derived set unusable for `OpenID` Connect: `aud`
         /// carries a client id and `iss` a URL, and neither is a domain any remote could
         /// match, so every OIDC login would refuse its own token.
         #[test]

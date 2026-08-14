@@ -80,7 +80,7 @@ pub struct AuthorizationToken {
 
 /// The claim shape a provider-issued token is read into, in either OIDC mode.
 ///
-/// It demands only what RFC 7519 and OpenID Connect Core guarantee — `iss`,
+/// It demands only what RFC 7519 and `OpenID` Connect Core guarantee — `iss`,
 /// `sub`, `aud`, `exp`, `iat` — so a conformant ID token from any standard
 /// provider satisfies it, with `name`, `preferred_username`, and `email`
 /// accepted when present but never required.
@@ -199,7 +199,7 @@ pub enum JwtVerifierMode {
 /// opt-in: absent, the deployment accepts an ID token; present, it is strict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OidcAcceptance {
-    /// No `resource` configured: a conformant OpenID Connect ID token, whose
+    /// No `resource` configured: a conformant `OpenID` Connect ID token, whose
     /// `aud` is pinned to the client id. This is an authentication assertion
     /// presented as a bearer credential, so `aud` names the client rather than
     /// the server — which is why two deployments sharing an issuer and a client
@@ -399,7 +399,7 @@ impl JwtVerifier {
         // credential as a way around the stronger one — which is the whole
         // reason an operator configured `resource`.
         if self.mode == JwtVerifierMode::Oidc(OidcAcceptance::AccessToken) {
-            return self.verify_access_token(token, key, &validation);
+            return Self::verify_access_token(token, key, &validation);
         }
 
         if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {
@@ -461,7 +461,6 @@ impl JwtVerifier {
     ///    `OidcJwkService` has already refused every symmetric one;
     /// 6. `exp` has not passed — `validation.validate_exp`.
     fn verify_access_token(
-        &self,
         token: &str,
         key: &DecodingKey,
         validation: &Validation,
@@ -1244,7 +1243,7 @@ mod tests {
         }
 
         /// The third-and-final claim decode: reached only when the token carries
-        /// none of the Lore-specific claims, as a conformant OpenID Connect ID
+        /// none of the Lore-specific claims, as a conformant `OpenID` Connect ID
         /// token does. It must accept the RFC 7519 / OIDC-guaranteed minimum,
         /// accept the optional display claims when present, and still enforce
         /// every check `Validation` applies regardless of target shape.

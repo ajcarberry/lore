@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! OpenID Connect authentication for the `oidc+https` and `oidc+http` schemes.
+//! `OpenID` Connect authentication for the `oidc+https` and `oidc+http` schemes.
 //!
 //! The provider is named by the auth URL the server advertises through
 //! `EnvironmentEndpoint.auth_url`:
@@ -14,7 +14,7 @@
 //! matters because every issuer check in the design is a byte comparison: the value the
 //! operator configured, the `issuer` member of the discovery document, and the `iss` claim
 //! must all be the same string. The query is safe to append because an issuer identifier
-//! "MUST NOT contain a query or fragment component" (OpenID Connect Discovery 1.0 §2).
+//! "MUST NOT contain a query or fragment component" (`OpenID` Connect Discovery 1.0 §2).
 //!
 //! Three flows fit onto the [`Authentication`] trait's start-and-poll shape:
 //!
@@ -27,7 +27,7 @@
 //! * **The refresh grant**, through `refresh_authentication`.
 //!
 //! The credential presented to a Lore server is the **ID token**: it is the only token
-//! OpenID Connect guarantees is a signed JWT carrying the client id in `aud`, which is the
+//! `OpenID` Connect guarantees is a signed JWT carrying the client id in `aud`, which is the
 //! value a server pins. Nothing here verifies that signature -- the server does, against the
 //! issuer's published key set. What this module checks is what only it can: that the
 //! authorization response belongs to the session it started (`state`) and that the ID token
@@ -66,7 +66,7 @@ use crate::traits::Authentication;
 use crate::traits::LoginFlow;
 use crate::types::*;
 
-/// Where a provider publishes its metadata (OpenID Connect Discovery 1.0 §4).
+/// Where a provider publishes its metadata (`OpenID` Connect Discovery 1.0 §4).
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 
 /// `offline_access` is what asks a conformant provider for a refresh token, so a session
@@ -401,13 +401,13 @@ fn authorization_code(
 /// A token endpoint success response.
 ///
 /// Which of the two tokens becomes the credential depends on the deployment: without a
-/// resource indicator it is the ID token, the only token OpenID Connect guarantees is a
+/// resource indicator it is the ID token, the only token `OpenID` Connect guarantees is a
 /// verifiable JWT; with one it is the access token, which is the token RFC 8707 lets a
 /// client bind to a particular resource server. The refresh token keeps the session alive
 /// either way.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 struct TokenResponse {
-    /// Present on every login, and genuinely optional on a refresh: OpenID Connect Core
+    /// Present on every login, and genuinely optional on a refresh: `OpenID` Connect Core
     /// §12.2 does not oblige a provider to reissue an ID token for a refresh grant. Where
     /// one is missing but needed, the diagnostic is this module's own rather than a
     /// deserialization error naming a field the operator has never heard of.
@@ -550,7 +550,7 @@ fn refresh_form(parts: &AuthUrlParts, refresh_token: &str) -> GrantForm {
 }
 
 /// `aud` is a set, and providers differ over whether they collapse a single-element one to
-/// a bare string (OpenID Connect Core §2). Both encodings have to read.
+/// a bare string (`OpenID` Connect Core §2). Both encodings have to read.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 enum Audience {
@@ -592,7 +592,7 @@ struct AccessTokenClaims {
 /// ordinary client-audienced token and a `200`. Without the check, `lore login` succeeds,
 /// stores a credential, prints a user name -- and then every repository operation is
 /// refused, with the cause two layers away and nothing in the login transcript pointing at
-/// it. PocketID 2.6.2 behaves exactly this way.
+/// it. `PocketID` 2.6.2 behaves exactly this way.
 fn resource_bound_credential(
     tokens: &TokenResponse,
     resource: &str,
@@ -651,7 +651,7 @@ fn resource_bound_credential(
 /// Turns a token response into an [`AuthenticationToken`].
 ///
 /// `expected_nonce` is `Some` for a login, where the ID token has to be tied to the
-/// authorization request that produced it, and `None` for a refresh, where OpenID Connect
+/// authorization request that produced it, and `None` for a refresh, where `OpenID` Connect
 /// Core §12.2 makes the claim optional.
 ///
 /// The ID token is the *identity* whenever the response carries one: it is the assertion
@@ -688,26 +688,25 @@ fn authentication_token(
         }
     }
 
-    let (token, expires) = match parts.resource.as_deref() {
-        Some(resource) => resource_bound_credential(&tokens, resource)?,
-        None => {
-            let (id_token, claims) = identity.as_ref().ok_or_else(|| {
-                ProtocolError::internal(
-                    "the token endpoint returned no id_token, and without a resource \
-                     indicator the ID token is the credential this deployment presents -- \
-                     a provider that omits it on a refresh (OpenID Connect Core §12.2 \
-                     permits that) can only be used where the server advertises a resource",
-                )
-            })?;
-            (id_token.clone(), claims.exp)
-        }
+    let (token, expires) = if let Some(resource) = parts.resource.as_deref() {
+        resource_bound_credential(&tokens, resource)?
+    } else {
+        let (id_token, claims) = identity.as_ref().ok_or_else(|| {
+            ProtocolError::internal(
+                "the token endpoint returned no id_token, and without a resource \
+                 indicator the ID token is the credential this deployment presents -- \
+                 a provider that omits it on a refresh (OpenID Connect Core §12.2 \
+                 permits that) can only be used where the server advertises a resource",
+            )
+        })?;
+        (id_token.clone(), claims.exp)
     };
 
     // Identity from the ID token whenever there is one. Without one -- a refresh against a
     // provider that exercised §12.2, which reaches here only in resource mode -- the
     // credential is the access token, of which RFC 9068 §2.2 requires `sub`.
-    let (user_id, user_name) = match identity {
-        Some((_, claims)) => (
+    let (user_id, user_name) = if let Some((_, claims)) = identity {
+        (
             claims.sub.clone(),
             // `name` and `preferred_username` are optional claims delivered with the
             // `profile` scope. Falling back to `sub` keeps a login from failing over a
@@ -716,19 +715,18 @@ fn authentication_token(
                 .name
                 .or(claims.preferred_username)
                 .unwrap_or(claims.sub),
-        ),
-        None => {
-            let subject = decode_unverified::<AccessTokenClaims>(&token)
-                .ok()
-                .and_then(|claims| claims.sub)
-                .ok_or_else(|| {
-                    ProtocolError::internal(
-                        "the refreshed access token names no `sub`, so there is no identity \
-                         to store the credential under (RFC 9068 §2.2 requires one)",
-                    )
-                })?;
-            (subject.clone(), subject)
-        }
+        )
+    } else {
+        let subject = decode_unverified::<AccessTokenClaims>(&token)
+            .ok()
+            .and_then(|claims| claims.sub)
+            .ok_or_else(|| {
+                ProtocolError::internal(
+                    "the refreshed access token names no `sub`, so there is no identity \
+                     to store the credential under (RFC 9068 §2.2 requires one)",
+                )
+            })?;
+        (subject.clone(), subject)
     };
 
     Ok(AuthenticationToken {
@@ -846,9 +844,7 @@ struct PollSchedule {
 impl PollSchedule {
     fn new(interval_secs: Option<u64>) -> Self {
         PollSchedule {
-            interval: interval_secs
-                .map(Duration::from_secs)
-                .unwrap_or(DEFAULT_DEVICE_INTERVAL),
+            interval: interval_secs.map_or(DEFAULT_DEVICE_INTERVAL, Duration::from_secs),
             last_poll: None,
         }
     }
@@ -916,7 +912,9 @@ async fn bind_loopback_redirect() -> Result<LoopbackRedirect, ProtocolError> {
 
     let port = port_receiver
         .await
-        .map_err(|_| ProtocolError::internal("loopback listener task ended before it bound"))?
+        .map_err(|e| {
+            ProtocolError::internal(format!("loopback listener task ended before it bound: {e}"))
+        })?
         .map_err(ProtocolError::internal)?;
 
     Ok(LoopbackRedirect {
@@ -1083,7 +1081,7 @@ struct DeviceSession {
     schedule: PollSchedule,
 }
 
-/// Authentication against a standard OpenID Connect provider.
+/// Authentication against a standard `OpenID` Connect provider.
 ///
 /// Registered under `oidc+https`, and under `oidc+http` for a loopback provider. One
 /// instance serves the whole process and holds the state of any login in flight: the code
@@ -1363,11 +1361,7 @@ impl OidcAuthentication {
     /// The token is whichever credential the deployment uses -- an ID token, or an
     /// RFC 9068 access token where a resource is advertised. Both carry `sub` and `exp`,
     /// which is all this reads.
-    fn passthrough(
-        &self,
-        auth_url: &str,
-        authn_token: &str,
-    ) -> Result<AuthorizationToken, ProtocolError> {
+    fn passthrough(auth_url: &str, authn_token: &str) -> Result<AuthorizationToken, ProtocolError> {
         let parts = parse_auth_url(auth_url)?;
         let claims = id_token_claims(authn_token)?;
 
@@ -1470,7 +1464,7 @@ impl Authentication for OidcAuthentication {
         _repository: RepositoryId,
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
-        self.passthrough(auth_url, authn_token)
+        Self::passthrough(auth_url, authn_token)
     }
 
     async fn exchange_for_custom_resource(
@@ -1480,7 +1474,7 @@ impl Authentication for OidcAuthentication {
         _resource_id: &str,
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
-        self.passthrough(auth_url, authn_token)
+        Self::passthrough(auth_url, authn_token)
     }
 
     /// The provider owns identity resolution and this design reads no directory.
@@ -1975,7 +1969,7 @@ mod tests {
         assert_eq!(token.user_id, "user-1");
     }
 
-    /// OpenID Connect Core §12.2 leaves `id_token` out of what a refresh response has to
+    /// `OpenID` Connect Core §12.2 leaves `id_token` out of what a refresh response has to
     /// carry, so a conformant provider that omits it must not fail before this module has
     /// looked at the response at all.
     #[test]
@@ -2178,7 +2172,7 @@ mod tests {
             assert_eq!(token.acceptable_root_domains, vec!["id.example.com"]);
         }
 
-        /// The case OpenID Connect Core §12.2 allows and this deployment survives: the
+        /// The case `OpenID` Connect Core §12.2 allows and this deployment survives: the
         /// refreshed response carries no ID token, the access token was already the
         /// credential, and RFC 9068 §2.2's `sub` is the identity to store it under.
         #[test]
@@ -2225,7 +2219,7 @@ mod tests {
                 .expect_err("a replayed identity assertion is refused whatever is presented");
         }
 
-        /// PocketID 2.6.2's behavior: `resource` is accepted with a `200` on both the
+        /// `PocketID` 2.6.2's behavior: `resource` is accepted with a `200` on both the
         /// device authorization and token requests, silently ignored, and the access
         /// token comes back audienced to the client id with `typ: "JWT"`. Failing here
         /// names the cause; not failing here means a successful login followed by
@@ -2277,7 +2271,7 @@ mod tests {
             assert!(error.to_string().contains("not a JWT"), "got: {error}");
         }
 
-        /// An array audience containing the resource is the encoding PocketID and others
+        /// An array audience containing the resource is the encoding `PocketID` and others
         /// use, so it has to satisfy the check as readily as the bare string.
         #[test]
         fn an_array_audience_containing_the_resource_is_accepted() {
@@ -2351,6 +2345,8 @@ mod tests {
             .expect("a loopback port");
         let port = listener.local_addr().expect("a bound address").port();
 
+        #[allow(clippy::disallowed_methods)]
+        // Test-only throwaway listener; no runtime split to honor.
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("a request");
 

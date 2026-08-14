@@ -172,7 +172,7 @@ impl GrpcServerBuilder<WantsEnvironment> {
         Self(WantsEnvironment(()))
     }
     /// `environment` is what internal consumers of the environment (currently
-    /// `LoreRepositoryService`/`LoreRepositoryV1Service`, for the ReBAC dial target)
+    /// `LoreRepositoryService`/`LoreRepositoryV1Service`, for the `ReBAC` dial target)
     /// read; `advertised_environment` is what `EnvironmentGet` returns to clients. They
     /// start equal but diverge when `[server.auth.oidc]` derives an `auth_url` an
     /// operator didn't set explicitly: that derived value is for advertisement only and

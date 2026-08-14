@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Integration tests for OIDC-secured server mode, exercised against a real PocketID
+//! Integration tests for OIDC-secured server mode, exercised against a real `PocketID`
 //! instance.
 //!
-//! A real `JwtVerifier` (`lore_server::auth::jwt`) is pointed at the PocketID instance in
+//! A real `JwtVerifier` (`lore_server::auth::jwt`) is pointed at the `PocketID` instance in
 //! `lore-integration-tests/compose.yaml`, following the discovery document rather than a
 //! hardcoded JWKS path, and wired into an in-process gRPC or HTTP server the same way
 //! `storage_remote_test.rs` and `presign_test.rs` do for an unauthenticated one. The
@@ -67,7 +67,7 @@ mod oidc_auth_tests {
         (backend_immutable, backend_mutable)
     }
 
-    /// A `JwtVerifier` pointed at PocketID's real JWKS, discovered rather than hardcoded,
+    /// A `JwtVerifier` pointed at `PocketID`'s real JWKS, discovered rather than hardcoded,
     /// assembled directly from `issuer`, `jwks_uri`, and `client_id` as the audience.
     async fn oidc_jwt_verifier(
         fixture: &oidc_common::OidcFixture,
@@ -289,14 +289,14 @@ mod oidc_auth_tests {
 
     /// `[server.auth.oidc].resource` end to end, over the real HTTP plug point.
     ///
-    /// **PocketID 2.6.2 does not implement RFC 8707** — verified against the live instance
+    /// **`PocketID` 2.6.2 does not implement RFC 8707** — verified against the live instance
     /// on 2026-08-13: it answers `200` to a `resource` parameter on both the device
     /// authorization and token requests, ignores it silently, and mints an access token
     /// audienced to the client id with header `typ: "JWT"`. So the tokens here are minted
     /// synthetically against a `file://` key set, which is the escape hatch the LEP keeps
     /// for exactly this class of reason. The client half of resource mode is proven by the
     /// `lore-transport` unit tests, and the diagnostic it raises against a
-    /// non-implementing provider is proven against live PocketID in `oidc_client_test.rs`.
+    /// non-implementing provider is proven against live `PocketID` in `oidc_client_test.rs`.
     mod resource_mode {
         use jsonwebtoken::EncodingKey;
         use jsonwebtoken::Header;
@@ -494,7 +494,7 @@ mod oidc_auth_tests {
         Ok(())
     }
 
-    /// The classic algorithm-confusion forgery, against a real PocketID key rather than a
+    /// The classic algorithm-confusion forgery, against a real `PocketID` key rather than a
     /// synthetic one: fetch the real JWKS, take a real `kid`, and sign an HS256 token using
     /// that key's own public RSA modulus as the HMAC secret. The modulus is public by
     /// definition — it is what the JWKS publishes — so if the verifier ever let the token's
@@ -548,7 +548,7 @@ mod oidc_auth_tests {
         )?)
     }
 
-    /// A self-signed forgery naming a key id PocketID never served and an issuer PocketID
+    /// A self-signed forgery naming a key id `PocketID` never served and an issuer `PocketID`
     /// never claimed. The harness has only one real identity provider, so this stands in
     /// for "a token from a second provider": whatever the verifier's actual rejection
     /// reason, the signing key can never be found in the real JWKS this server was pointed
@@ -579,7 +579,7 @@ mod oidc_auth_tests {
         .expect("encode forged token")
     }
 
-    /// PocketID emits `aud` as a JSON array (`["<client_id>"]`), not a bare string.
+    /// `PocketID` emits `aud` as a JSON array (`["<client_id>"]`), not a bare string.
     /// `#[serde_as(as = "OneOrMany<_, PreferMany>")]` on `AuthorizationToken::audience`
     /// already accepts it. Supplying `env`/`name`/`preferred_username` here isolates the
     /// `aud`-shape question from the mandatory-claims question, so this test is about

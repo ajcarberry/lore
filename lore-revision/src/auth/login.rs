@@ -358,7 +358,7 @@ pub async fn interactive(
 ///
 /// [`AuthenticationToken::acceptable_root_domains`] is authoritative when the
 /// implementation filled it in, because only the implementation knows how its own tokens'
-/// audience semantics work. An OpenID Connect provider issues `aud` as a client id and
+/// audience semantics work. An `OpenID` Connect provider issues `aud` as a client id and
 /// `iss` as a URL, neither of which is a domain any remote could match, so deriving the set
 /// from the JWT would make every OIDC login refuse its own token. What the implementation
 /// cannot know is the remote the login was performed against; this layer adds it, so the
@@ -426,7 +426,7 @@ mod tests {
 
     /// The producer half of the token-recipient guard: what login persists is what
     /// `exchange` later requires the recipient to be in. Drop the remote here and every
-    /// OpenID Connect login still succeeds, while every operation against the remote it
+    /// `OpenID` Connect login still succeeds, while every operation against the remote it
     /// was performed for is refused a token.
     #[test]
     fn an_oidc_login_may_be_used_at_its_remote_and_its_issuer() {

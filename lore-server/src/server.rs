@@ -438,8 +438,8 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
         return Ok(None);
     };
 
-    let (jwt_issuer, jwt_audience, jwk_settings, acceptance) = match auth.oidc.as_ref() {
-        Some(oidc) => {
+    let (jwt_issuer, jwt_audience, jwk_settings, acceptance) =
+        if let Some(oidc) = auth.oidc.as_ref() {
             let issuer = oidc.issuer.clone();
             let document =
                 lore_spawn_net!(async move { discovery::fetch_discovery_document(&issuer).await })
@@ -472,8 +472,7 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
             });
 
             (jwt_issuer, jwt_audience, jwk_settings, Some(acceptance))
-        }
-        None => {
+        } else {
             let Some(jwk) = auth.jwk.as_ref() else {
                 return Ok(None);
             };
@@ -483,8 +482,7 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
                 jwk.clone(),
                 None,
             )
-        }
-    };
+        };
 
     let jwk_service = JwkServiceImpl::new(jwk_settings);
     jwk_service

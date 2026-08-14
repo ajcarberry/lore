@@ -287,7 +287,7 @@ pub struct AuthSettings {
     pub oidc: Option<OidcSettings>,
 }
 
-/// `[server.auth.oidc]`: direct in-server verification of a standard OpenID Connect
+/// `[server.auth.oidc]`: direct in-server verification of a standard `OpenID` Connect
 /// provider's tokens. See `docs/proposals/2026-08-13-oidc-authentication.md`.
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]

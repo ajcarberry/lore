@@ -74,7 +74,7 @@ mod tests {
             }))
         }
 
-        /// The shape an OpenID Connect provider produces: the authorization token is the
+        /// The shape an `OpenID` Connect provider produces: the authorization token is the
         /// authentication token, and the only domain it can name for itself is the
         /// issuer's.
         fn oidc_shaped(issuer_domain: &'static str) -> Self {

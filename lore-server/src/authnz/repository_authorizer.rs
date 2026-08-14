@@ -91,7 +91,7 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
     }
 }
 
-/// Whether `auth_url` names an OpenID Connect provider, which is the one thing this
+/// Whether `auth_url` names an `OpenID` Connect provider, which is the one thing this
 /// server must not point its relationship-based authorization client at: the URL names an
 /// identity provider, and dialing it as if it were the authorization service would fail
 /// every repository operation that checks a permission.

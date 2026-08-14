@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Provisioning helpers for the PocketID instance in `lore-integration-tests/compose.yaml`.
+//! Provisioning helpers for the `PocketID` instance in `lore-integration-tests/compose.yaml`.
 //!
-//! PocketID's only interactive login is a passkey ceremony, which no test can drive. The
+//! `PocketID`'s only interactive login is a passkey ceremony, which no test can drive. The
 //! way around it is entirely made of documented endpoints, and this module is the one
 //! place that knows the sequence:
 //!
@@ -20,7 +20,7 @@
 //! `POST /api/oidc/device/authorize` for a code, then the same session cookie approves it
 //! via `POST /api/oidc/device/verify`, and the token endpoint redeems the device code.
 //!
-//! Every token this module hands out is minted and signed by PocketID; nothing here
+//! Every token this module hands out is minted and signed by `PocketID`; nothing here
 //! fabricates or self-signs one.
 #[cfg(all(test, feature = "integration_tests"))]
 pub(crate) mod oidc_common {
@@ -47,19 +47,19 @@ pub(crate) mod oidc_common {
     /// `STATIC_API_KEY`, which is what makes the admin API reachable without a wizard.
     const API_KEY: &str = "lorelocaltestapikeylorelocaltestapikey";
 
-    /// The OIDC client every test shares. PocketID accepts a caller-chosen client id, so
+    /// The OIDC client every test shares. `PocketID` accepts a caller-chosen client id, so
     /// this is stable across runs and across a `docker compose down -v`, which means a
     /// server config can name it without discovering it first.
     pub const TEST_CLIENT_ID: &str = "lore-integration-tests";
 
-    /// Loopback redirect for the authorization-code flow. PocketID validates the value
+    /// Loopback redirect for the authorization-code flow. `PocketID` validates the value
     /// against the client's registered callbacks, but nothing ever listens on it here:
     /// the code comes back in the `authorize` JSON response, not through a redirect.
     pub const TEST_REDIRECT_URI: &str = "http://127.0.0.1:19999/callback";
 
     const SCOPE: &str = "openid profile email";
 
-    /// A user provisioned in PocketID, along with the id PocketID will put in `sub`.
+    /// A user provisioned in `PocketID`, along with the id `PocketID` will put in `sub`.
     #[derive(Clone, Debug)]
     pub struct TestUser {
         pub id: String,
@@ -67,7 +67,7 @@ pub(crate) mod oidc_common {
         pub email: String,
     }
 
-    /// The token endpoint's response. Every field is signed by PocketID.
+    /// The token endpoint's response. Every field is signed by `PocketID`.
     #[derive(Clone, Debug, Deserialize)]
     pub struct TokenSet {
         pub access_token: String,
@@ -87,7 +87,7 @@ pub(crate) mod oidc_common {
         pub interval: i64,
     }
 
-    /// The claims Lore cares about. PocketID sends `aud` as an array, so it is typed as
+    /// The claims Lore cares about. `PocketID` sends `aud` as an array, so it is typed as
     /// one — a bare `String` here fails to deserialize against a real token.
     #[derive(Clone, Debug, Deserialize)]
     pub struct PocketIdClaims {
@@ -111,11 +111,11 @@ pub(crate) mod oidc_common {
         base_url: String,
     }
 
-    /// Point the fixture at the compose-managed PocketID and make sure the shared OIDC
+    /// Point the fixture at the compose-managed `PocketID` and make sure the shared OIDC
     /// client exists.
     ///
     /// Idempotent and safe to call from tests running in parallel, in the same spirit as
-    /// `aws_common::setup`: a losing racer sees PocketID reject the duplicate client and
+    /// `aws_common::setup`: a losing racer sees `PocketID` reject the duplicate client and
     /// treats that as success.
     pub async fn setup() -> Result<OidcFixture, Box<dyn Error + 'static>> {
         let _ = tracing_subscriber::fmt::try_init();
@@ -134,7 +134,7 @@ pub(crate) mod oidc_common {
     }
 
     impl OidcFixture {
-        /// The issuer PocketID signs tokens with, for a server's OIDC config.
+        /// The issuer `PocketID` signs tokens with, for a server's OIDC config.
         pub fn issuer(&self) -> &str {
             &self.base_url
         }
@@ -186,7 +186,7 @@ pub(crate) mod oidc_common {
         }
 
         /// Fail with the endpoint's own error text rather than a bare status code, since
-        /// PocketID explains validation failures in the body and nowhere else.
+        /// `PocketID` explains validation failures in the body and nowhere else.
         async fn json_or_error(
             path: &str,
             response: reqwest::Response,
@@ -276,7 +276,7 @@ pub(crate) mod oidc_common {
 
         /// Log `user` in without a passkey, returning the session cookie.
         ///
-        /// The cookie is returned rather than kept in a cookie jar because PocketID marks
+        /// The cookie is returned rather than kept in a cookie jar because `PocketID` marks
         /// it `Secure` even when serving plain HTTP, which a conforming cookie store
         /// drops on an `http://` origin.
         async fn login(&self, user: &TestUser) -> Result<String, Box<dyn Error + 'static>> {
@@ -315,7 +315,7 @@ pub(crate) mod oidc_common {
         }
 
         /// Complete an authorization-code + PKCE exchange as `user` and return the tokens
-        /// PocketID mints, using [`TEST_CLIENT_ID`].
+        /// `PocketID` mints, using [`TEST_CLIENT_ID`].
         pub async fn issue_token(
             &self,
             user: &TestUser,
@@ -564,7 +564,7 @@ pub(crate) mod oidc_common {
         }
     }
 
-    /// The spike this module was written to settle: a PocketID container, driven only
+    /// The spike this module was written to settle: a `PocketID` container, driven only
     /// over its documented API, issues a real signed token for a user it has never seen
     /// log in.
     ///

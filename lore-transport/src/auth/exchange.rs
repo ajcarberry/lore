@@ -106,7 +106,7 @@ fn acceptable_root_domains(
 ///
 /// The recipient half is the token-recipient guard on this path. `exchange` is reachable
 /// with an explicit identity and a caller-supplied recipient, and where the authorization
-/// token *is* the authentication token -- an OpenID Connect passthrough -- any remote that
+/// token *is* the authentication token -- an `OpenID` Connect passthrough -- any remote that
 /// advertises the auth URL a user logged in against would otherwise be handed that user's
 /// credential. Only the stored acceptable-domain set records where a token may go, since an
 /// ID token's own claims name a client id and an issuer but never a remote, so the check

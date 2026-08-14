@@ -28,7 +28,7 @@ pub struct JWTUserInfo {
     pub issuer: String,
     #[serde(rename = "sub")]
     pub user_id: String,
-    /// `name` is an OpenID Connect claim delivered only with the `profile` scope, so a
+    /// `name` is an `OpenID` Connect claim delivered only with the `profile` scope, so a
     /// conformant provider may omit it. Optional rather than required so a token without
     /// it still deserializes.
     pub name: Option<String>,

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! OpenID Connect Discovery (§4 of the spec): fetching a provider's
+//! `OpenID` Connect Discovery (§4 of the spec): fetching a provider's
 //! `.well-known/openid-configuration` document at server start-up so
 //! `[server.auth.oidc]` needs only an issuer and a client id.
 //!

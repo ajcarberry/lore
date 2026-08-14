@@ -75,11 +75,11 @@ available_interval_seconds = 30
 available_timeout_seconds = 5
 store_health_check = false
 
-# Direct in-server verification of a standard OpenID Connect provider's tokens.
-# Absent by default: an unconfigured server accepts unauthenticated requests on
-# every path, exactly as above. `authorize_all_repositories` has no default and
-# must be set to `true` — a verified token then authorizes every repository on
-# the server. See docs/proposals/2026-08-13-oidc-authentication.md.
+# Configure an OpenID Connect provider for authentication. The server verifies the
+# provider's tokens itself. Absent by default: an unconfigured server accepts
+# unauthenticated requests on every path, exactly as above. Set
+# authorize_all_repositories to true, and a verified token then lets its user reach
+# every repository on the server. See docs/proposals/2026-08-13-oidc-authentication.md.
 # [server.auth.oidc]
 # issuer = "https://id.example.com"
 # client_id = "lore"

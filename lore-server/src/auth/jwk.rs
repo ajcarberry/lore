@@ -553,18 +553,18 @@ impl InstrumentProvider for JwkServiceImpl {
 /// added to `jsonwebtoken` in a later release is refused until it is reviewed
 /// and added here, not admitted by default.
 fn oidc_permits_algorithm(algorithm: jsonwebtoken::Algorithm) -> bool {
-    use jsonwebtoken::Algorithm::ES256;
-    use jsonwebtoken::Algorithm::ES384;
-    use jsonwebtoken::Algorithm::EdDSA;
-    use jsonwebtoken::Algorithm::PS256;
-    use jsonwebtoken::Algorithm::PS384;
-    use jsonwebtoken::Algorithm::PS512;
-    use jsonwebtoken::Algorithm::RS256;
-    use jsonwebtoken::Algorithm::RS384;
-    use jsonwebtoken::Algorithm::RS512;
+    use jsonwebtoken::Algorithm as Alg;
     matches!(
         algorithm,
-        RS256 | RS384 | RS512 | PS256 | PS384 | PS512 | ES256 | ES384 | EdDSA
+        Alg::RS256
+            | Alg::RS384
+            | Alg::RS512
+            | Alg::PS256
+            | Alg::PS384
+            | Alg::PS512
+            | Alg::ES256
+            | Alg::ES384
+            | Alg::EdDSA
     )
 }
 

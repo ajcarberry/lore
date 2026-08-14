@@ -100,14 +100,14 @@ fn acceptable_root_domains(
     }
 }
 
-/// Loads only a stored authentication token that is acceptable both for the auth service
-/// it will be presented to and for the remote the authorization token is destined for.
+/// Loads a stored authentication token only if it is acceptable both for the auth service
+/// it is sent to and for the remote the authorization token will reach.
 ///
-/// The recipient half is the token-recipient guard on this path: `exchange` is reachable
-/// with an explicit identity and a caller-supplied recipient, and where the authorization
-/// token is the authentication token -- an `OpenID` Connect passthrough -- any remote
-/// advertising the same auth URL would otherwise be handed that user's credential. Only the
-/// stored acceptable-domain set records where a token may go.
+/// This is the token-recipient guard for this path. `exchange` can run with an explicit
+/// identity and a caller-supplied recipient. When the authorization token is the
+/// authentication token (an `OpenID` Connect passthrough), any remote that advertises the
+/// same auth URL could otherwise receive the user's credential. The stored acceptable-domain
+/// set limits where a token may go.
 fn tokens_for_auth_service_and_recipient(
     auth_domain: String,
     recipient_domain: String,

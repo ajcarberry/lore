@@ -173,6 +173,26 @@ This field is optional. When it's absent, the server starts with the presigned U
 | --- | --- | --- |
 | `lock_service.max_encoding_message_size` | `16777216` (16 MiB) | Maximum encoded gRPC response size, in bytes, for the lock service. When unset, the gRPC framework default applies. |
 
+### Environment discovery
+
+`[environment]` is what the server advertises to clients through the unauthenticated `EnvironmentService/EnvironmentGet` call every client makes while connecting. It has two optional sub-tables: `[environment.endpoint]`, the per-service URLs clients should use, and `[environment.config]`, server-tunable values clients read (query-batch size and compression mode). When a field is empty or a table is absent, clients fall back to the URL or default they were configured with. URLs are stored verbatim and expected to be fully qualified (`scheme://host[:port][/path]`).
+
+`[environment.endpoint]`:
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `auth_url` | none | The endpoint clients use to authenticate. Clients read its scheme to select an authentication backend (`ucs-auth`, `oidc+https`, ...). When `[server.auth.oidc]` is set and this is empty, the server derives it as `oidc+https://{issuer}?client_id={client_id}` (`oidc+http` for an `http://` issuer); an explicit value always wins. Leaving both this and the OIDC block unset is what makes a token-verifying server report no authentication to clients — set one of them. |
+| `repository_url` | none | Repository-management service endpoint. |
+| `storage_url` | none | Storage service endpoint. |
+| `revision_url` | none | Revision-graph service endpoint. |
+| `lock_url` | none | Lock service endpoint. |
+| `notification_url` | none | Notification service endpoint. |
+
+```toml
+[environment.endpoint]
+auth_url = "oidc+https://id.example.com?client_id=lore"
+```
+
 ### Authentication
 
 `[server.auth]` configures JWT verification for gRPC, HTTP, and QUIC. When `[server.auth]` (or its `[server.auth.jwk]` and `[server.auth.oidc]` sub-tables) is absent — as in every shipped config — JWT verification is disabled and every protocol accepts unauthenticated requests.
@@ -219,26 +239,6 @@ authorize_all_repositories = true
 Configuring the OIDC block also fills in the `auth_url` the server advertises to clients (see [Environment discovery](#environment-discovery)), so an operator configures authentication in one place: a server that verifies OpenID Connect tokens also tells clients to log in with OpenID Connect. An explicit `environment.endpoint.auth_url` still wins.
 
 See [Secure a Lore server with OpenID Connect](../how-to/secure-a-lore-server-with-oidc.md) for a full walkthrough.
-
-### Environment discovery
-
-`[environment]` is what the server advertises to clients through the unauthenticated `EnvironmentService/EnvironmentGet` call every client makes while connecting. It has two optional sub-tables: `[environment.endpoint]`, the per-service URLs clients should use, and `[environment.config]`, server-tunable values clients read (query-batch size and compression mode). When a field is empty or a table is absent, clients fall back to the URL or default they were configured with. URLs are stored verbatim and expected to be fully qualified (`scheme://host[:port][/path]`).
-
-`[environment.endpoint]`:
-
-| Field | Default | Description |
-| --- | --- | --- |
-| `auth_url` | none | The endpoint clients use to authenticate. Clients read its scheme to select an authentication backend (`ucs-auth`, `oidc+https`, ...). When `[server.auth.oidc]` is set and this is empty, the server derives it as `oidc+https://{issuer}?client_id={client_id}` (`oidc+http` for an `http://` issuer); an explicit value always wins. Leaving both this and the OIDC block unset is what makes a token-verifying server report no authentication to clients — set one of them. |
-| `repository_url` | none | Repository-management service endpoint. |
-| `storage_url` | none | Storage service endpoint. |
-| `revision_url` | none | Revision-graph service endpoint. |
-| `lock_url` | none | Lock service endpoint. |
-| `notification_url` | none | Notification service endpoint. |
-
-```toml
-[environment.endpoint]
-auth_url = "oidc+https://id.example.com?client_id=lore"
-```
 
 ## Store settings
 

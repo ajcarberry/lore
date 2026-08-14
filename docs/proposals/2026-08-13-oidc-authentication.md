@@ -57,11 +57,10 @@ both are operators reaching for a deployment Lore does not support.
 [Issue #59](https://github.com/EpicGames/lore/issues/59) asks for the headless half of the same
 story, credentials on a machine with no browser.
 
-**Why now.** GOVERNANCE.md requires an accepted LEP, after a two-week discussion period, before any
-change to authentication flows — and [PR #22](https://github.com/EpicGames/lore/pull/22) already
-proposes a different answer to the same demand, a standalone service minting Lore's own tokens. The
-design space is being settled now, and this proposal argues the self-hosted case wants the smaller
-answer.
+**Why now.** Authentication is the first wall an adopter hits. A single user experimenting with Lore
+runs it open without noticing, but the moment the server holds anything a team shares, running it
+open stops being acceptable — so every evaluation that outgrows one person stalls here. It is the
+natural next step for anyone adopting Lore, not a niche request, and nothing in the tree meets it.
 
 ## Goals / Non-Goals
 
@@ -69,8 +68,9 @@ answer.
 
 1. **An operator secures a Lore server with any conformant provider by naming an issuer and a client
    id** — no other configuration, and nothing new to deploy or operate.
-2. **The server carries no provider-specific code.** Every endpoint and every key comes from the
-   provider's own discovery document, so supporting a new provider is a configuration change.
+2. **A standards-compliant OpenID Connect implementation, carrying no provider-specific code.**
+   Every endpoint and every key comes from the provider's own discovery document, and every flow is a
+   standard OAuth grant, so supporting a new provider is a configuration change, not a code change.
 3. **A verified token from the trusted issuer authorizes every repository on the server**, and the
    configuration states the grant in terms of what it grants.
 4. **All three public protocols enforce it identically.** gRPC, HTTP, and QUIC reach the same

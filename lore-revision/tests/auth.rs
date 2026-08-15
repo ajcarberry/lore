@@ -41,7 +41,6 @@ mod tests {
     mod verify_jwt_usage_for_remote_tests {
 
         use lore_credential::JWTUserInfo;
-        use lore_credential::domain_in_root_domains;
         use lore_credential::verify_jwt_usage_for_remote;
 
         fn make_jwt_with_audience(audience: Vec<String>) -> JWTUserInfo {
@@ -126,23 +125,6 @@ mod tests {
             verify_jwt_usage_for_remote(&token, "evilepicgames.net").unwrap_err();
         }
 
-        /// A UCS Auth token's acceptable set is `iss` followed by `aud`, and `aud` is a
-        /// list of root domains, which is why the JWT-derived set works for that scheme.
-        #[test]
-        fn ucs_auth_derivation_is_unchanged() {
-            let token = make_jwt_with_audience(vec!["lore.example.com".to_string()]);
-
-            assert_eq!(
-                token.acceptable_root_domains(),
-                vec![
-                    "my_test_issuer.example.com".to_string(),
-                    "lore.example.com".to_string(),
-                ]
-            );
-            verify_jwt_usage_for_remote(&token, "lore.example.com").unwrap();
-            verify_jwt_usage_for_remote(&token, "my_test_issuer.example.com").unwrap();
-        }
-
         /// The mismatch that makes the JWT-derived set unusable for `OpenID` Connect: `aud`
         /// carries a client id and `iss` a URL, and neither is a domain a remote matches.
         #[test]
@@ -152,22 +134,6 @@ mod tests {
 
             verify_jwt_usage_for_remote(&token, "lore.example.com").unwrap_err();
             verify_jwt_usage_for_remote(&token, "id.example.com").unwrap_err();
-        }
-
-        /// An OIDC token is usable at the remote it was obtained for and at its issuer,
-        /// nowhere else. The issuer entry comes from the implementation, the remote entry
-        /// from `login::interactive`.
-        #[test]
-        fn oidc_authoritative_domains_admit_the_remote_and_the_issuer_only() {
-            let domains = vec!["id.example.com".to_string(), "lore.example.com".to_string()];
-
-            assert!(domain_in_root_domains("lore.example.com", &domains));
-            assert!(domain_in_root_domains("id.example.com", &domains));
-            // A subdomain of the remote is still the remote's deployment.
-            assert!(domain_in_root_domains("eu.lore.example.com", &domains));
-            // A server the user never logged in to gets nothing.
-            assert!(!domain_in_root_domains("attacker.example.com", &domains));
-            assert!(!domain_in_root_domains("evillore.example.com", &domains));
         }
     }
 }

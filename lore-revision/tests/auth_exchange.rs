@@ -376,8 +376,8 @@ mod tests {
     ///
     /// One directory for the whole binary, because `LORE_AUTH_PATH` and the loaded token map
     /// are both process-wide. Tests stay independent by using an auth URL of their own. The
-    /// `OnceLock` is what serializes the environment write: concurrent callers block until
-    /// it has run, and none of them observes the variables unset.
+    /// unsynchronized write is sound only because every reader of these variables sits
+    /// behind this `OnceLock`: no other test in this binary touches the token store.
     fn isolated_credential_store() -> &'static TempDir {
         static AUTH_DIR: OnceLock<TempDir> = OnceLock::new();
         AUTH_DIR.get_or_init(|| {

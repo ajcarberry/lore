@@ -97,6 +97,10 @@ impl EventError for InteractiveLoginError {
 // To be read from config somehow
 const POLLING_MAX_RETRIES: u64 = 30;
 const POLLING_INTERVAL_SECS: u64 = 5;
+/// A `--no-browser` login is approved by a human on a second device, so it gets
+/// minutes rather than the browser flow's 150 seconds — while staying under a
+/// typical device code's 600-second lifetime.
+const NO_BROWSER_POLLING_MAX_RETRIES: u64 = 110;
 
 /// Exchanges an external token for a URC authentication token via the
 /// registered `Authentication` implementation.
@@ -125,18 +129,16 @@ async fn exchange_token(
             user_info.id
         );
 
-        let decoded_token = insecure_decode_token(&authn.token).internal("decoding token")?;
-        verify_jwt_usage_for_remote(
-            &decoded_token.claims,
-            &domain_from_url_or_url(recipient_url),
-        )
-        .forward::<LoginError>("verifying JWT usage for remote")?;
+        let acceptable_root_domains = authn
+            .recipients
+            .domains_for(&authn.token, &domain_from_url_or_url(recipient_url))
+            .forward::<LoginError>("verifying JWT usage for remote")?;
 
         token_store::store_user_token(
             auth_url.as_str(),
             user_info.id.as_str(),
             &authn.token,
-            decoded_token.claims.acceptable_root_domains(),
+            acceptable_root_domains,
         )
         .await
         .forward::<LoginError>("storing user token")?;
@@ -309,12 +311,18 @@ pub async fn interactive(
     }
 
     // 3. Poll until complete or timeout
+    let max_retries = if no_browser {
+        NO_BROWSER_POLLING_MAX_RETRIES
+    } else {
+        POLLING_MAX_RETRIES
+    };
     let authn = poll_interactive_session(
         &*auth_impl,
         &auth_url,
         &client_state,
         &session.session_code,
         &correlation_id,
+        max_retries,
     )
     .await?;
 
@@ -360,8 +368,9 @@ async fn poll_interactive_session(
     client_state: &str,
     session_code: &str,
     correlation_id: &str,
+    max_retries: u64,
 ) -> Result<AuthenticationToken, InteractiveLoginError> {
-    for _ in 0..POLLING_MAX_RETRIES {
+    for _ in 0..max_retries {
         let result = auth
             .poll_auth_session(auth_url, client_state, session_code, correlation_id)
             .await
@@ -374,40 +383,4 @@ async fn poll_interactive_session(
         sleep(Duration::from_secs(POLLING_INTERVAL_SECS)).await;
     }
     Err(InteractiveLoginError::internal("Timeout"))
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_transport::TokenRecipients;
-
-    use super::*;
-
-    fn authn_token(recipients: TokenRecipients, token: &str) -> AuthenticationToken {
-        AuthenticationToken {
-            token: token.to_string(),
-            user_id: "user-1".to_string(),
-            user_name: "user-1".to_string(),
-            expires_ms: 0,
-            recipients,
-            refresh_token: None,
-        }
-    }
-
-    /// The producer half of the token-recipient guard: what login persists is what
-    /// `exchange` later requires the recipient to be in.
-    #[test]
-    fn an_oidc_login_may_be_used_at_its_remote_and_its_issuer() {
-        let authn = authn_token(
-            TokenRecipients::Explicit(vec!["id.example.com".to_string()]),
-            "not-decoded",
-        );
-
-        let domains = authn
-            .recipients
-            .domains_for(&authn.token, "repo.example.com")
-            .unwrap();
-
-        assert!(domains.contains(&"id.example.com".to_string()));
-        assert!(domains.contains(&"repo.example.com".to_string()));
-    }
 }

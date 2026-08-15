@@ -23,6 +23,9 @@ from lore_server import (
     launch_lore_server,
     lore_local_server,
 )
+
+# Imported for pytest to collect them as fixtures, not called directly here.
+from pocket_id import pocket_id, pocket_id_user  # noqa: F401
 from service_util import service_supported
 
 logger = logging.getLogger(__name__)

@@ -331,6 +331,20 @@ pub trait Environment: Send + Sync {
     async fn get(&self) -> Result<EnvironmentConfig, ProtocolError>;
 }
 
+/// Whether a browser can be opened on the host starting an interactive login,
+/// which decides the ceremony an `Authentication` implementation runs.
+///
+/// This is a capability, not a preference. An implementation with only one
+/// ceremony ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoginFlow {
+    /// A redirect back to this host can complete the login.
+    #[default]
+    Browser,
+    /// The login has to be completed on another device.
+    NoBrowser,
+}
+
 /// Client-side authentication and authorization protocol trait.
 ///
 /// Covers the full auth lifecycle: obtaining authentication tokens (via
@@ -344,6 +358,7 @@ pub trait Authentication: Send + Sync {
         &self,
         auth_url: &str,
         client_state: &str,
+        flow: LoginFlow,
         correlation_id: &str,
     ) -> Result<AuthSession, ProtocolError>;
 

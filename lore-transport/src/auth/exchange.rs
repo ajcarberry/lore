@@ -19,14 +19,15 @@ use lore_base::lore_trace;
 use lore_base::lore_warn;
 use lore_base::types::RepositoryId;
 use lore_credential::get_domain_or_empty;
-use lore_credential::insecure_decode_token;
 use lore_credential::token_store;
 use lore_credential::token_store::tokens_only_for_recipient_domain;
-use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 
 use crate::auth::authentication;
+use crate::auth::refresh::refreshed_authn_token;
+use crate::auth::refresh::tokens_for_auth_service_and_recipient;
+use crate::auth::refresh::unexpired_authn_token;
 
 #[error_set]
 pub enum ExchangeError {
@@ -60,6 +61,12 @@ pub fn is_expired(expires: u64) -> bool {
         .unwrap_or_default()
         .as_millis();
     current_time >= expires
+}
+
+/// Maps a refused or undecodable token to the error `exchange` reports.
+fn recipient_refused(err: lore_credential::JwtUsageError) -> ExchangeError {
+    lore_warn!("{err}");
+    ExchangeError::internal_with_context(err, "The token is not suitable for what you intend to do")
 }
 
 /// Exchanges an authentication token for a repository-scoped authorization
@@ -100,14 +107,17 @@ pub async fn exchange(
         repo_id_str.clone(),
         recipient_domain.clone(),
     );
-    let mut cache = cache().lock().await;
-
-    lore_trace!(
-        "Check for cached authz token for {cache_key:?} in cache with {} tokens",
-        cache.len()
-    );
-
-    let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
+    // The guard is scoped to the lookup: the token-store read, the refresh grant, and
+    // the exchange below all await the network, and this global guard would serialize
+    // every exchange in the process across them.
+    let mut token = {
+        let cache = cache().lock().await;
+        lore_trace!(
+            "Check for cached authz token for {cache_key:?} in cache with {} tokens",
+            cache.len()
+        );
+        cache.get(&cache_key).cloned().unwrap_or_default()
+    };
 
     // Token store key: "{auth_url}/{repository_id}" (no urc- prefix)
     let token_store_key = format!("{auth_url}/{repo_id_str}");
@@ -130,7 +140,7 @@ pub async fn exchange(
         if let Some(user_info) = lore_credential::user_info_from_token(token.clone()) {
             if !is_expired(user_info.expires) {
                 lore_trace!("Using authz token for {cache_key:?}");
-                cache.insert(cache_key, token.clone());
+                cache().lock().await.insert(cache_key, token.clone());
                 return Ok(token.clone());
             } else {
                 lore_debug!("Authz token for {cache_key:?} has expired");
@@ -141,19 +151,28 @@ pub async fn exchange(
     } else {
         lore_trace!("No stored authz token found for {cache_key:?}");
     }
-
-    // Load authn token for the auth service domain
+    // Load authn token for the auth service domain, and only if it may reach the recipient
     lore_trace!("Authorizing using authn identity: {identity}");
     let Some(auth_service_only_token) = lore_credential::user_info(
         auth_url.as_str(),
         identity,
-        tokens_only_for_recipient_domain(auth_domain),
+        tokens_for_auth_service_and_recipient(auth_domain.clone(), recipient_domain.clone()),
     )
     .await
     else {
-        lore_debug!("Not authenticated, unable to perform authz exchange");
+        lore_debug!(
+            "No authentication token usable at {recipient_domain}, unable to perform authz exchange"
+        );
         return Err(NotAuthenticated.into());
     };
+    let authn_token = unexpired_authn_token(
+        auth_service_only_token,
+        &auth_url,
+        &auth_domain,
+        identity,
+        &recipient_domain,
+    )
+    .await;
     lore_trace!("Authorizing using endpoint: {auth_url}");
 
     let time_start = Instant::now();
@@ -167,12 +186,7 @@ pub async fn exchange(
 
     lore_trace!("Send auth exchange request");
     let authz = auth_impl
-        .exchange_for_repository(
-            &auth_url,
-            &auth_service_only_token.token,
-            repository,
-            &correlation_id,
-        )
+        .exchange_for_repository(&auth_url, &authn_token, repository, &correlation_id)
         .await
         .map_err(|err| {
             if err.is_not_authorized() {
@@ -186,16 +200,10 @@ pub async fn exchange(
     if token.is_empty() {
         return Err(ExchangeError::internal("Empty token response"));
     }
-    let decoded_token = insecure_decode_token(&token)
-        .internal("Could not decode token")
-        .map_err(ExchangeError::from)?;
-    verify_jwt_usage_for_remote(&decoded_token.claims, &recipient_domain).map_err(|err| {
-        lore_warn!("{err}");
-        ExchangeError::internal_with_context(
-            err,
-            "The token is not suitable for what you intend to do",
-        )
-    })?;
+    let domains = authz
+        .recipients
+        .domains_for(&token, &recipient_domain)
+        .map_err(recipient_refused)?;
 
     lore_trace!(
         "Authorization with user token successful in {} ms",
@@ -204,18 +212,13 @@ pub async fn exchange(
 
     lore_trace!("Cached authz token for {cache_key:?}");
 
-    cache.insert(cache_key, token.clone());
+    cache().lock().await.insert(cache_key, token.clone());
 
-    let _ = token_store::store_user_token(
-        &token_store_key,
-        identity,
-        &token,
-        decoded_token.claims.acceptable_root_domains(),
-    )
-    .await
-    .map_err(|err| {
-        lore_warn!("Failed to store token: {err}");
-    });
+    let _ = token_store::store_user_token(&token_store_key, identity, &token, domains)
+        .await
+        .map_err(|err| {
+            lore_warn!("Failed to store token: {err}");
+        });
 
     Ok(token)
 }
@@ -259,14 +262,17 @@ pub async fn exchange_custom_resource(
         resource_id.to_string(),
         recipient_domain.clone(),
     );
-    let mut cache = cache().lock().await;
-
-    lore_trace!(
-        "Check for cached authz token for {cache_key:?} in cache with {} tokens",
-        cache.len()
-    );
-
-    let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
+    // The guard is scoped to the lookup: the token-store read, the refresh grant, and
+    // the exchange below all await the network, and this global guard would serialize
+    // every exchange in the process across them.
+    let mut token = {
+        let cache = cache().lock().await;
+        lore_trace!(
+            "Check for cached authz token for {cache_key:?} in cache with {} tokens",
+            cache.len()
+        );
+        cache.get(&cache_key).cloned().unwrap_or_default()
+    };
 
     // Token store key: "{auth_url}/{resource_id}" -- same shape as the
     // repository variant, with the resource ID taking the repository slot.
@@ -290,7 +296,7 @@ pub async fn exchange_custom_resource(
         if let Some(user_info) = lore_credential::user_info_from_token(token.clone()) {
             if !is_expired(user_info.expires) {
                 lore_trace!("Using authz token for {cache_key:?}");
-                cache.insert(cache_key, token.clone());
+                cache().lock().await.insert(cache_key, token.clone());
                 return Ok(token.clone());
             } else {
                 lore_debug!("Authz token for {cache_key:?} has expired");
@@ -301,18 +307,27 @@ pub async fn exchange_custom_resource(
     } else {
         lore_trace!("No stored authz token found for {cache_key:?}");
     }
-
     lore_trace!("Authorizing using authn identity: {identity}");
     let Some(auth_service_only_token) = lore_credential::user_info(
         auth_url.as_str(),
         identity,
-        tokens_only_for_recipient_domain(auth_domain),
+        tokens_for_auth_service_and_recipient(auth_domain.clone(), recipient_domain.clone()),
     )
     .await
     else {
-        lore_debug!("Not authenticated, unable to perform authz exchange");
+        lore_debug!(
+            "No authentication token usable at {recipient_domain}, unable to perform authz exchange"
+        );
         return Err(NotAuthenticated.into());
     };
+    let authn_token = unexpired_authn_token(
+        auth_service_only_token,
+        &auth_url,
+        &auth_domain,
+        identity,
+        &recipient_domain,
+    )
+    .await;
     lore_trace!("Authorizing using endpoint: {auth_url}");
 
     let time_start = Instant::now();
@@ -325,12 +340,7 @@ pub async fn exchange_custom_resource(
 
     lore_trace!("Send auth exchange request");
     let authz = auth_impl
-        .exchange_for_custom_resource(
-            &auth_url,
-            &auth_service_only_token.token,
-            resource_id,
-            &correlation_id,
-        )
+        .exchange_for_custom_resource(&auth_url, &authn_token, resource_id, &correlation_id)
         .await
         .map_err(|err| {
             if err.is_not_authorized() {
@@ -344,16 +354,10 @@ pub async fn exchange_custom_resource(
     if token.is_empty() {
         return Err(ExchangeError::internal("Empty token response"));
     }
-    let decoded_token = insecure_decode_token(&token)
-        .internal("Could not decode token")
-        .map_err(ExchangeError::from)?;
-    verify_jwt_usage_for_remote(&decoded_token.claims, &recipient_domain).map_err(|err| {
-        lore_warn!("{err}");
-        ExchangeError::internal_with_context(
-            err,
-            "The token is not suitable for what you intend to do",
-        )
-    })?;
+    let domains = authz
+        .recipients
+        .domains_for(&token, &recipient_domain)
+        .map_err(recipient_refused)?;
 
     lore_trace!(
         "Authorization with user token successful in {} ms",
@@ -362,18 +366,13 @@ pub async fn exchange_custom_resource(
 
     lore_trace!("Cached authz token for {cache_key:?}");
 
-    cache.insert(cache_key, token.clone());
+    cache().lock().await.insert(cache_key, token.clone());
 
-    let _ = token_store::store_user_token(
-        &token_store_key,
-        identity,
-        &token,
-        decoded_token.claims.acceptable_root_domains(),
-    )
-    .await
-    .map_err(|err| {
-        lore_warn!("Failed to store token: {err}");
-    });
+    let _ = token_store::store_user_token(&token_store_key, identity, &token, domains)
+        .await
+        .map_err(|err| {
+            lore_warn!("Failed to store token: {err}");
+        });
 
     Ok(token)
 }
@@ -431,7 +430,7 @@ async fn auth_exchange_for_identity(
     identity: &str,
     repository: RepositoryId,
 ) -> (String, String, String) {
-    let Ok(authentication_token) = token_store::load_user_token(
+    let Ok(mut authentication_token) = token_store::load_user_token(
         auth_url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
@@ -442,12 +441,18 @@ async fn auth_exchange_for_identity(
         return (String::new(), String::new(), String::new());
     };
 
-    // Reject expired authn tokens
+    // Refresh once before giving up on an expired login.
     if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
-        lore_debug!("Skipping identity {identity}, authn token is expired");
-        return (String::new(), String::new(), String::new());
+        let auth_domain = get_domain_or_empty(auth_url);
+        let Some(refreshed) =
+            refreshed_authn_token(auth_url, &auth_domain, identity, remote_domain).await
+        else {
+            lore_debug!("Skipping identity {identity}, authn token is expired");
+            return (String::new(), String::new(), String::new());
+        };
+        authentication_token = refreshed;
     }
 
     // This will return the cached authz token if it is still valid,
@@ -558,7 +563,7 @@ async fn auth_exchange_custom_resource_for_identity(
     identity: &str,
     resource_id: &str,
 ) -> (String, String, String) {
-    let Ok(authentication_token) = token_store::load_user_token(
+    let Ok(mut authentication_token) = token_store::load_user_token(
         auth_url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
@@ -569,11 +574,18 @@ async fn auth_exchange_custom_resource_for_identity(
         return (String::new(), String::new(), String::new());
     };
 
+    // Refresh once before giving up on an expired login.
     if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
-        lore_debug!("Skipping identity {identity}, authn token is expired");
-        return (String::new(), String::new(), String::new());
+        let auth_domain = get_domain_or_empty(auth_url);
+        let Some(refreshed) =
+            refreshed_authn_token(auth_url, &auth_domain, identity, remote_domain).await
+        else {
+            lore_debug!("Skipping identity {identity}, authn token is expired");
+            return (String::new(), String::new(), String::new());
+        };
+        authentication_token = refreshed;
     }
 
     let authorization_token =

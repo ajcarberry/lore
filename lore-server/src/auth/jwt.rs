@@ -17,6 +17,7 @@ use tracing::warn;
 
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
+use crate::auth::oidc_claims::OidcTokenClaims;
 
 #[serde_as]
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
@@ -90,25 +91,88 @@ pub enum JwtVerifierError {
     NotAuthorized,
 }
 
+/// Which claim shape `verify_token_internal` decodes, and with it whether a
+/// verified token is granted the all-repositories wildcard.
+///
+/// By the constructors' convention only [`JwtVerifier::oidc`], built from a
+/// configured `[server.auth.oidc]` block, produces `Oidc`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JwtVerifierMode {
+    /// Only Lore's own claim shapes (`AuthorizationToken`, `JWTUserInfo`)
+    /// verify.
+    #[default]
+    LoreClaims,
+    /// `[server.auth.oidc]`'s authn-only mode: a conformant `OpenID` Connect ID
+    /// token, whose `aud` names the client rather than the server, so two
+    /// deployments sharing an issuer and a client id accept each other's tokens.
+    Oidc,
+}
+
 #[derive(Clone)]
 pub struct JwtVerifier {
     pub jwk_service: Arc<dyn JWKService>,
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<Vec<String>>,
+    pub mode: JwtVerifierMode,
 }
 
-/// Whether a verification failure could be the signing key's fault rather than the token's.
-///
-/// A key rotated under an unchanged key id presents exactly this way, and it is the only
-/// failure worth re-fetching keys for: a token that has expired, or that names another
-/// audience or issuer, fails identically against every key that could ever be served. That
-/// distinction is what keeps an invalid token from being a way to ask for network work.
+impl JwtVerifier {
+    /// Only Lore's own claim shapes verify.
+    pub fn new(
+        jwk_service: Arc<dyn JWKService>,
+        jwt_issuer: Option<String>,
+        jwt_audience: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            jwk_service,
+            jwt_issuer,
+            jwt_audience,
+            mode: JwtVerifierMode::LoreClaims,
+        }
+    }
+
+    /// `[server.auth.oidc]`'s authn-only mode, accepting an ID token whose
+    /// `jwt_audience` is the client id.
+    pub fn oidc(
+        jwk_service: Arc<dyn JWKService>,
+        jwt_issuer: Option<String>,
+        jwt_audience: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            jwk_service,
+            jwt_issuer,
+            jwt_audience,
+            mode: JwtVerifierMode::Oidc,
+        }
+    }
+}
+
+/// Whether a verification failure could be the signing key's fault rather than the
+/// token's — the only failures worth re-fetching keys for. Every other failure repeats
+/// against any key, so it must not become a way to ask for network work.
 fn key_may_be_stale(error: &JwtVerifierError) -> bool {
     matches!(error, JwtVerifierError::ValidationFailed(inner) if matches!(
         inner.kind(),
         jsonwebtoken::errors::ErrorKind::InvalidSignature
             | jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
     ))
+}
+
+/// Log a claim-decode failure at the level its kind deserves, and carry it on.
+///
+/// An expired token is an ordinary event on any path a client can reach, so it stays at
+/// `debug`. Both terminal decodes of [`JwtVerifier::verify_token_internal`] end here,
+/// so the level does not depend on which claim shape was tried.
+fn decode_failure(error: jsonwebtoken::errors::Error) -> JwtVerifierError {
+    if matches!(
+        error.kind(),
+        jsonwebtoken::errors::ErrorKind::ExpiredSignature
+    ) {
+        debug!(error = ?error, "Allowable error decoding JWT AuthN token");
+    } else {
+        warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
+    }
+    JwtVerifierError::ValidationFailed(error)
 }
 
 impl JwtVerifier {
@@ -151,9 +215,7 @@ impl JwtVerifier {
     /// answer and the caller must fall back to the async [`verify_token`].
     ///
     /// A signature that does not match the cached key is `Ok(None)`, not `Err`: the cached
-    /// key may be a rotated-out one, and only the async path can replace it. Reporting it as
-    /// a failure here is what left a rotated key broken until restart even though the
-    /// refresh existed.
+    /// key may be a rotated-out one, and only the async path can replace it.
     pub fn try_verify_token_cached(
         &self,
         token: &str,
@@ -189,37 +251,42 @@ impl JwtVerifier {
 
         debug!("Decoding JWT token");
 
-        if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {
-            debug!("Decoded user info: {:?}", token_data.claims);
-            Ok(token_data.claims)
-        } else {
-            let token_data = decode::<JWTUserInfo>(token, key, &validation).map_err(|error| {
-                if matches!(
-                    error.kind(),
-                    jsonwebtoken::errors::ErrorKind::ExpiredSignature
-                ) {
-                    debug!(error = ?error, "Allowable error decoding JWT AuthN token");
-                } else {
-                    warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
-                }
-                JwtVerifierError::ValidationFailed(error)
-            })?;
+        // OIDC mode reads every token as the provider-issued shape: which claims a
+        // provider happens to include must never decide what a token authorizes.
+        if self.mode == JwtVerifierMode::Oidc {
+            return decode::<OidcTokenClaims>(token, key, &validation)
+                .map_err(decode_failure)
+                .map(|token_data| token_data.claims.into());
+        }
 
-            let token = token_data.claims;
-            Ok(AuthorizationToken {
-                user_id: token.user_id,
-                issuer: token.issuer,
-                issued_at: token.issued_at,
-                expires: token.expires,
-                audience: token.audience,
-                env: token.env,
-                name: token.name,
-                preferred_username: token.preferred_username,
-                resources: None,
-                groups: None,
-                is_service_account: token.is_service_account,
-                idp: String::default(),
-            })
+        if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {
+            debug!(
+                sub = %token_data.claims.user_id,
+                iss = %token_data.claims.issuer,
+                "Decoded user info"
+            );
+            return Ok(token_data.claims);
+        }
+
+        match decode::<JWTUserInfo>(token, key, &validation) {
+            Ok(token_data) => {
+                let token = token_data.claims;
+                Ok(AuthorizationToken {
+                    user_id: token.user_id,
+                    issuer: token.issuer,
+                    issued_at: token.issued_at,
+                    expires: token.expires,
+                    audience: token.audience,
+                    env: token.env,
+                    name: token.name,
+                    preferred_username: token.preferred_username,
+                    resources: None,
+                    groups: None,
+                    is_service_account: token.is_service_account,
+                    idp: String::default(),
+                })
+            }
+            Err(error) => Err(decode_failure(error)),
         }
     }
 }
@@ -482,11 +549,7 @@ mod tests {
         }
 
         fn verifier_for(service: Arc<RotatingJWKService>) -> JwtVerifier {
-            JwtVerifier {
-                jwk_service: service,
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["Lore".to_string()]),
-            }
+            JwtVerifier::new(service, None, Some(vec!["Lore".to_string()]))
         }
 
         /// Well past `Validation`'s default 60-second leeway, so the expiry is what fails.
@@ -619,11 +682,7 @@ mod tests {
             // Serving no replacement keeps these tests about the first verdict.
             service.expect_refresh_key().returning(|_| Ok(None));
 
-            JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["Lore".to_string()]),
-            }
+            JwtVerifier::new(Arc::new(service), None, Some(vec!["Lore".to_string()]))
         }
 
         /// Assemble a token with an arbitrary header, since `encode` will not produce the
@@ -641,14 +700,9 @@ mod tests {
             format!("{header}.{claims}.{signature}")
         }
 
-        /// The algorithm-confusion forgery, and the reason the algorithm comes from the JWK
-        /// rather than the token.
-        ///
-        /// An RSA public key is published to the world in the JWKS. If the header could choose
-        /// the algorithm, an attacker would sign with HS256 using that public modulus as the
-        /// shared secret, and the server — holding the same public value — would agree. Nobody
-        /// needs the private key for this. The signature here is genuinely valid for the
-        /// algorithm the token claims; it is refused because the token does not get a say.
+        /// The algorithm-confusion forgery: HS256 signed with the published RSA modulus as
+        /// the shared secret. The signature is valid for the algorithm the token claims; it
+        /// is refused because the algorithm comes from the JWK, not the token.
         #[tokio::test]
         async fn a_public_rsa_key_is_never_accepted_as_an_hmac_secret() {
             let verifier = rsa_verifier();
@@ -693,11 +747,8 @@ mod tests {
                     Algorithm::RS256,
                 ))
             });
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["Lore".to_string()]),
-            };
+            let verifier =
+                JwtVerifier::new(Arc::new(service), None, Some(vec!["Lore".to_string()]));
 
             let forged = {
                 let jwt_key = EncodingKey::from_secret(RSA_N.as_bytes());
@@ -847,11 +898,11 @@ mod tests {
                 ))
             });
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
-            };
+            let verifier = JwtVerifier::new(
+                Arc::new(service),
+                None,
+                Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
+            );
 
             let authn_string_audience = json!({
                 "sub": "the u".to_string(),
@@ -886,11 +937,11 @@ mod tests {
                 ))
             });
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
-            };
+            let verifier = JwtVerifier::new(
+                Arc::new(service),
+                None,
+                Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
+            );
 
             let base_authz_token = mock_authz_token(vec!["URC_test".to_string()]);
             let authz_string_audience = json!({
@@ -922,11 +973,11 @@ mod tests {
                 ))
             });
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["urc.example.com".to_string(), "Lore".to_string()]),
-            };
+            let verifier = JwtVerifier::new(
+                Arc::new(service),
+                None,
+                Some(vec!["urc.example.com".to_string(), "Lore".to_string()]),
+            );
             let (original_authz_token, encoded_authz_token) =
                 make_authz_token_with_audience(vec!["Lore".to_string()]);
             let (original_authn_token, encoded_authn_token) =
@@ -956,11 +1007,7 @@ mod tests {
 
             let common_audience = vec!["urc.example.com".to_string(), "Lore".to_string()];
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(common_audience.clone()),
-            };
+            let verifier = JwtVerifier::new(Arc::new(service), None, Some(common_audience.clone()));
 
             let (original_token, encoded_token) = make_authz_token_with_audience(common_audience);
 
@@ -981,11 +1028,8 @@ mod tests {
                 ))
             });
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["Lore".to_string()]),
-            };
+            let verifier =
+                JwtVerifier::new(Arc::new(service), None, Some(vec!["Lore".to_string()]));
 
             let (original_token, encoded_token) = make_authz_token_with_audience(vec![
                 "urc.example.com".to_string(),
@@ -1008,11 +1052,8 @@ mod tests {
                 ))
             });
 
-            let verifier = JwtVerifier {
-                jwk_service: Arc::new(service),
-                jwt_issuer: None,
-                jwt_audience: Some(vec!["skein".to_string()]),
-            };
+            let verifier =
+                JwtVerifier::new(Arc::new(service), None, Some(vec!["skein".to_string()]));
 
             let (_, encoded_token) = make_authz_token_with_audience(vec!["Lore".to_string()]);
 

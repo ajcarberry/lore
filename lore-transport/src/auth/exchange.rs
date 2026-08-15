@@ -148,10 +148,6 @@ pub async fn exchange(
     } else {
         lore_trace!("No stored authz token found for {cache_key:?}");
     }
-    // The exchange below makes network calls; holding the global cache guard
-    // across them would stall every other exchange in the process.
-    drop(cache);
-
     // Load authn token for the auth service domain, and only if it may reach the recipient
     lore_trace!("Authorizing using authn identity: {identity}");
     let Some(auth_service_only_token) = lore_credential::user_info(
@@ -213,7 +209,7 @@ pub async fn exchange(
 
     lore_trace!("Cached authz token for {cache_key:?}");
 
-    self::cache().lock().await.insert(cache_key, token.clone());
+    cache.insert(cache_key, token.clone());
 
     let _ = token_store::store_user_token(&token_store_key, identity, &token, domains)
         .await
@@ -305,10 +301,6 @@ pub async fn exchange_custom_resource(
     } else {
         lore_trace!("No stored authz token found for {cache_key:?}");
     }
-    // The exchange below makes network calls; holding the global cache guard
-    // across them would stall every other exchange in the process.
-    drop(cache);
-
     lore_trace!("Authorizing using authn identity: {identity}");
     let Some(auth_service_only_token) = lore_credential::user_info(
         auth_url.as_str(),
@@ -368,7 +360,7 @@ pub async fn exchange_custom_resource(
 
     lore_trace!("Cached authz token for {cache_key:?}");
 
-    self::cache().lock().await.insert(cache_key, token.clone());
+    cache.insert(cache_key, token.clone());
 
     let _ = token_store::store_user_token(&token_store_key, identity, &token, domains)
         .await

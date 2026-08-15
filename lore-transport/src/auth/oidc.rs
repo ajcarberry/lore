@@ -1,24 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! `OpenID` Connect authentication for the `oidc+https` and `oidc+http` schemes.
-//!
-//! The provider is named by the auth URL the server advertises, such as
-//! `oidc+https://id.example.com/realms/studio?client_id=lore`.
-//! Stripping `oidc+` leaves the issuer identifier byte for byte, which every issuer check
-//! downstream compares as bytes; an issuer identifier carries no query or fragment
-//! (`OpenID` Connect Discovery 1.0 §2), so the parameters are safe to append.
-//!
-//! Three grants fit the [`Authentication`] start-and-poll shape: authorization code with
-//! PKCE over a loopback redirect ([RFC 7636], [RFC 8252] §7.3), the device authorization
-//! grant ([RFC 8628]) for [`LoginFlow::NoBrowser`], and the refresh grant.
-//!
-//! The server verifies token signatures. This module checks only what it alone can: that the
-//! authorization response belongs to the session it started (`state`) and that the ID token
-//! belongs to that same exchange (`nonce`).
-//!
-//! [RFC 7636]: https://www.rfc-editor.org/rfc/rfc7636
-//! [RFC 8252]: https://www.rfc-editor.org/rfc/rfc8252
-//! [RFC 8628]: https://www.rfc-editor.org/rfc/rfc8628
+//! `OpenID` Connect authentication for the `oidc+https` and `oidc+http` schemes:
+//! authorization code with PKCE over a loopback redirect, the device authorization grant
+//! for [`LoginFlow::NoBrowser`], and the refresh grant. Stripping `oidc+` from the
+//! advertised auth URL recovers the issuer identifier byte for byte; the server verifies
+//! token signatures, so this module checks only `state` and `nonce`.
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -77,8 +63,7 @@ const DEFAULT_DEVICE_INTERVAL: Duration = Duration::from_secs(5);
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
 /// How long a login may stay in flight before its session and loopback listener are
-/// dropped, on the next start or poll. Longer than any polling window a caller may use, so
-/// a session is never reclaimed under one, and in the range of a device code's `expires_in`.
+/// dropped, on the next start or poll. Longer than any caller's polling window.
 const FLOW_LIFETIME: Duration = Duration::from_secs(600);
 
 /// Bytes of entropy behind a code verifier and a `state`. 32 bytes base64url-encode to 43
@@ -1130,10 +1115,21 @@ impl Authentication for OidcAuthentication {
         session_code: &str,
         _correlation_id: &str,
     ) -> Result<Option<AuthenticationToken>, ProtocolError> {
-        let is_pkce = matches!(
-            self.sessions.lock().get(session_code),
-            Some(PendingSession::Pkce(_))
-        );
+        let is_pkce = {
+            let mut sessions = self.sessions.lock();
+            evict_stale(&mut sessions, Instant::now());
+            match sessions.get(session_code) {
+                Some(PendingSession::Pkce(_)) => true,
+                Some(PendingSession::Device(_)) => false,
+                None => {
+                    return Err(ProtocolError::internal(format!(
+                        "no login is in flight for this session; an abandoned one is \
+                         dropped after {}s",
+                        FLOW_LIFETIME.as_secs()
+                    )));
+                }
+            }
+        };
         if !is_pkce {
             return self.poll_device(session_code).await;
         }
@@ -1685,9 +1681,7 @@ mod tests {
             .expect("a loopback port");
         let port = listener.local_addr().expect("a bound address").port();
 
-        #[allow(clippy::disallowed_methods)]
-        // Test-only throwaway listener; no runtime split to honor.
-        tokio::spawn(async move {
+        lore_base::lore_spawn_net!(async move {
             let (mut stream, _) = listener.accept().await.expect("a request");
 
             // Drain the whole request before answering: a client still writing its body

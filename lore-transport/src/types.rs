@@ -216,8 +216,9 @@ impl TokenRecipients {
     /// The domains `token` may be sent to, always including `recipient_domain`.
     ///
     /// `SelfDescribing` derives the set from the token's own claims, refusing a
-    /// recipient the claims do not name. `Explicit` is authoritative; the
-    /// recipient is added if absent, so the invariant holds by construction.
+    /// recipient the claims do not name. `Explicit` is authoritative; the recipient
+    /// is added if absent. Enforcement happens where a stored token is loaded, by
+    /// filtering on the set this returns.
     pub fn domains_for(
         &self,
         token: &str,

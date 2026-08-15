@@ -128,7 +128,6 @@ pub(super) async fn refreshed_authn_token(
     let refreshed = authentication::find(auth_url)
         .inspect_err(|err| lore_debug!("No authentication implementation to refresh with: {err}"))
         .ok()?
-        // The correlation_id is no longer available from ExecutionContext in lore-transport.
         .refresh_authentication(auth_url, &refresh_token, "")
         .await
         .inspect_err(|err| {
@@ -146,7 +145,7 @@ pub(super) async fn refreshed_authn_token(
     {
         let mut state = refresh_state().lock().await;
         state.last_result.insert(
-            key,
+            key.clone(),
             RefreshedToken {
                 token: refreshed.token.clone(),
                 expires_ms: refreshed.expires_ms,
@@ -154,7 +153,7 @@ pub(super) async fn refreshed_authn_token(
         );
     }
 
-    if let Err(err) = token_store::store_refreshed_user_token(
+    match token_store::store_refreshed_user_token(
         auth_url,
         identity,
         &refreshed.token,
@@ -162,7 +161,11 @@ pub(super) async fn refreshed_authn_token(
     )
     .await
     {
-        lore_warn!("Failed to store the refreshed authentication token: {err}");
+        // Stored, so the record — a bearer token — need not outlive this call.
+        Ok(()) => {
+            refresh_state().lock().await.last_result.remove(&key);
+        }
+        Err(err) => lore_warn!("Failed to store the refreshed authentication token: {err}"),
     }
 
     Some(refreshed.token)

@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+#[cfg(all(test, feature = "oidc_integration_tests"))]
+pub(crate) mod oidc;
+
 /// Shared bootstrap for tests that serve a real gRPC server in process.
-#[cfg(all(test, feature = "integration_tests"))]
+#[cfg(all(
+    test,
+    any(feature = "integration_tests", feature = "oidc_integration_tests")
+))]
 pub(crate) mod grpc_common {
     use std::collections::HashMap;
     use std::sync::Arc;

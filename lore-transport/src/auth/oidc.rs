@@ -13,6 +13,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use lore_base::error::NotAuthenticated;
+use lore_base::error::NotAuthorized;
 use lore_base::error::NotSupported;
 use lore_base::lore_debug;
 use lore_base::types::RepositoryId;
@@ -57,6 +59,13 @@ const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval to use when a device authorization response omits `interval`
+/// (RFC 8628 §3.2 makes it OPTIONAL and names 5 seconds as the default).
+const DEFAULT_DEVICE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What a `slow_down` adds to the poll interval (RFC 8628 §3.5).
+const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
 /// How long a login may stay in flight before its session and loopback listener are
 /// dropped, on the next start or poll. Minutes past the longest caller polling window
@@ -389,6 +398,14 @@ fn id_token_claims(id_token: &str) -> Result<IdTokenClaims, ProtocolError> {
 /// endpoint.
 type GrantForm = Vec<(&'static str, String)>;
 
+/// The device authorization request (RFC 8628 §3.1).
+fn device_authorization_form(parts: &AuthUrlParts) -> GrantForm {
+    vec![
+        ("client_id", parts.client_id.clone()),
+        ("scope", SCOPES.to_string()),
+    ]
+}
+
 /// The authorization-code exchange (RFC 6749 §4.1.3, with RFC 7636 §4.5's verifier).
 fn authorization_code_form(session: &PkceSession, code: &str) -> GrantForm {
     vec![
@@ -397,6 +414,18 @@ fn authorization_code_form(session: &PkceSession, code: &str) -> GrantForm {
         ("redirect_uri", session.redirect_uri.clone()),
         ("client_id", session.parts.client_id.clone()),
         ("code_verifier", session.verifier.clone()),
+    ]
+}
+
+/// One poll of an approved device code (RFC 8628 §3.4).
+fn device_token_form(parts: &AuthUrlParts, device_code: &str) -> GrantForm {
+    vec![
+        (
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+        ),
+        ("device_code", device_code.to_string()),
+        ("client_id", parts.client_id.clone()),
     ]
 }
 
@@ -445,6 +474,120 @@ fn authentication_token(
         recipients: TokenRecipients::Explicit(vec![parts.issuer_domain.clone()]),
         refresh_token: tokens.refresh_token,
     })
+}
+
+/// A device authorization response (RFC 8628 §3.2).
+#[derive(Debug, Deserialize)]
+struct DeviceAuthorization {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+/// The URL to put in front of the user.
+///
+/// `verification_uri_complete` already carries the user code (RFC 8628 §3.3.1). Without it
+/// the code is appended, so the user still gets one thing to open.
+fn device_login_url(authorization: &DeviceAuthorization) -> String {
+    if let Some(complete) = &authorization.verification_uri_complete {
+        return complete.clone();
+    }
+
+    match Url::parse(&authorization.verification_uri) {
+        Ok(mut url) => {
+            url.query_pairs_mut()
+                .append_pair("user_code", &authorization.user_code);
+            url.into()
+        }
+        // Not a URL. Handed over as it is, because the user can still read it.
+        Err(_) => format!(
+            "{} (user code: {})",
+            authorization.verification_uri, authorization.user_code
+        ),
+    }
+}
+
+/// What one poll of the token endpoint established, during a device grant.
+#[derive(Debug, PartialEq, Eq)]
+enum DeviceStep {
+    Pending,
+    /// The provider asked for a longer interval (RFC 8628 §3.5).
+    SlowDown,
+    Granted(TokenResponse),
+}
+
+/// Classifies a token endpoint response during a device grant (RFC 8628 §3.5).
+fn device_poll_step(status: StatusCode, body: &str) -> Result<DeviceStep, ProtocolError> {
+    if status.is_success() {
+        return serde_json::from_str::<TokenResponse>(body)
+            .map(DeviceStep::Granted)
+            .map_err(|e| {
+                ProtocolError::internal(format!("token endpoint response is not usable: {e}"))
+            });
+    }
+
+    let error = serde_json::from_str::<TokenError>(body).unwrap_or_default();
+    let description = error
+        .error_description
+        .as_deref()
+        .unwrap_or("no description");
+
+    match error.error.as_deref() {
+        Some("authorization_pending") => Ok(DeviceStep::Pending),
+        Some("slow_down") => Ok(DeviceStep::SlowDown),
+        Some("access_denied") => {
+            lore_debug!("Device authorization was refused: {description}");
+            Err(ProtocolError::from(NotAuthorized))
+        }
+        Some("expired_token") => {
+            lore_debug!("Device code expired before it was approved: {description}");
+            Err(ProtocolError::from(NotAuthenticated))
+        }
+        Some(other) => Err(ProtocolError::internal(format!(
+            "token endpoint refused the device code: {other} ({description})"
+        ))),
+        None => Err(ProtocolError::internal(format!(
+            "token endpoint answered {status} with no error code"
+        ))),
+    }
+}
+
+/// When the next poll of a device grant is allowed, honoring the provider's `interval`
+/// (RFC 8628 §3.5) independently of the caller's own polling period.
+#[derive(Debug)]
+struct PollSchedule {
+    interval: Duration,
+    last_poll: Option<Instant>,
+}
+
+impl PollSchedule {
+    fn new(interval_secs: Option<u64>) -> Self {
+        PollSchedule {
+            interval: interval_secs.map_or(DEFAULT_DEVICE_INTERVAL, Duration::from_secs),
+            last_poll: None,
+        }
+    }
+
+    /// Whether enough time has passed since the last poll. The first poll is always due.
+    fn due(&self, now: Instant) -> bool {
+        match self.last_poll {
+            Some(last) => now.saturating_duration_since(last) >= self.interval,
+            None => true,
+        }
+    }
+
+    fn mark(&mut self, now: Instant) {
+        self.last_poll = Some(now);
+    }
+
+    /// Lengthens the interval after a `slow_down`.
+    fn slow_down(&mut self) {
+        self.interval = self.interval.saturating_add(SLOW_DOWN_INCREMENT);
+    }
 }
 
 /// A listener on `127.0.0.1:0` waiting for one authorization response.
@@ -710,12 +853,14 @@ async fn post_token_request(
 /// A login this process started and is polling for.
 enum PendingSession {
     Pkce(PkceSession),
+    Device(DeviceSession),
 }
 
 impl PendingSession {
     fn started(&self) -> Instant {
         match self {
             PendingSession::Pkce(session) => session.started,
+            PendingSession::Device(session) => session.started,
         }
     }
 }
@@ -736,6 +881,16 @@ struct PkceSession {
     redirect: oneshot::Receiver<Result<String, String>>,
     /// Held so that dropping the session closes the loopback listener.
     _listener: AbortOnDropHandle<()>,
+    started: Instant,
+}
+
+struct DeviceSession {
+    parts: AuthUrlParts,
+    token_endpoint: String,
+    /// RFC 8628 §3.4's credential for redeeming this login's tokens. It stays in here: the
+    /// handle the caller polls with is a separate, opaque string.
+    device_code: String,
+    schedule: PollSchedule,
     started: Instant,
 }
 
@@ -824,6 +979,80 @@ impl OidcAuthentication {
         })
     }
 
+    /// Starts the device authorization grant (RFC 8628 §3.1).
+    async fn start_device(
+        &self,
+        parts: AuthUrlParts,
+        discovery: Discovery,
+    ) -> Result<AuthSession, ProtocolError> {
+        let Discovery {
+            token_endpoint,
+            device_authorization_endpoint,
+            ..
+        } = discovery;
+
+        // There is no fallback: the browser flow's redirect goes to a loopback listener on
+        // this host, so an authorization URL for another device could never complete.
+        let endpoint = device_authorization_endpoint.ok_or_else(|| {
+            ProtocolError::from(NotSupported {
+                operation: format!(
+                    "login without a browser against {}: the provider advertises no \
+                     device_authorization_endpoint, so the device authorization grant \
+                     (RFC 8628) is unavailable. Log in from a host with a browser, \
+                     without --no-browser",
+                    parts.issuer
+                ),
+            })
+        })?;
+
+        let form = device_authorization_form(&parts);
+
+        let client = http_client().await?;
+        let (status, body) = send(client.post(&endpoint).form(&form)).await?;
+        if !status.is_success() {
+            let error = serde_json::from_str::<TokenError>(&body).unwrap_or_default();
+            return Err(ProtocolError::internal(format!(
+                "device authorization at {endpoint} answered {status}: {}",
+                error.error.as_deref().unwrap_or("no error code")
+            )));
+        }
+
+        let authorization: DeviceAuthorization = serde_json::from_str(&body).map_err(|e| {
+            ProtocolError::internal(format!("device authorization response is not usable: {e}"))
+        })?;
+
+        // RFC 8628 §5.2: the user has to be able to compare the code the terminal shows
+        // with the one the provider shows.
+        lore_debug!(
+            "Enter code {} at {} to authorize this login",
+            authorization.user_code,
+            authorization.verification_uri
+        );
+
+        let login_url = device_login_url(&authorization);
+        // Opaque, as in the PKCE flow: the handle travels out through a layer that logs it,
+        // and the device code redeems this login's tokens on its own.
+        let session_code = random_token();
+        let mut sessions = self.sessions.lock();
+        evict_stale(&mut sessions, Instant::now());
+        sessions.insert(
+            session_code.clone(),
+            PendingSession::Device(DeviceSession {
+                parts,
+                token_endpoint,
+                device_code: authorization.device_code,
+                schedule: PollSchedule::new(authorization.interval),
+                started: Instant::now(),
+            }),
+        );
+        drop(sessions);
+
+        Ok(AuthSession {
+            session_code,
+            login_url,
+        })
+    }
+
     /// Takes the PKCE session's secrets out of the map, with the redirect the browser
     /// delivered. `None` while the browser has not come back.
     fn take_pkce(
@@ -869,6 +1098,60 @@ impl OidcAuthentication {
         let tokens = post_token_request(&session.token_endpoint, &form).await?;
         authentication_token(tokens, Some(&session.nonce), &session.parts)
     }
+
+    /// One poll of a device grant. Returns `None` while approval is outstanding.
+    async fn poll_device(
+        &self,
+        session_code: &str,
+    ) -> Result<Option<AuthenticationToken>, ProtocolError> {
+        // The provider's interval is authoritative, so a poll that is not due yet does not
+        // reach the network.
+        let (token_endpoint, parts, device_code) = {
+            let mut sessions = self.sessions.lock();
+            evict_stale(&mut sessions, Instant::now());
+            let Some(PendingSession::Device(session)) = sessions.get_mut(session_code) else {
+                return Err(ProtocolError::internal(
+                    "no device authorization is in flight for this session",
+                ));
+            };
+            let now = Instant::now();
+            if !session.schedule.due(now) {
+                return Ok(None);
+            }
+            session.schedule.mark(now);
+            (
+                session.token_endpoint.clone(),
+                session.parts.clone(),
+                session.device_code.clone(),
+            )
+        };
+
+        let form = device_token_form(&parts, &device_code);
+
+        let client = http_client().await?;
+        let (status, body) = send(client.post(&token_endpoint).form(&form)).await?;
+
+        match device_poll_step(status, &body) {
+            Ok(DeviceStep::Pending) => Ok(None),
+            Ok(DeviceStep::SlowDown) => {
+                if let Some(PendingSession::Device(session)) =
+                    self.sessions.lock().get_mut(session_code)
+                {
+                    session.schedule.slow_down();
+                }
+                Ok(None)
+            }
+            Ok(DeviceStep::Granted(tokens)) => {
+                self.sessions.lock().remove(session_code);
+                // RFC 8628 carries no nonce; the device code is the binding.
+                Ok(Some(authentication_token(tokens, None, &parts)?))
+            }
+            Err(e) => {
+                self.sessions.lock().remove(session_code);
+                Err(e)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -887,10 +1170,7 @@ impl Authentication for OidcAuthentication {
 
         match flow {
             LoginFlow::Browser => self.start_pkce(parts, discovery).await,
-            // The device authorization grant lands in the next phase.
-            LoginFlow::NoBrowser => Err(ProtocolError::from(NotSupported {
-                operation: "start_auth_session --no-browser".to_string(),
-            })),
+            LoginFlow::NoBrowser => self.start_device(parts, discovery).await,
         }
     }
 
@@ -901,16 +1181,23 @@ impl Authentication for OidcAuthentication {
         session_code: &str,
         _correlation_id: &str,
     ) -> Result<Option<AuthenticationToken>, ProtocolError> {
-        {
+        let is_pkce = {
             let mut sessions = self.sessions.lock();
             evict_stale(&mut sessions, Instant::now());
-            if !matches!(sessions.get(session_code), Some(PendingSession::Pkce(_))) {
-                return Err(ProtocolError::internal(format!(
-                    "no login is in flight for this session; an abandoned one is \
-                     dropped after {}s",
-                    FLOW_LIFETIME.as_secs()
-                )));
+            match sessions.get(session_code) {
+                Some(PendingSession::Pkce(_)) => true,
+                Some(PendingSession::Device(_)) => false,
+                None => {
+                    return Err(ProtocolError::internal(format!(
+                        "no login is in flight for this session; an abandoned one is \
+                         dropped after {}s",
+                        FLOW_LIFETIME.as_secs()
+                    )));
+                }
             }
+        };
+        if !is_pkce {
+            return self.poll_device(session_code).await;
         }
 
         let Some((session, target)) = self.take_pkce(session_code)? else {
@@ -1433,6 +1720,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn no_browser_login_against_a_provider_without_the_device_grant_fails_cleanly() {
+        let auth = OidcAuthentication::default();
+        let discovery = parse_discovery(
+            r#"{"issuer":"https://id.example.com",
+                "authorization_endpoint":"https://id.example.com/authorize",
+                "token_endpoint":"https://id.example.com/token"}"#,
+            "https://id.example.com",
+        )
+        .expect("discovery should parse");
+        assert_eq!(discovery.device_authorization_endpoint, None);
+
+        let error = auth
+            .start_device(parts(), discovery)
+            .await
+            .expect_err("there is no headless ceremony to run");
+
+        assert!(
+            error.is_not_supported(),
+            "the CLI has to be able to tell this from a transport failure, got: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("device_authorization_endpoint"),
+            "the message must name the missing capability, got: {message}"
+        );
+        assert!(
+            message.contains("browser"),
+            "the message must say what to do instead, got: {message}"
+        );
+    }
+
     /// Answers one HTTP request on a loopback port with a canned body.
     async fn one_shot_provider(body: impl Into<String>) -> String {
         use tokio::io::AsyncReadExt;
@@ -1482,6 +1801,34 @@ mod tests {
         });
 
         format!("http://127.0.0.1:{port}/device")
+    }
+
+    /// RFC 8628's `device_code` is a bearer credential and the session handle is logged, so
+    /// the two must not be the same string.
+    #[tokio::test]
+    async fn a_device_login_hands_back_a_handle_that_is_not_the_device_code() {
+        let endpoint = one_shot_provider(
+            r#"{"device_code":"the-device-code","user_code":"WDJB-MJHT",
+                "verification_uri":"https://id.example.com/device","interval":5}"#,
+        )
+        .await;
+        let auth = OidcAuthentication::default();
+        let discovery = Discovery {
+            issuer: "https://id.example.com".to_string(),
+            authorization_endpoint: "https://id.example.com/authorize".to_string(),
+            token_endpoint: "https://id.example.com/token".to_string(),
+            device_authorization_endpoint: Some(endpoint),
+        };
+
+        let session = auth
+            .start_device(parts(), discovery)
+            .await
+            .expect("the device authorization should start");
+
+        assert_ne!(
+            session.session_code, "the-device-code",
+            "the device code is the session handle, and the handle gets logged"
+        );
     }
 
     /// The nonce the session generated has to reach the check the exchange performs.
@@ -1555,6 +1902,132 @@ mod tests {
             .expect("the redirect target");
         assert!(target.contains("state=the-state"), "{target}");
         assert!(target.contains("code=the-code"), "{target}");
+    }
+
+    #[test]
+    fn device_login_url_prefers_the_complete_verification_uri() {
+        let authorization = DeviceAuthorization {
+            device_code: "device".to_string(),
+            user_code: "WDJB-MJHT".to_string(),
+            verification_uri: "https://id.example.com/device".to_string(),
+            verification_uri_complete: Some(
+                "https://id.example.com/device?code=WDJB-MJHT".to_string(),
+            ),
+            interval: Some(5),
+        };
+        assert_eq!(
+            device_login_url(&authorization),
+            "https://id.example.com/device?code=WDJB-MJHT"
+        );
+    }
+
+    #[test]
+    fn device_login_url_falls_back_to_the_uri_and_user_code() {
+        let authorization = DeviceAuthorization {
+            device_code: "device".to_string(),
+            user_code: "WDJB-MJHT".to_string(),
+            verification_uri: "https://id.example.com/device".to_string(),
+            verification_uri_complete: None,
+            interval: None,
+        };
+        let url = device_login_url(&authorization);
+        assert!(
+            url.starts_with("https://id.example.com/device"),
+            "fallback should stay on the verification URI, got {url}"
+        );
+        assert!(
+            url.contains("WDJB-MJHT"),
+            "fallback should carry the user code, got {url}"
+        );
+    }
+
+    #[test]
+    fn device_poll_maps_authorization_pending_to_pending() {
+        assert_eq!(
+            device_poll_step(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"authorization_pending"}"#
+            )
+            .expect("pending is not a failure"),
+            DeviceStep::Pending
+        );
+    }
+
+    #[test]
+    fn device_poll_maps_slow_down_to_the_back_off_step() {
+        assert_eq!(
+            device_poll_step(StatusCode::BAD_REQUEST, r#"{"error":"slow_down"}"#)
+                .expect("slow_down is not a failure"),
+            DeviceStep::SlowDown
+        );
+    }
+
+    #[test]
+    fn device_poll_maps_access_denied_to_not_authorized() {
+        let error = device_poll_step(StatusCode::BAD_REQUEST, r#"{"error":"access_denied"}"#)
+            .expect_err("a refusal is terminal");
+        assert!(error.is_not_authorized(), "got {error}");
+    }
+
+    #[test]
+    fn device_poll_maps_expired_token_to_not_authenticated() {
+        let error = device_poll_step(StatusCode::BAD_REQUEST, r#"{"error":"expired_token"}"#)
+            .expect_err("an expired device code is terminal");
+        assert!(error.is_not_authenticated(), "got {error}");
+    }
+
+    #[test]
+    fn device_poll_reports_an_unknown_error() {
+        device_poll_step(StatusCode::BAD_REQUEST, r#"{"error":"invalid_client"}"#)
+            .expect_err("an unrecognized error must not be mistaken for pending");
+    }
+
+    #[test]
+    fn device_poll_returns_the_tokens_once_approved() {
+        let step = device_poll_step(
+            StatusCode::OK,
+            r#"{"id_token":"the-id-token","refresh_token":"the-refresh-token","token_type":"Bearer"}"#,
+        )
+        .expect("approval should parse");
+        let DeviceStep::Granted(tokens) = step else {
+            panic!("expected tokens, got {step:?}");
+        };
+        assert_eq!(tokens.id_token.as_deref(), Some("the-id-token"));
+        assert_eq!(tokens.refresh_token.as_deref(), Some("the-refresh-token"));
+    }
+
+    #[test]
+    fn poll_schedule_honors_the_advertised_interval() {
+        let start = Instant::now();
+        let mut schedule = PollSchedule::new(Some(7));
+
+        assert!(schedule.due(start), "the first poll is always due");
+        schedule.mark(start);
+        assert!(!schedule.due(start + Duration::from_secs(6)));
+        assert!(schedule.due(start + Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn poll_schedule_defaults_the_interval_when_the_provider_omits_it() {
+        let start = Instant::now();
+        let mut schedule = PollSchedule::new(None);
+        schedule.mark(start);
+        assert!(!schedule.due(start + DEFAULT_DEVICE_INTERVAL - Duration::from_millis(1)));
+        assert!(schedule.due(start + DEFAULT_DEVICE_INTERVAL));
+    }
+
+    #[test]
+    fn poll_schedule_backs_off_on_slow_down() {
+        let start = Instant::now();
+        let mut schedule = PollSchedule::new(Some(5));
+        schedule.mark(start);
+        schedule.slow_down();
+
+        assert!(
+            !schedule.due(start + Duration::from_secs(9)),
+            "slow_down must lengthen the interval"
+        );
+        assert!(schedule.due(start + Duration::from_secs(10)));
     }
 
     #[test]

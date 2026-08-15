@@ -97,6 +97,10 @@ impl EventError for InteractiveLoginError {
 // To be read from config somehow
 const POLLING_MAX_RETRIES: u64 = 30;
 const POLLING_INTERVAL_SECS: u64 = 5;
+/// A `--no-browser` login is approved by a human on a second device, so it gets
+/// minutes rather than the browser flow's 150 seconds — while staying under a
+/// typical device code's 600-second lifetime.
+const NO_BROWSER_POLLING_MAX_RETRIES: u64 = 110;
 
 /// Exchanges an external token for a URC authentication token via the
 /// registered `Authentication` implementation.
@@ -307,12 +311,18 @@ pub async fn interactive(
     }
 
     // 3. Poll until complete or timeout
+    let max_retries = if no_browser {
+        NO_BROWSER_POLLING_MAX_RETRIES
+    } else {
+        POLLING_MAX_RETRIES
+    };
     let authn = poll_interactive_session(
         &*auth_impl,
         &auth_url,
         &client_state,
         &session.session_code,
         &correlation_id,
+        max_retries,
     )
     .await?;
 
@@ -358,8 +368,9 @@ async fn poll_interactive_session(
     client_state: &str,
     session_code: &str,
     correlation_id: &str,
+    max_retries: u64,
 ) -> Result<AuthenticationToken, InteractiveLoginError> {
-    for _ in 0..POLLING_MAX_RETRIES {
+    for _ in 0..max_retries {
         let result = auth
             .poll_auth_session(auth_url, client_state, session_code, correlation_id)
             .await

@@ -175,13 +175,14 @@ This field is optional. When it's absent, the server starts with the presigned U
 
 ### Authentication
 
-`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` (or its `[server.auth.jwk]` sub-table) is absent — as in every shipped config — JWT verification is disabled and the gRPC services accept unauthenticated requests.
+`[server.auth]` configures JWT verification for gRPC, HTTP, and QUIC. When `[server.auth]` (or its `[server.auth.jwk]` and `[server.auth.oidc]` sub-tables) is absent — as in every shipped config — JWT verification is disabled and every protocol accepts unauthenticated requests.
 
 | Field | Default | Description |
 | --- | --- | --- |
 | `jwt_issuer` | none | Expected JWT `iss` claim. When set, tokens with a different issuer are rejected; when unset, issuer validation is skipped. |
 | `jwt_audience` | none | Array of accepted JWT `aud` values. A token's audience must match one entry; when unset, audience validation is skipped. |
 | `jwk` | none | The `[server.auth.jwk]` sub-table below. Its presence enables JWT verification. |
+| `oidc` | none | The `[server.auth.oidc]` sub-table below: direct verification of a standard OpenID Connect provider's tokens. |
 
 `[server.auth.jwk]`:
 
@@ -196,6 +197,21 @@ jwt_audience = ["lore-service"]
 
 [server.auth.jwk]
 endpoint = "https://accounts.example.com/.well-known/jwks.json"
+```
+
+`[server.auth.oidc]`: direct verification of a standard OpenID Connect provider's tokens, configured with an issuer and a client id. At startup the server fetches `{issuer}/.well-known/openid-configuration`, checks the document's `issuer` against the configured one, and feeds `jwks_uri` to the same key-set machinery `[server.auth.jwk]` uses directly.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `issuer` | none (required) | The provider's issuer identifier, exactly as it publishes it — the same string it puts in the `iss` claim. It must carry no query or fragment. |
+| `client_id` | none (required) | The public client id registered for Lore with the provider. |
+| `authorize_all_repositories` | none (required) | A configured block that omits this, or sets it to `false`, fails startup validation: a verified token authorizes every repository on the server, and per-repository authorization from provider claims is not implemented, so an operator has to say explicitly that the coarse grant is what they want. |
+
+```toml
+[server.auth.oidc]
+issuer = "https://id.example.com"
+client_id = "lore"
+authorize_all_repositories = true
 ```
 
 ## Store settings

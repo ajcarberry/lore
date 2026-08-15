@@ -2873,6 +2873,7 @@ dependencies = [
  "tracing-ecs",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "uuid",
  "vergen",
  "x509-parser",

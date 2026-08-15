@@ -8,6 +8,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lore_base::error::NotSupported;
 use lore_base::lore_debug;
 use lore_base::types::RepositoryId;
@@ -24,6 +26,11 @@ use crate::types::*;
 /// Where a provider publishes its metadata (`OpenID` Connect Discovery 1.0 §4).
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// `offline_access` asks a conformant provider for a refresh token. `profile` and `email`
+/// carry the optional display claims; the code falls back to `sub` without them.
+const SCOPES: &str = "openid profile email offline_access";
+
 /// Cap on a provider response body, so a broken or hostile endpoint cannot stream
 /// unbounded bytes into memory.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -32,6 +39,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// Bytes of entropy behind a code verifier and a `state`. 32 bytes base64url-encode to 43
+/// characters, the minimum RFC 7636 §4.1 allows for a verifier.
+const RANDOM_BYTES: usize = 32;
+
 /// What the advertised auth URL says about the provider.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AuthUrlParts {
@@ -39,9 +51,7 @@ struct AuthUrlParts {
     issuer: String,
     /// Derived exactly as the token-recipient guard derives a remote's, so the two are
     /// comparable without normalizing either.
-    #[allow(dead_code)] // Read by the login flows in the following phases.
     issuer_domain: String,
-    #[allow(dead_code)] // Read by the login flows in the following phases.
     client_id: String,
 }
 
@@ -195,6 +205,224 @@ fn check_endpoint(member: &str, endpoint: &str) -> Result<(), ProtocolError> {
     }
 
     Ok(())
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// The S256 code challenge for a verifier (RFC 7636 §4.2).
+fn code_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        verifier.as_bytes(),
+    ))
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// `RANDOM_BYTES` of entropy, base64url without padding: 43 characters from the unreserved
+/// set, which is what RFC 7636 §4.1 asks of a code verifier.
+fn random_token() -> String {
+    URL_SAFE_NO_PAD.encode(rand::random::<[u8; RANDOM_BYTES]>())
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// Builds the provider's authorization URL for a PKCE login.
+fn authorization_url(
+    discovery: &Discovery,
+    parts: &AuthUrlParts,
+    redirect_uri: &str,
+    state: &str,
+    nonce: &str,
+    challenge: &str,
+) -> Result<String, ProtocolError> {
+    let mut url = Url::parse(&discovery.authorization_endpoint).map_err(|e| {
+        ProtocolError::internal(format!(
+            "provider advertises an unusable authorization_endpoint '{}': {e}",
+            discovery.authorization_endpoint
+        ))
+    })?;
+
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &parts.client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", SCOPES)
+            .append_pair("state", state)
+            .append_pair("nonce", nonce)
+            .append_pair("code_challenge", challenge)
+            .append_pair("code_challenge_method", "S256");
+    }
+
+    Ok(url.into())
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// What the browser delivered to the loopback redirect.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CallbackOutcome {
+    state: Option<String>,
+    code: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// Reads the query out of a redirect's request target (`/callback?code=...&state=...`).
+fn callback_outcome(request_target: &str) -> Result<CallbackOutcome, ProtocolError> {
+    // The target is origin-form (`/callback?...`), which is not a URL on its own. The
+    // authority is irrelevant -- only the query is read.
+    let url = Url::parse("http://localhost")
+        .and_then(|base| base.join(request_target))
+        .map_err(|e| {
+            ProtocolError::internal(format!("redirect request target is not usable: {e}"))
+        })?;
+
+    let mut outcome = CallbackOutcome::default();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "state" => outcome.state = Some(value.into_owned()),
+            "code" => outcome.code = Some(value.into_owned()),
+            "error" => outcome.error = Some(value.into_owned()),
+            "error_description" => outcome.error_description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    Ok(outcome)
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// Returns the authorization code, having first established that the response belongs to
+/// this session.
+///
+/// The `state` comparison runs before the code and before any provider-reported error is
+/// read: a response from another session is not evidence about this one either way.
+fn authorization_code(
+    outcome: &CallbackOutcome,
+    expected_state: &str,
+) -> Result<String, ProtocolError> {
+    if outcome.state.as_deref() != Some(expected_state) {
+        return Err(ProtocolError::internal(
+            "authorization response carries the wrong state and does not belong to this login",
+        ));
+    }
+
+    if let Some(error) = &outcome.error {
+        let description = outcome
+            .error_description
+            .as_deref()
+            .unwrap_or("no description");
+        // `error_description` is the only place the user learns what to fix.
+        return Err(ProtocolError::internal(format!(
+            "provider refused the authorization request: {error} ({description})"
+        )));
+    }
+
+    outcome
+        .code
+        .clone()
+        .filter(|code| !code.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::internal("authorization response carries neither a code nor an error")
+        })
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// A token endpoint success response. The ID token is the credential.
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+struct TokenResponse {
+    /// Optional on a refresh: `OpenID` Connect Core §12.2 does not oblige a provider to
+    /// reissue an ID token for a refresh grant.
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// A token endpoint error response (RFC 6749 §5.2).
+#[derive(Debug, Default, Deserialize)]
+struct TokenError {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// The ID token claims this client reads. Only `sub` and `exp` are required of it; `name`
+/// and `preferred_username` arrive with the `profile` scope.
+#[derive(Debug, Deserialize)]
+struct IdTokenClaims {
+    sub: String,
+    exp: u64,
+    #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    preferred_username: Option<String>,
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// Reads an ID token's claims without verifying its signature, which is the server's job.
+fn id_token_claims(id_token: &str) -> Result<IdTokenClaims, ProtocolError> {
+    lore_credential::insecure_decode_token_as::<IdTokenClaims>(id_token)
+        .map(|data| data.claims)
+        .map_err(|e| ProtocolError::internal(format!("ID token claims are not readable: {e}")))
+}
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// The form fields of one request to the provider's token or device authorization
+/// endpoint.
+type GrantForm = Vec<(&'static str, String)>;
+
+#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// Turns a token response into an [`AuthenticationToken`].
+///
+/// `expected_nonce` is `Some` for a login and `None` for a refresh, where `OpenID` Connect
+/// Core §12.2 makes the claim optional. The ID token is always the credential.
+fn authentication_token(
+    tokens: TokenResponse,
+    expected_nonce: Option<&str>,
+    parts: &AuthUrlParts,
+) -> Result<AuthenticationToken, ProtocolError> {
+    let Some(id_token) = tokens.id_token.as_deref() else {
+        return Err(ProtocolError::internal(
+            "the token endpoint returned no id_token, so this deployment has no \
+             credential to present",
+        ));
+    };
+    let claims = id_token_claims(id_token)?;
+
+    // Core §3.1.3.3: a login response always carries an ID token, and the nonce travels
+    // on it.
+    if let Some(expected) = expected_nonce
+        && claims.nonce.as_deref() != Some(expected)
+    {
+        return Err(ProtocolError::internal(
+            "ID token does not echo this login's nonce and may be a replay",
+        ));
+    }
+
+    let user_id = claims.sub.clone();
+    let expires = claims.exp;
+    let user_name = claims
+        .name
+        .or(claims.preferred_username)
+        .unwrap_or(claims.sub);
+
+    Ok(AuthenticationToken {
+        token: id_token.to_string(),
+        user_id,
+        user_name,
+        // Claims count seconds since the epoch; every other Lore timestamp is milliseconds.
+        expires_ms: expires.saturating_mul(1000),
+        // The issuer already holds the token. The orchestration layer adds the remote the
+        // login was performed against.
+        recipients: TokenRecipients::Explicit(vec![parts.issuer_domain.clone()]),
+        refresh_token: tokens.refresh_token,
+    })
 }
 
 /// The HTTP client, built on the net runtime and pooled so a login's several requests to
@@ -404,6 +632,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::types::unsigned_jwt;
 
     const DISCOVERY_JSON: &str = r#"{
         "issuer": "https://id.example.com",
@@ -413,8 +642,42 @@ mod tests {
         "jwks_uri": "https://id.example.com/jwks.json"
     }"#;
 
+    fn parts() -> AuthUrlParts {
+        AuthUrlParts {
+            issuer: "https://id.example.com".to_string(),
+            issuer_domain: "id.example.com".to_string(),
+            client_id: "lore".to_string(),
+        }
+    }
+
     fn discovery() -> Discovery {
         parse_discovery(DISCOVERY_JSON, "https://id.example.com").expect("discovery should parse")
+    }
+
+    /// Pinned to RFC 7636 Appendix B's worked example rather than to this code's output.
+    #[test]
+    fn code_challenge_matches_the_rfc_7636_test_vector() {
+        assert_eq!(
+            code_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn code_verifier_uses_the_rfc_7636_length_and_alphabet() {
+        let verifier = random_token();
+        assert!(
+            (43..=128).contains(&verifier.len()),
+            "verifier length {} is outside 43..=128",
+            verifier.len()
+        );
+        assert!(
+            verifier
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')),
+            "verifier {verifier} uses characters outside the unreserved set"
+        );
+        assert_ne!(verifier, random_token(), "verifier is not random");
     }
 
     #[test]
@@ -596,6 +859,222 @@ mod tests {
         let discovery =
             parse_discovery(body, "https://id.example.com").expect("discovery should parse");
         assert_eq!(discovery.device_authorization_endpoint, None);
+    }
+
+    #[test]
+    fn authorization_url_carries_pkce_state_and_nonce() {
+        let url = authorization_url(
+            &discovery(),
+            &parts(),
+            "http://127.0.0.1:49152/callback",
+            "the-state",
+            "the-nonce",
+            "the-challenge",
+        )
+        .expect("authorization URL should build");
+
+        let url = Url::parse(&url).expect("authorization URL should be a URL");
+        let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            url.origin(),
+            Url::parse("https://id.example.com").unwrap().origin()
+        );
+        assert_eq!(url.path(), "/authorize");
+        assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(query.get("client_id").map(String::as_str), Some("lore"));
+        assert_eq!(
+            query.get("redirect_uri").map(String::as_str),
+            Some("http://127.0.0.1:49152/callback")
+        );
+        assert_eq!(query.get("state").map(String::as_str), Some("the-state"));
+        assert_eq!(query.get("nonce").map(String::as_str), Some("the-nonce"));
+        assert_eq!(
+            query.get("code_challenge").map(String::as_str),
+            Some("the-challenge")
+        );
+        assert_eq!(
+            query.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert!(
+            query
+                .get("scope")
+                .is_some_and(|scope| scope.split(' ').any(|s| s == "offline_access")),
+            "offline_access is what asks for a refresh token"
+        );
+    }
+
+    #[test]
+    fn callback_query_is_read_from_the_request_target() {
+        let outcome = callback_outcome("/callback?code=the-code&state=the-state")
+            .expect("the target should parse");
+        assert_eq!(
+            outcome,
+            CallbackOutcome {
+                state: Some("the-state".to_string()),
+                code: Some("the-code".to_string()),
+                error: None,
+                error_description: None,
+            }
+        );
+    }
+
+    #[test]
+    fn callback_code_is_returned_when_the_state_matches() {
+        let outcome =
+            callback_outcome("/callback?code=the-code&state=the-state").expect("should parse");
+        assert_eq!(
+            authorization_code(&outcome, "the-state").expect("the code should be accepted"),
+            "the-code"
+        );
+    }
+
+    #[test]
+    fn callback_with_a_mismatched_state_is_refused() {
+        let outcome =
+            callback_outcome("/callback?code=the-code&state=another-state").expect("should parse");
+        authorization_code(&outcome, "the-state")
+            .expect_err("a response from another session must not be accepted");
+    }
+
+    #[test]
+    fn callback_without_a_state_is_refused() {
+        let outcome = callback_outcome("/callback?code=the-code").expect("should parse");
+        authorization_code(&outcome, "the-state").expect_err("an unbound response is not ours");
+    }
+
+    #[test]
+    fn callback_error_with_a_wrong_state_is_refused_as_a_state_mismatch() {
+        let outcome = callback_outcome("/callback?error=access_denied&state=another-state")
+            .expect("should parse");
+        let error = authorization_code(&outcome, "the-state")
+            .expect_err("a foreign error response must not be accepted");
+        assert!(
+            error.to_string().contains("state"),
+            "the state mismatch should be the reported cause, got: {error}"
+        );
+    }
+
+    #[test]
+    fn callback_error_is_reported_when_the_state_matches() {
+        let outcome = callback_outcome(
+            "/callback?error=access_denied&error_description=User%20said%20no&state=the-state",
+        )
+        .expect("should parse");
+        let error = authorization_code(&outcome, "the-state").expect_err("the provider refused");
+        assert!(
+            error.to_string().contains("access_denied"),
+            "the provider's error should be reported, got: {error}"
+        );
+    }
+
+    #[test]
+    fn callback_without_a_code_is_refused() {
+        let outcome = callback_outcome("/callback?state=the-state").expect("should parse");
+        authorization_code(&outcome, "the-state").expect_err("there is nothing to exchange");
+    }
+
+    #[test]
+    fn id_token_nonce_mismatch_is_refused() {
+        let tokens = TokenResponse {
+            id_token: Some(unsigned_jwt(
+                r#"{"sub":"user-1","exp":1000,"nonce":"another-nonce"}"#,
+            )),
+            refresh_token: None,
+        };
+        authentication_token(tokens, Some("the-nonce"), &parts())
+            .expect_err("a replayed token from another exchange must not be accepted");
+    }
+
+    #[test]
+    fn id_token_without_a_nonce_is_refused_on_a_login() {
+        let tokens = TokenResponse {
+            id_token: Some(unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#)),
+            refresh_token: None,
+        };
+        authentication_token(tokens, Some("the-nonce"), &parts())
+            .expect_err("a login's ID token has to echo the nonce that was sent");
+    }
+
+    #[test]
+    fn id_token_becomes_the_credential_with_the_issuer_as_its_recipient() {
+        let id_token = unsigned_jwt(
+            r#"{"sub":"user-1","exp":1000,"nonce":"the-nonce","name":"Ada Lovelace"}"#,
+        );
+        let tokens = TokenResponse {
+            id_token: Some(id_token.clone()),
+            refresh_token: Some("the-refresh-token".to_string()),
+        };
+        let token = authentication_token(tokens, Some("the-nonce"), &parts())
+            .expect("the token should be accepted");
+
+        assert_eq!(token.token, id_token, "the ID token is the credential");
+        assert_eq!(token.user_id, "user-1");
+        assert_eq!(token.user_name, "Ada Lovelace");
+        assert_eq!(token.expires_ms, 1_000_000);
+        assert_eq!(token.refresh_token.as_deref(), Some("the-refresh-token"));
+        assert_eq!(
+            token.recipients,
+            TokenRecipients::Explicit(vec!["id.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn display_name_falls_back_through_preferred_username_to_sub() {
+        let tokens = TokenResponse {
+            id_token: Some(unsigned_jwt(
+                r#"{"sub":"user-1","exp":1,"preferred_username":"ada"}"#,
+            )),
+            refresh_token: None,
+        };
+        let token = authentication_token(tokens, None, &parts()).expect("should be accepted");
+        assert_eq!(token.user_name, "ada");
+
+        let tokens = TokenResponse {
+            id_token: Some(unsigned_jwt(r#"{"sub":"user-1","exp":1}"#)),
+            refresh_token: None,
+        };
+        let token = authentication_token(tokens, None, &parts()).expect("should be accepted");
+        assert_eq!(token.user_name, "user-1");
+    }
+
+    #[test]
+    fn a_refreshed_id_token_need_not_carry_a_nonce() {
+        let tokens = TokenResponse {
+            id_token: Some(unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#)),
+            refresh_token: Some("rotated".to_string()),
+        };
+        let token =
+            authentication_token(tokens, None, &parts()).expect("refresh should be accepted");
+        assert_eq!(token.user_id, "user-1");
+    }
+
+    #[test]
+    fn a_refresh_without_an_id_token_is_refused_where_the_id_token_is_the_credential() {
+        let tokens = TokenResponse {
+            id_token: None,
+            refresh_token: Some("rotated".to_string()),
+        };
+        let error = authentication_token(tokens, None, &parts())
+            .expect_err("there is no credential to store");
+        assert!(
+            error.to_string().contains("id_token"),
+            "the diagnostic should name the missing member: {error}"
+        );
+    }
+
+    #[test]
+    fn a_login_without_an_id_token_is_refused() {
+        let tokens = TokenResponse {
+            id_token: None,
+            ..Default::default()
+        };
+        let error = authentication_token(tokens, Some("the-nonce"), &parts())
+            .expect_err("a login cannot complete without an ID token");
+        assert!(
+            error.to_string().contains("id_token"),
+            "the diagnostic should name the missing member: {error}"
+        );
     }
 
     #[test]

@@ -2960,6 +2960,7 @@ dependencies = [
  "rand",
  "rcgen",
  "reqwest",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "serde",

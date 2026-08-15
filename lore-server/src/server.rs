@@ -1770,11 +1770,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 jwk_service
                     .fetch_new_keys(None /* fetch all keys */)
                     .await?;
-                let jwt_verifier = JwtVerifier {
-                    jwk_service: Arc::new(jwk_service),
-                    jwt_issuer: auth.jwt_issuer.clone(),
-                    jwt_audience: auth.jwt_audience.clone(),
-                };
+                let jwt_verifier = JwtVerifier::new(
+                    Arc::new(jwk_service),
+                    auth.jwt_issuer.clone(),
+                    auth.jwt_audience.clone(),
+                );
                 Some(jwt_verifier)
             }
             None => None,

@@ -108,7 +108,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::auth::jwk::JWKS_MAX_RESPONSE_BYTES;
+    use crate::auth::jwk::PROVIDER_MAX_RESPONSE_BYTES;
 
     #[test]
     fn discovery_url_trims_a_trailing_slash_on_the_issuer() {
@@ -208,7 +208,7 @@ mod tests {
             json!({
                 "issuer": issuer,
                 "jwks_uri": "http://issuer.invalid/jwks.json",
-                "padding": "x".repeat(JWKS_MAX_RESPONSE_BYTES),
+                "padding": "x".repeat(PROVIDER_MAX_RESPONSE_BYTES),
             })
         })
         .await;

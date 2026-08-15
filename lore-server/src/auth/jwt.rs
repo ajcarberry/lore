@@ -149,12 +149,9 @@ impl JwtVerifier {
     }
 }
 
-/// Whether a verification failure could be the signing key's fault rather than the token's.
-///
-/// A key rotated under an unchanged key id presents exactly this way, and it is the only
-/// failure worth re-fetching keys for: a token that has expired, or that names another
-/// audience or issuer, fails identically against every key that could ever be served. That
-/// distinction is what keeps an invalid token from being a way to ask for network work.
+/// Whether a verification failure could be the signing key's fault rather than the
+/// token's — the only failures worth re-fetching keys for. Every other failure repeats
+/// against any key, so it must not become a way to ask for network work.
 fn key_may_be_stale(error: &JwtVerifierError) -> bool {
     matches!(error, JwtVerifierError::ValidationFailed(inner) if matches!(
         inner.kind(),
@@ -220,9 +217,7 @@ impl JwtVerifier {
     /// answer and the caller must fall back to the async [`verify_token`].
     ///
     /// A signature that does not match the cached key is `Ok(None)`, not `Err`: the cached
-    /// key may be a rotated-out one, and only the async path can replace it. Reporting it as
-    /// a failure here is what left a rotated key broken until restart even though the
-    /// refresh existed.
+    /// key may be a rotated-out one, and only the async path can replace it.
     pub fn try_verify_token_cached(
         &self,
         token: &str,
@@ -258,6 +253,14 @@ impl JwtVerifier {
 
         debug!("Decoding JWT token");
 
+        // OIDC mode reads every token as the provider-issued shape: which claims a
+        // provider happens to include must never decide what a token authorizes.
+        if self.mode == JwtVerifierMode::Oidc {
+            return decode::<OidcTokenClaims>(token, key, &validation)
+                .map_err(decode_failure)
+                .map(|token_data| token_data.claims.into());
+        }
+
         if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {
             debug!(
                 sub = %token_data.claims.user_id,
@@ -284,14 +287,6 @@ impl JwtVerifier {
                     is_service_account: token.is_service_account,
                     idp: String::default(),
                 })
-            }
-            // Reached only once both Lore-specific claim shapes above have failed
-            // to deserialize, and only in OIDC mode: a `[server.auth.jwk]`-only
-            // verifier stops here.
-            Err(_) if self.mode == JwtVerifierMode::Oidc => {
-                decode::<OidcTokenClaims>(token, key, &validation)
-                    .map_err(decode_failure)
-                    .map(|token_data| token_data.claims.into())
             }
             Err(error) => Err(decode_failure(error)),
         }
@@ -707,14 +702,9 @@ mod tests {
             format!("{header}.{claims}.{signature}")
         }
 
-        /// The algorithm-confusion forgery, and the reason the algorithm comes from the JWK
-        /// rather than the token.
-        ///
-        /// An RSA public key is published to the world in the JWKS. If the header could choose
-        /// the algorithm, an attacker would sign with HS256 using that public modulus as the
-        /// shared secret, and the server — holding the same public value — would agree. Nobody
-        /// needs the private key for this. The signature here is genuinely valid for the
-        /// algorithm the token claims; it is refused because the token does not get a say.
+        /// The algorithm-confusion forgery: HS256 signed with the published RSA modulus as
+        /// the shared secret. The signature is valid for the algorithm the token claims; it
+        /// is refused because the algorithm comes from the JWK, not the token.
         #[tokio::test]
         async fn a_public_rsa_key_is_never_accepted_as_an_hmac_secret() {
             let verifier = rsa_verifier();

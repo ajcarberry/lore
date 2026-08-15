@@ -103,11 +103,12 @@ const JWKS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// this: an unauthenticated caller can cycle key ids and never repeat one.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Cap on the JWKS document this server will hold in memory. Generous beside any real key
-/// set — even a large provider publishes single-digit kilobytes — so the only documents it
-/// refuses are ones no identity provider would send. [`JWKS_REQUEST_TIMEOUT`] bounds how
-/// long a fetch may run, which is not the same as bounding what it delivers.
-pub(crate) const JWKS_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Cap on a provider document (JWKS or discovery) this server will hold in memory.
+/// Generous beside either — even a large provider publishes single-digit kilobytes — so
+/// the only documents it refuses are ones no identity provider would send.
+/// [`JWKS_REQUEST_TIMEOUT`] bounds how long a fetch may run, which is not the same as
+/// bounding what it delivers.
+pub(crate) const PROVIDER_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// How much of a rejected response body reaches the log. The body is whatever the endpoint
 /// chose to send, so it is neither trustworthy nor necessarily small.
@@ -121,7 +122,7 @@ pub(crate) fn body_excerpt(body: &str) -> String {
     }
 }
 
-/// Read a response body, refusing anything past [`JWKS_MAX_RESPONSE_BYTES`].
+/// Read a response body, refusing anything past [`PROVIDER_MAX_RESPONSE_BYTES`].
 ///
 /// `Content-Length` is consulted first when the endpoint offers one, but it is a claim
 /// rather than a fact — it can be absent, understated, or the response chunked — so the
@@ -130,26 +131,28 @@ pub(crate) async fn read_capped_body(
     response: &mut reqwest::Response,
 ) -> Result<String, JWKServiceError> {
     if let Some(declared) = response.content_length()
-        && declared > JWKS_MAX_RESPONSE_BYTES as u64
+        && declared > PROVIDER_MAX_RESPONSE_BYTES as u64
     {
-        warn!("JWKS response declares {declared} bytes, over the {JWKS_MAX_RESPONSE_BYTES} cap");
+        warn!(
+            "Provider response declares {declared} bytes, over the {PROVIDER_MAX_RESPONSE_BYTES} cap"
+        );
         return Err(JWKServiceError::ResponseTooLarge);
     }
 
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| {
-        warn!("failed to read JWKS response body: {e:?}");
+        warn!("failed to read provider response body: {e:?}");
         JWKServiceError::InternalError
     })? {
-        if body.len() + chunk.len() > JWKS_MAX_RESPONSE_BYTES {
-            warn!("JWKS response exceeded the {JWKS_MAX_RESPONSE_BYTES} byte cap");
+        if body.len() + chunk.len() > PROVIDER_MAX_RESPONSE_BYTES {
+            warn!("Provider response exceeded the {PROVIDER_MAX_RESPONSE_BYTES} byte cap");
             return Err(JWKServiceError::ResponseTooLarge);
         }
         body.extend_from_slice(&chunk);
     }
 
     String::from_utf8(body).map_err(|e| {
-        warn!("JWKS response was not valid UTF-8: {e}");
+        warn!("Provider response was not valid UTF-8: {e}");
         JWKServiceError::InternalError
     })
 }
@@ -371,9 +374,9 @@ impl JwkServiceImpl {
                     JWKServiceError::InternalError
                 })?
                 .len();
-            if size > JWKS_MAX_RESPONSE_BYTES as u64 {
+            if size > PROVIDER_MAX_RESPONSE_BYTES as u64 {
                 warn!(
-                    "JWKS file at {} is {size} bytes, over the {JWKS_MAX_RESPONSE_BYTES} cap",
+                    "JWKS file at {} is {size} bytes, over the {PROVIDER_MAX_RESPONSE_BYTES} cap",
                     path.display()
                 );
                 return Err(JWKServiceError::ResponseTooLarge);
@@ -572,13 +575,13 @@ fn oidc_permits_algorithm(algorithm: jsonwebtoken::Algorithm) -> bool {
 
 /// Wraps a [`JWKService`] to additionally refuse symmetric signing algorithms,
 /// for `[server.auth.oidc]` verifiers only.
-pub struct OidcJwkService {
+pub(crate) struct OidcJwkService {
     inner: Arc<dyn JWKService>,
 }
 
 impl OidcJwkService {
     /// Wrap `inner`, refusing any key it serves under a symmetric algorithm.
-    pub fn new(inner: Arc<dyn JWKService>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn JWKService>) -> Self {
         Self { inner }
     }
 }
@@ -1335,7 +1338,7 @@ mod tests {
             "an_oversized_jwks_file_is_refused",
             &format!(
                 r#"{{"keys":[],"padding":"{}"}}"#,
-                "x".repeat(JWKS_MAX_RESPONSE_BYTES)
+                "x".repeat(PROVIDER_MAX_RESPONSE_BYTES)
             ),
         );
 
@@ -1421,7 +1424,7 @@ mod tests {
     /// header and the accumulating read has to do it. This is the case that matters: an
     /// endpoint that means harm simply omits `Content-Length` or understates it.
     async fn chunked_oversized_handler() -> axum::response::Response {
-        let chunks = (0..(JWKS_MAX_RESPONSE_BYTES / 1024) + 2)
+        let chunks = (0..(PROVIDER_MAX_RESPONSE_BYTES / 1024) + 2)
             .map(|_| Ok::<_, std::io::Error>(vec![b'x'; 1024]));
 
         axum::response::Response::new(axum::body::Body::from_stream(futures::stream::iter(chunks)))
@@ -1469,11 +1472,10 @@ mod tests {
         }
 
         fn rsa_key() -> (DecodingKey, jsonwebtoken::Algorithm) {
-            (rsa_key_from_components(), jsonwebtoken::Algorithm::RS256)
-        }
-
-        fn rsa_key_from_components() -> DecodingKey {
-            DecodingKey::from_rsa_components(RSA_N, RSA_E).expect("rsa decoding key")
+            (
+                DecodingKey::from_rsa_components(RSA_N, RSA_E).expect("rsa decoding key"),
+                jsonwebtoken::Algorithm::RS256,
+            )
         }
 
         struct StaticJwkService {
@@ -1572,7 +1574,7 @@ mod tests {
             requests: requests.clone(),
             body: Arc::new(format!(
                 r#"{{"keys":[],"padding":"{}"}}"#,
-                "x".repeat(JWKS_MAX_RESPONSE_BYTES)
+                "x".repeat(PROVIDER_MAX_RESPONSE_BYTES)
             )),
             delay: Duration::ZERO,
         })

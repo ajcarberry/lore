@@ -164,11 +164,6 @@ class Lore:
         self.name = name
         self.global_dir = global_dir
         self.environment_vars = environment_vars or {}
-        # Keep the whole credential store inside the test's own directory.
-        # `LORE_AUTH_PATH` places the token file there, but the key encrypting it
-        # defaults to the OS keyring, which on macOS blocks a CLI login behind a
-        # GUI authorization prompt no test can answer.
-        self.environment_vars.setdefault("LORE_AUTH_STORE", "fallback")
         # If the caller picked a specific remote_url, mirror it into the env
         # subprocess overrides — otherwise repository_create inherits the
         # session-level LORE_REMOTE_URL pointing at the autouse server and

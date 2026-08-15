@@ -66,10 +66,9 @@ impl From<OidcTokenClaims> for AuthorizationToken {
     }
 }
 
-/// The third-and-final claim decode, reached only when the token carries
-/// none of the Lore-specific claims.
+/// The one claim decode an OIDC-mode verifier performs.
 #[cfg(test)]
-mod oidc_third_decode {
+mod oidc_decode {
     use std::ops::Add;
     use std::sync::Arc;
     use std::time::Duration;
@@ -248,10 +247,11 @@ mod oidc_third_decode {
             .expect_err("expiry is checked before the minimal shape ever matters");
     }
 
-    /// A Lore-issued token matches `AuthorizationToken` or `JWTUserInfo`
-    /// first, so it never reaches this decode or its wildcard.
+    /// Extra claims — Lore's own among them — must not change how an OIDC-mode
+    /// verifier treats a token: the claims a provider happens to emit never
+    /// decide what a token authorizes.
     #[tokio::test]
-    async fn a_full_lore_shaped_token_does_not_take_this_path() {
+    async fn lore_shaped_claims_get_the_same_oidc_treatment() {
         let mut claims = minimal_claims();
         claims["env"] = json!("the env");
         claims["name"] = json!("the name");
@@ -261,13 +261,12 @@ mod oidc_third_decode {
         let token = oidc_verifier()
             .verify_token(&encoded)
             .await
-            .expect("still verifies, via JWTUserInfo");
+            .expect("extra claims do not block acceptance");
 
         assert_eq!(token.name, "the name");
-        assert_eq!(
-            token.resources, None,
-            "authn-only path grants nothing itself"
-        );
+        assert_eq!(token.env, "", "`env` is not read in OIDC mode");
+        let resources = token.resources.expect("wildcard resource is populated");
+        assert!(resources[0].is_wildcard_resource());
     }
 
     /// The invariant the mode gate preserves: a `LoreClaims` verifier must

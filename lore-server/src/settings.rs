@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::env;
-use std::net::IpAddr;
 
 use config::Config;
 use lore_base::runtime::TokioSettings;
@@ -18,6 +17,8 @@ use lore_storage::hash::StringHash;
 use lore_telemetry::TelemetryConfig;
 use lore_telemetry::TraceConfigError;
 use serde::Deserialize;
+use url::Host;
+use url::Url;
 
 use crate::auth::jwk::JWKServiceSettings;
 use crate::grpc::server::FeatureSettings;
@@ -208,17 +209,13 @@ fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigErro
 
 /// Whether a host is this machine, matching the rule `lore-transport` applies to an
 /// `oidc+http` auth URL. `localhost` counts: it resolves to a loopback address.
-fn is_loopback_host(host: Option<&str>) -> bool {
-    let Some(host) = host else {
-        return false;
-    };
-
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+fn is_loopback_host(host: Option<Host<&str>>) -> bool {
+    match host {
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 /// `[server.auth.oidc]` offers one authorization mode: a verified token authorizes
@@ -238,15 +235,22 @@ fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> 
         return Ok(());
     };
 
-    let issuer = reqwest::Url::parse(&oidc.issuer).map_err(|e| {
+    let issuer = Url::parse(&oidc.issuer).map_err(|e| {
         config::ConfigError::Message(format!(
             "server.auth.oidc.issuer '{}' is not a URL: {e}",
             oidc.issuer
         ))
     })?;
+    if issuer.query().is_some() || issuer.fragment().is_some() {
+        return Err(config::ConfigError::Message(format!(
+            "server.auth.oidc.issuer '{}' must carry no query or fragment: an issuer \
+             identifier is a bare URL, and the derived auth_url appends its own query",
+            oidc.issuer
+        )));
+    }
     let transport_is_protected = match issuer.scheme() {
         "https" => true,
-        "http" => is_loopback_host(issuer.host_str()),
+        "http" => is_loopback_host(issuer.host()),
         _ => false,
     };
     if !transport_is_protected {
@@ -297,7 +301,6 @@ pub struct AuthSettings {
 /// `[server.auth.oidc]`: direct in-server verification of a standard `OpenID` Connect
 /// provider's tokens. See `docs/proposals/2026-08-13-oidc-authentication.md`.
 #[derive(Clone, Debug, Deserialize)]
-//#[serde(deny_unknown_fields)]
 pub struct OidcSettings {
     /// The provider's issuer identifier, exactly as it publishes it. The server checks
     /// it against the discovery document's own `issuer` member byte for byte.
@@ -600,24 +603,22 @@ mod tests {
     use crate::store::resolve_plugin_config_with_fallback;
     use crate::topology::TopologyProvider;
 
-    /// The `[server.auth.oidc]` matrix: block absent (fine), flag absent (fails),
-    /// flag `false` (fails), flag `true` (fine), and the issuer schemes the server
-    /// will fetch discovery and keys over.
+    /// The `[server.auth.oidc]` matrix: block absent (fine), the grant flag
+    /// unacknowledged (fails), and the issuer shapes the server will fetch
+    /// discovery and keys over.
     mod oidc_settings {
         use super::*;
 
-        /// A configuration whose only variable is the `[server.auth.oidc]` issuer.
-        /// Set after parsing, because `Settings` deserializes only from a `'static`
-        /// document.
-        fn settings_with_issuer(issuer: &str) -> Settings {
-            const CONFIG: &str = r#"
+        /// A minimal configuration around the given `[server.auth.oidc]` block;
+        /// empty for no block at all. Leaked because `Settings` deserializes only
+        /// from a `'static` document.
+        fn settings_with_oidc(oidc_block: &str) -> Settings {
+            let config = format!(
+                r#"
                 [server]
                 runtime_shutdown_timeout_seconds = 0
 
-                [server.auth.oidc]
-                issuer = "https://id.example.com"
-                client_id = "lore"
-                authorize_all_repositories = true
+                {oidc_block}
 
                 [immutable_store]
                 mode = "local"
@@ -632,16 +633,20 @@ mod tests {
                 [mutable_store.local]
                 path = "/tmp/mutable"
                 flush_delay_seconds = 5
-            "#;
-            let mut settings: Settings = toml::from_str(CONFIG).expect("parses");
-            let oidc = settings
-                .server
-                .auth
-                .as_mut()
-                .and_then(|auth| auth.oidc.as_mut())
-                .expect("the config carries an [server.auth.oidc] block");
-            oidc.issuer = issuer.to_string();
-            settings
+                "#
+            );
+            toml::from_str(String::leak(config)).expect("parses")
+        }
+
+        fn settings_with_issuer(issuer: &str) -> Settings {
+            settings_with_oidc(&format!(
+                r#"
+                [server.auth.oidc]
+                issuer = "{issuer}"
+                client_id = "lore"
+                authorize_all_repositories = true
+                "#
+            ))
         }
 
         #[test]
@@ -674,122 +679,45 @@ mod tests {
             assert!(error.to_string().contains("loopback"), "{error}");
         }
 
+        /// An issuer identifier is a bare URL, and the derived `auth_url` appends
+        /// its own query.
+        #[test]
+        fn issuer_with_a_query_or_fragment_fails_validation() {
+            for issuer in [
+                "https://id.example.com?tenant=studio",
+                "https://id.example.com#studio",
+            ] {
+                let error = validate_oidc_config(&settings_with_issuer(issuer))
+                    .expect_err("must fail closed");
+                assert!(error.to_string().contains("query or fragment"), "{issuer}");
+            }
+        }
+
         #[test]
         fn absent_block_passes_validation() {
-            const CONFIG: &str = r#"
-                [server]
-                runtime_shutdown_timeout_seconds = 0
-
-                [immutable_store]
-                mode = "local"
-
-                [immutable_store.local]
-                path = "/tmp/immutable"
-                flush_delay_seconds = 5
-
-                [mutable_store]
-                mode = "local"
-
-                [mutable_store.local]
-                path = "/tmp/mutable"
-                flush_delay_seconds = 5
-            "#;
-            let settings: Settings = toml::from_str(CONFIG).expect("parses with no [server.auth]");
-            assert!(validate_oidc_config(&settings).is_ok());
+            assert!(validate_oidc_config(&settings_with_oidc("")).is_ok());
         }
 
+        /// `authorize_all_repositories` has no default: a block that omits it, or
+        /// sets it `false`, must refuse to start rather than verify every token
+        /// and then deny every request.
         #[test]
-        fn flag_absent_fails_validation() {
-            const CONFIG: &str = r#"
-                [server]
-                runtime_shutdown_timeout_seconds = 0
-
-                [server.auth.oidc]
-                issuer = "https://id.example.com"
-                client_id = "lore"
-
-                [immutable_store]
-                mode = "local"
-
-                [immutable_store.local]
-                path = "/tmp/immutable"
-                flush_delay_seconds = 5
-
-                [mutable_store]
-                mode = "local"
-
-                [mutable_store.local]
-                path = "/tmp/mutable"
-                flush_delay_seconds = 5
-            "#;
-            let settings: Settings = toml::from_str(CONFIG)
-                .expect("parses: authorize_all_repositories defaults to false");
-
-            let error = validate_oidc_config(&settings).expect_err("must fail closed");
-            assert!(
-                error.to_string().contains("authorize_all_repositories"),
-                "{error}"
-            );
-        }
-
-        #[test]
-        fn flag_false_fails_validation() {
-            const CONFIG: &str = r#"
-                [server]
-                runtime_shutdown_timeout_seconds = 0
-
-                [server.auth.oidc]
-                issuer = "https://id.example.com"
-                client_id = "lore"
-                authorize_all_repositories = false
-
-                [immutable_store]
-                mode = "local"
-
-                [immutable_store.local]
-                path = "/tmp/immutable"
-                flush_delay_seconds = 5
-
-                [mutable_store]
-                mode = "local"
-
-                [mutable_store.local]
-                path = "/tmp/mutable"
-                flush_delay_seconds = 5
-            "#;
-            let settings: Settings = toml::from_str(CONFIG).expect("parses");
-
-            assert!(validate_oidc_config(&settings).is_err());
-        }
-
-        #[test]
-        fn flag_true_passes_validation() {
-            const CONFIG: &str = r#"
-                [server]
-                runtime_shutdown_timeout_seconds = 0
-
-                [server.auth.oidc]
-                issuer = "https://id.example.com"
-                client_id = "lore"
-                authorize_all_repositories = true
-
-                [immutable_store]
-                mode = "local"
-
-                [immutable_store.local]
-                path = "/tmp/immutable"
-                flush_delay_seconds = 5
-
-                [mutable_store]
-                mode = "local"
-
-                [mutable_store.local]
-                path = "/tmp/mutable"
-                flush_delay_seconds = 5
-            "#;
-            let settings: Settings = toml::from_str(CONFIG).expect("parses");
-
-            assert!(validate_oidc_config(&settings).is_ok());
+        fn an_unacknowledged_grant_fails_validation() {
+            for flag_line in ["", "authorize_all_repositories = false"] {
+                let settings = settings_with_oidc(&format!(
+                    r#"
+                    [server.auth.oidc]
+                    issuer = "https://id.example.com"
+                    client_id = "lore"
+                    {flag_line}
+                    "#
+                ));
+                let error = validate_oidc_config(&settings).expect_err("must fail closed");
+                assert!(
+                    error.to_string().contains("authorize_all_repositories"),
+                    "{error}"
+                );
+            }
         }
     }
 

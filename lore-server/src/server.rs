@@ -489,45 +489,14 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
 }
 
 /// Derive `auth_url` from `[server.auth.oidc]` when the operator left
-/// `environment.endpoint.auth_url` empty:
-/// `oidc+{scheme}://{issuer-without-scheme}?client_id=...`, with the issuer's own
-/// path preserved so stripping the `oidc+` prefix recovers the issuer string
-/// unchanged. An explicit `auth_url` always wins, and must carry the parameters
-/// itself.
-fn derive_oidc_auth_url(oidc: &OidcSettings) -> Option<String> {
-    let issuer = &oidc.issuer;
-    let Ok(issuer_url) = reqwest::Url::parse(issuer) else {
-        warn!(%issuer, "Advertising no auth_url: the OIDC issuer is not a URL");
-        return None;
-    };
-    let scheme = match issuer_url.scheme() {
-        "https" => "https",
-        "http" => "http",
-        other => {
-            warn!(%issuer, "Advertising no auth_url: no client dials an OIDC issuer over '{other}'");
-            return None;
-        }
-    };
-    let Some(host) = issuer_url.host_str() else {
-        warn!(%issuer, "Advertising no auth_url: the OIDC issuer names no host");
-        return None;
-    };
-
-    let mut derived = format!("oidc+{scheme}://{host}");
-    if let Some(port) = issuer_url.port() {
-        derived.push_str(&format!(":{port}"));
-    }
-    derived.push_str(issuer_url.path().trim_end_matches('/'));
-
-    let Ok(mut derived) = reqwest::Url::parse(&derived) else {
-        warn!(%issuer, "Advertising no auth_url: '{derived}' derived from the OIDC issuer is not a URL");
-        return None;
-    };
-    derived
-        .query_pairs_mut()
-        .append_pair("client_id", &oidc.client_id);
-
-    Some(derived.into())
+/// `environment.endpoint.auth_url` empty: `oidc+{issuer}?client_id=...`, built
+/// textually because the client recovers the issuer from it byte for byte and
+/// pins the provider's discovery document to that exact string. An explicit
+/// `auth_url` always wins, and must carry the parameters itself.
+fn derive_oidc_auth_url(oidc: &OidcSettings) -> String {
+    let client_id: String =
+        url::form_urlencoded::byte_serialize(oidc.client_id.as_bytes()).collect();
+    format!("oidc+{}?client_id={client_id}", oidc.issuer)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -612,7 +581,7 @@ async fn launch_grpc_server(
                 .unwrap_or_default()
                 .is_empty()
         })
-        .and_then(derive_oidc_auth_url);
+        .map(derive_oidc_auth_url);
 
     GrpcServerBuilder::new()
         .with_environment(environment)
@@ -2275,19 +2244,28 @@ mod tests {
             }
         }
 
+        fn oidc_client_id(client_id: &str) -> OidcSettings {
+            OidcSettings {
+                client_id: client_id.to_string(),
+                ..oidc("https://id.example.com")
+            }
+        }
+
         #[test]
         fn bare_https_issuer() {
             assert_eq!(
                 derive_oidc_auth_url(&oidc("https://id.example.com")),
-                Some("oidc+https://id.example.com?client_id=lore".to_string())
+                "oidc+https://id.example.com?client_id=lore"
             );
         }
 
+        /// The client pins discovery to the issuer byte for byte, so a path —
+        /// trailing slash included — must survive the round trip unchanged.
         #[test]
-        fn issuer_with_a_path_is_preserved() {
+        fn issuer_path_and_trailing_slash_are_preserved() {
             assert_eq!(
-                derive_oidc_auth_url(&oidc("https://id.example.com/realms/studio")),
-                Some("oidc+https://id.example.com/realms/studio?client_id=lore".to_string())
+                derive_oidc_auth_url(&oidc("https://id.example.com/realms/studio/")),
+                "oidc+https://id.example.com/realms/studio/?client_id=lore"
             );
         }
 
@@ -2295,7 +2273,15 @@ mod tests {
         fn http_issuer_derives_oidc_plus_http() {
             assert_eq!(
                 derive_oidc_auth_url(&oidc("http://127.0.0.1:1411")),
-                Some("oidc+http://127.0.0.1:1411?client_id=lore".to_string())
+                "oidc+http://127.0.0.1:1411?client_id=lore"
+            );
+        }
+
+        #[test]
+        fn client_id_is_query_encoded() {
+            assert_eq!(
+                derive_oidc_auth_url(&oidc_client_id("lore studio&co")),
+                "oidc+https://id.example.com?client_id=lore+studio%26co"
             );
         }
     }
@@ -2357,7 +2343,7 @@ mod tests {
             assert_eq!(
                 verifier.mode,
                 crate::auth::jwt::JwtVerifierMode::LoreClaims,
-                "a jwk-only verifier must not gain the OIDC third decode / wildcard grant"
+                "a jwk-only verifier must not gain the OIDC decode / wildcard grant"
             );
         }
 

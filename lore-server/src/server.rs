@@ -21,7 +21,6 @@ use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
 use lore_base::lore_spawn;
-use lore_base::lore_spawn_net;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::LoreTaskLifecycleEvent;
 use lore_base::runtime::LoreTaskSpawnLocation;
@@ -65,9 +64,11 @@ use tracing::warn;
 
 use crate::auth::discovery;
 use crate::auth::jwk::JWKService;
+use crate::auth::jwk::JWKServiceSettings;
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwk::OidcJwkService;
 use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::JwtVerifierMode;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -105,6 +106,7 @@ use crate::settings::GrpcSettings;
 use crate::settings::LocalImmutableStoreSettings;
 use crate::settings::LocalMutableStoreSettings;
 use crate::settings::NotificationSettings;
+use crate::settings::OidcSettings;
 use crate::settings::QuicSettings;
 use crate::settings::RemoteStoreSettings;
 use crate::settings::ReplicatedStoreSettings;
@@ -423,28 +425,26 @@ fn compiled_features() -> Vec<String> {
 /// Build the server's `JwtVerifier` from `[server.auth]`, when configured.
 ///
 /// `[server.auth.oidc]` supplies what `jwt_issuer`/`jwt_audience`/`jwk.endpoint`
-/// otherwise ask for twice: the server fetches the provider's discovery document
-/// on the net runtime, checks its `issuer` against the configured one, and feeds
-/// `jwks_uri` to the same `JWKService` used everywhere else. An explicit
-/// `jwt_issuer`, `jwt_audience`, or `[server.auth.jwk].endpoint` still wins,
-/// which keeps the `file://` key-set endpoint reachable.
+/// otherwise ask for twice: the server fetches the provider's discovery document,
+/// checks its `issuer` against the configured one, and feeds `jwks_uri` to the same
+/// `JWKService` used everywhere else. An explicit `jwt_issuer`, `jwt_audience`, or
+/// `[server.auth.jwk].endpoint` still wins. `jwks_uri` is the only member the
+/// document supplies, so an explicit endpoint skips the fetch altogether, which
+/// keeps the `file://` key-set endpoint reachable with no provider running.
 async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVerifier>> {
     let Some(auth) = auth else {
         return Ok(None);
     };
 
-    let (jwt_issuer, jwt_audience, jwk_settings, is_oidc) = if let Some(oidc) = auth.oidc.as_ref() {
-        let issuer = oidc.issuer.clone();
-        let document =
-            lore_spawn_net!(async move { discovery::fetch_discovery_document(&issuer).await })
-                .await??;
-
-        let jwk_settings = auth
-            .jwk
-            .clone()
-            .unwrap_or(crate::auth::jwk::JWKServiceSettings {
-                endpoint: document.jwks_uri,
-            });
+    let (jwt_issuer, jwt_audience, jwk_settings, mode) = if let Some(oidc) = auth.oidc.as_ref() {
+        let jwk_settings = match auth.jwk.clone() {
+            Some(jwk) => jwk,
+            None => JWKServiceSettings {
+                endpoint: discovery::fetch_discovery_document(&oidc.issuer)
+                    .await?
+                    .jwks_uri,
+            },
+        };
         let jwt_issuer = auth.jwt_issuer.clone().or(Some(oidc.issuer.clone()));
 
         // The server pins the client id and reads an ID token. An explicit
@@ -454,7 +454,12 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
             .clone()
             .or_else(|| Some(vec![oidc.client_id.clone()]));
 
-        (jwt_issuer, jwt_audience, jwk_settings, true)
+        (
+            jwt_issuer,
+            jwt_audience,
+            jwk_settings,
+            JwtVerifierMode::Oidc,
+        )
     } else {
         let Some(jwk) = auth.jwk.as_ref() else {
             return Ok(None);
@@ -463,7 +468,7 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
             auth.jwt_issuer.clone(),
             auth.jwt_audience.clone(),
             jwk.clone(),
-            false,
+            JwtVerifierMode::LoreClaims,
         )
     };
 
@@ -471,16 +476,15 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
     jwk_service
         .fetch_new_keys(None /* fetch all keys */)
         .await?;
-    let jwk_service: Arc<dyn JWKService> = if is_oidc {
-        Arc::new(OidcJwkService::new(Arc::new(jwk_service)))
-    } else {
-        Arc::new(jwk_service)
+
+    let jwk_service: Arc<dyn JWKService> = match mode {
+        JwtVerifierMode::Oidc => Arc::new(OidcJwkService::new(Arc::new(jwk_service))),
+        JwtVerifierMode::LoreClaims => Arc::new(jwk_service),
     };
 
-    Ok(Some(if is_oidc {
-        JwtVerifier::oidc(jwk_service, jwt_issuer, jwt_audience)
-    } else {
-        JwtVerifier::new(jwk_service, jwt_issuer, jwt_audience)
+    Ok(Some(match mode {
+        JwtVerifierMode::Oidc => JwtVerifier::oidc(jwk_service, jwt_issuer, jwt_audience),
+        JwtVerifierMode::LoreClaims => JwtVerifier::new(jwk_service, jwt_issuer, jwt_audience),
     }))
 }
 
@@ -490,21 +494,35 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
 /// path preserved so stripping the `oidc+` prefix recovers the issuer string
 /// unchanged. An explicit `auth_url` always wins, and must carry the parameters
 /// itself.
-fn derive_oidc_auth_url(oidc: &crate::settings::OidcSettings) -> Option<String> {
-    let issuer_url = reqwest::Url::parse(&oidc.issuer).ok()?;
+fn derive_oidc_auth_url(oidc: &OidcSettings) -> Option<String> {
+    let issuer = &oidc.issuer;
+    let Ok(issuer_url) = reqwest::Url::parse(issuer) else {
+        warn!(%issuer, "Advertising no auth_url: the OIDC issuer is not a URL");
+        return None;
+    };
     let scheme = match issuer_url.scheme() {
         "https" => "https",
         "http" => "http",
-        _ => return None,
+        other => {
+            warn!(%issuer, "Advertising no auth_url: no client dials an OIDC issuer over '{other}'");
+            return None;
+        }
+    };
+    let Some(host) = issuer_url.host_str() else {
+        warn!(%issuer, "Advertising no auth_url: the OIDC issuer names no host");
+        return None;
     };
 
-    let mut derived = format!("oidc+{scheme}://{}", issuer_url.host_str()?);
+    let mut derived = format!("oidc+{scheme}://{host}");
     if let Some(port) = issuer_url.port() {
         derived.push_str(&format!(":{port}"));
     }
     derived.push_str(issuer_url.path().trim_end_matches('/'));
 
-    let mut derived = reqwest::Url::parse(&derived).ok()?;
+    let Ok(mut derived) = reqwest::Url::parse(&derived) else {
+        warn!(%issuer, "Advertising no auth_url: '{derived}' derived from the OIDC issuer is not a URL");
+        return None;
+    };
     derived
         .query_pairs_mut()
         .append_pair("client_id", &oidc.client_id);
@@ -2341,6 +2359,35 @@ mod tests {
                 crate::auth::jwt::JwtVerifierMode::LoreClaims,
                 "a jwk-only verifier must not gain the OIDC third decode / wildcard grant"
             );
+        }
+
+        /// `jwks_uri` is the only member the discovery document supplies, so an
+        /// explicit endpoint has to make start-up independent of the provider
+        /// answering. The issuer here refuses connections.
+        #[tokio::test]
+        async fn an_explicit_jwk_endpoint_skips_the_discovery_fetch() {
+            let address = spawn_jwks_server(issuer_agnostic_rsa_jwks()).await;
+            let auth = AuthSettings {
+                jwk: Some(JWKServiceSettings {
+                    endpoint: format!("http://{address}/jwks"),
+                }),
+                jwt_audience: None,
+                jwt_issuer: None,
+                oidc: Some(OidcSettings {
+                    issuer: "http://127.0.0.1:1".to_string(),
+                    client_id: "lore-client".to_string(),
+                    authorize_all_repositories: true,
+                }),
+            };
+
+            let verifier = build_jwt_verifier(Some(&auth))
+                .await
+                .unwrap()
+                .expect("an unreachable issuer is never contacted");
+
+            assert_eq!(verifier.jwt_issuer, Some("http://127.0.0.1:1".to_string()));
+            assert_eq!(verifier.jwt_audience, Some(vec!["lore-client".to_string()]));
+            assert_eq!(verifier.mode, crate::auth::jwt::JwtVerifierMode::Oidc);
         }
 
         #[tokio::test]

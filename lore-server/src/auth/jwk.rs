@@ -107,14 +107,14 @@ const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// set — even a large provider publishes single-digit kilobytes — so the only documents it
 /// refuses are ones no identity provider would send. [`JWKS_REQUEST_TIMEOUT`] bounds how
 /// long a fetch may run, which is not the same as bounding what it delivers.
-const JWKS_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+pub(crate) const JWKS_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// How much of a rejected response body reaches the log. The body is whatever the endpoint
 /// chose to send, so it is neither trustworthy nor necessarily small.
 const LOGGED_BODY_LIMIT: usize = 512;
 
 /// The head of a response body, for diagnostics.
-fn body_excerpt(body: &str) -> String {
+pub(crate) fn body_excerpt(body: &str) -> String {
     match body.char_indices().nth(LOGGED_BODY_LIMIT) {
         Some((end, _)) => format!("{}… ({} bytes total)", &body[..end], body.len()),
         None => body.to_string(),
@@ -126,7 +126,9 @@ fn body_excerpt(body: &str) -> String {
 /// `Content-Length` is consulted first when the endpoint offers one, but it is a claim
 /// rather than a fact — it can be absent, understated, or the response chunked — so the
 /// accumulating read is what actually enforces the cap.
-async fn read_capped_body(response: &mut reqwest::Response) -> Result<String, JWKServiceError> {
+pub(crate) async fn read_capped_body(
+    response: &mut reqwest::Response,
+) -> Result<String, JWKServiceError> {
     if let Some(declared) = response.content_length()
         && declared > JWKS_MAX_RESPONSE_BYTES as u64
     {
@@ -242,7 +244,7 @@ fn key_is_usable_with(key: &DecodingKey, algorithm: jsonwebtoken::Algorithm) -> 
 
 /// One pooled client for every fetch. Building it per request meant a fresh TLS
 /// handshake each time and no connection reuse.
-fn http_client() -> Result<&'static reqwest::Client, JWKServiceError> {
+pub(crate) fn http_client() -> Result<&'static reqwest::Client, JWKServiceError> {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     if let Some(client) = CLIENT.get() {
         return Ok(client);
@@ -575,6 +577,7 @@ pub struct OidcJwkService {
 }
 
 impl OidcJwkService {
+    /// Wrap `inner`, refusing any key it serves under a symmetric algorithm.
     pub fn new(inner: Arc<dyn JWKService>) -> Self {
         Self { inner }
     }

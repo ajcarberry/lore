@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::env;
+use std::net::IpAddr;
 
 use config::Config;
 use lore_base::runtime::TokioSettings;
@@ -205,10 +206,28 @@ fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigErro
     Ok(())
 }
 
+/// Whether a host is this machine, matching the rule `lore-transport` applies to an
+/// `oidc+http` auth URL. `localhost` counts: it resolves to a loopback address.
+fn is_loopback_host(host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 /// `[server.auth.oidc]` offers one authorization mode: a verified token authorizes
-/// every repository. `authorize_all_repositories` has no default, so a configured
+/// every repository. `authorize_all_repositories` defaults to `false`, so a configured
 /// block that omits it, or sets it to `false`, fails here rather than starting a
 /// server that verifies every token and then refuses every request.
+///
+/// The issuer's own scheme is checked here too: discovery and the key set are fetched
+/// from it, so `http` is accepted only for a loopback host.
 fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> {
     let Some(oidc) = settings
         .server
@@ -218,6 +237,26 @@ fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> 
     else {
         return Ok(());
     };
+
+    let issuer = reqwest::Url::parse(&oidc.issuer).map_err(|e| {
+        config::ConfigError::Message(format!(
+            "server.auth.oidc.issuer '{}' is not a URL: {e}",
+            oidc.issuer
+        ))
+    })?;
+    let transport_is_protected = match issuer.scheme() {
+        "https" => true,
+        "http" => is_loopback_host(issuer.host_str()),
+        _ => false,
+    };
+    if !transport_is_protected {
+        return Err(config::ConfigError::Message(format!(
+            "server.auth.oidc.issuer '{}' must be https, or http for a loopback host: \
+             the discovery document and the signing keys would otherwise be fetched \
+             in the clear, and anyone on the path could choose them",
+            oidc.issuer
+        )));
+    }
 
     if !oidc.authorize_all_repositories {
         return Err(config::ConfigError::Message(
@@ -265,9 +304,9 @@ pub struct OidcSettings {
     pub issuer: String,
     /// The public client id registered for Lore with the provider.
     pub client_id: String,
-    /// Whether a verified token authorizes every repository on the server. Has no
-    /// default: a configured block that omits this, or sets it to `false`, fails
-    /// startup validation, because no other mode is implemented.
+    /// Whether a verified token authorizes every repository on the server. Defaults
+    /// to `false`, which fails startup validation, as does omitting it, because no
+    /// other mode is implemented.
     #[serde(default)]
     pub authorize_all_repositories: bool,
 }
@@ -562,9 +601,78 @@ mod tests {
     use crate::topology::TopologyProvider;
 
     /// The `[server.auth.oidc]` matrix: block absent (fine), flag absent (fails),
-    /// flag `false` (fails), flag `true` (fine).
+    /// flag `false` (fails), flag `true` (fine), and the issuer schemes the server
+    /// will fetch discovery and keys over.
     mod oidc_settings {
         use super::*;
+
+        /// A configuration whose only variable is the `[server.auth.oidc]` issuer.
+        /// Set after parsing, because `Settings` deserializes only from a `'static`
+        /// document.
+        fn settings_with_issuer(issuer: &str) -> Settings {
+            const CONFIG: &str = r#"
+                [server]
+                runtime_shutdown_timeout_seconds = 0
+
+                [server.auth.oidc]
+                issuer = "https://id.example.com"
+                client_id = "lore"
+                authorize_all_repositories = true
+
+                [immutable_store]
+                mode = "local"
+
+                [immutable_store.local]
+                path = "/tmp/immutable"
+                flush_delay_seconds = 5
+
+                [mutable_store]
+                mode = "local"
+
+                [mutable_store.local]
+                path = "/tmp/mutable"
+                flush_delay_seconds = 5
+            "#;
+            let mut settings: Settings = toml::from_str(CONFIG).expect("parses");
+            let oidc = settings
+                .server
+                .auth
+                .as_mut()
+                .and_then(|auth| auth.oidc.as_mut())
+                .expect("the config carries an [server.auth.oidc] block");
+            oidc.issuer = issuer.to_string();
+            settings
+        }
+
+        #[test]
+        fn https_issuer_passes_validation() {
+            assert!(validate_oidc_config(&settings_with_issuer("https://id.example.com")).is_ok());
+        }
+
+        /// The loopback provider the integration tests and the `PocketID` fixture run
+        /// against: nothing leaves the machine, so plaintext costs nothing.
+        #[test]
+        fn http_loopback_issuer_passes_validation() {
+            for issuer in [
+                "http://127.0.0.1:1411",
+                "http://localhost:1411",
+                "http://[::1]:1411",
+            ] {
+                assert!(
+                    validate_oidc_config(&settings_with_issuer(issuer)).is_ok(),
+                    "{issuer}"
+                );
+            }
+        }
+
+        /// A plaintext issuer anywhere else means discovery and the key set travel in
+        /// the clear, so whoever is on the path chooses the keys that verify tokens.
+        #[test]
+        fn http_non_loopback_issuer_fails_validation() {
+            let error = validate_oidc_config(&settings_with_issuer("http://id.example.com"))
+                .expect_err("must fail closed");
+            assert!(error.to_string().contains("loopback"), "{error}");
+        }
 
         #[test]
         fn absent_block_passes_validation() {

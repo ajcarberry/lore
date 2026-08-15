@@ -23,6 +23,26 @@ services:
       - AWS_SECRET_ACCESS_KEY=lorelocal
       - AWS_REGION=us-east-1
     command: "-jar DynamoDBLocal.jar -port 9090 -inMemory -sharedDb"
+  pocket-id:
+    image: ghcr.io/pocket-id/pocket-id:v2.6.2
+    ports:
+      - "127.0.0.1:1411:1411"
+    environment:
+      # APP_URL is the issuer PocketID advertises and signs tokens with, so it has
+      # to be the address tests reach it on. The http:// scheme also switches the
+      # session cookie name from __Host-access_token to access_token.
+      - APP_URL=http://127.0.0.1:1411
+      # NOTE: these credentials are just hardcoded here, same as the minio ones above.
+      # STATIC_API_KEY provisions an admin "Static API User" on first boot, which is
+      # what lets the fixtures skip the interactive setup wizard entirely.
+      - STATIC_API_KEY=lorelocaltestapikeylorelocaltestapikey
+      - ENCRYPTION_KEY=bG9yZWxvY2FsLWludGVncmF0aW9uLXRlc3RzLWtleTE=
+      # Keep a test container from phoning home to analytics and the GitHub release feed.
+      - ANALYTICS_DISABLED=true
+      - VERSION_CHECK_DISABLED=true
+      # The fixtures create one-time access tokens in a tight loop; the default limiter
+      # (5 exchanges per 10s) fails tests that have done nothing wrong.
+      - DISABLE_RATE_LIMITING=true
   consul-server:
     image: hashicorp/consul:latest
     container_name: consul-server

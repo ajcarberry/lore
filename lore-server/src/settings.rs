@@ -611,9 +611,9 @@ mod tests {
         use super::*;
 
         /// A minimal configuration around the given `[server.auth.oidc]` block;
-        /// empty for no block at all. Leaked because `Settings::plugins` holds
-        /// `toml::Value`, which borrows from the document, so `toml::from_str`
-        /// demands a `'static` one.
+        /// empty for no block at all. Leaked because `Settings` carries
+        /// `#[serde(bound(deserialize = "'de: 'static"))]`, so `toml::from_str`
+        /// demands a `'static` document.
         fn settings_with_oidc(oidc_block: &str) -> Settings {
             let config = format!(
                 r#"

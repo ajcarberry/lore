@@ -5,7 +5,10 @@
 //! for [`LoginFlow::NoBrowser`], and the refresh grant. Stripping `oidc+` from the
 //! advertised auth URL recovers the issuer identifier byte for byte; the server verifies
 //! token signatures, so this module checks only `state` and `nonce`.
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -13,8 +16,15 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lore_base::error::NotSupported;
 use lore_base::lore_debug;
 use lore_base::types::RepositoryId;
+use parking_lot::Mutex;
 use reqwest::StatusCode;
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::oneshot;
+use tokio_util::task::AbortOnDropHandle;
 use url::Host;
 use url::Url;
 
@@ -26,7 +36,6 @@ use crate::types::*;
 /// Where a provider publishes its metadata (`OpenID` Connect Discovery 1.0 §4).
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// `offline_access` asks a conformant provider for a refresh token, deliberately without
 /// `prompt=consent` (Core §11's condition for it): the prompt would put a consent screen
 /// in front of every login, and the providers this targets issue refresh tokens to a
@@ -35,15 +44,25 @@ const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 /// (`name`, `preferred_username`); the code falls back to `sub` without them.
 const SCOPES: &str = "openid profile offline_access";
 
+/// Path the loopback listener answers on.
+const CALLBACK_PATH: &str = "/callback";
+
 /// Cap on a provider response body, so a broken or hostile endpoint cannot stream
 /// unbounded bytes into memory.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Cap on the redirect request's start line.
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// How long a login may stay in flight before its session and loopback listener are
+/// dropped, on the next start or poll. Minutes past the longest caller polling window
+/// (550s), so a slow provider cannot run a live poll loop into the eviction.
+const FLOW_LIFETIME: Duration = Duration::from_secs(900);
+
 /// Bytes of entropy behind a code verifier and a `state`. 32 bytes base64url-encode to 43
 /// characters, the minimum RFC 7636 §4.1 allows for a verifier.
 const RANDOM_BYTES: usize = 32;
@@ -211,7 +230,6 @@ fn check_endpoint(member: &str, endpoint: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// The S256 code challenge for a verifier (RFC 7636 §4.2).
 fn code_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(ring::digest::digest(
@@ -220,14 +238,12 @@ fn code_challenge(verifier: &str) -> String {
     ))
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// `RANDOM_BYTES` of entropy, base64url without padding: 43 characters from the unreserved
 /// set, which is what RFC 7636 §4.1 asks of a code verifier.
 fn random_token() -> String {
     URL_SAFE_NO_PAD.encode(rand::random::<[u8; RANDOM_BYTES]>())
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// Builds the provider's authorization URL for a PKCE login.
 fn authorization_url(
     discovery: &Discovery,
@@ -260,7 +276,6 @@ fn authorization_url(
     Ok(url.into())
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// What the browser delivered to the loopback redirect.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CallbackOutcome {
@@ -270,7 +285,6 @@ struct CallbackOutcome {
     error_description: Option<String>,
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// Reads the query out of a redirect's request target (`/callback?code=...&state=...`).
 fn callback_outcome(request_target: &str) -> Result<CallbackOutcome, ProtocolError> {
     // The target is origin-form (`/callback?...`), which is not a URL on its own. The
@@ -295,7 +309,6 @@ fn callback_outcome(request_target: &str) -> Result<CallbackOutcome, ProtocolErr
     Ok(outcome)
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// Returns the authorization code, having first established that the response belongs to
 /// this session.
 ///
@@ -331,7 +344,6 @@ fn authorization_code(
         })
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// A token endpoint success response. The ID token is the credential.
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 struct TokenResponse {
@@ -343,7 +355,6 @@ struct TokenResponse {
     refresh_token: Option<String>,
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// A token endpoint error response (RFC 6749 §5.2).
 #[derive(Debug, Default, Deserialize)]
 struct TokenError {
@@ -353,7 +364,6 @@ struct TokenError {
     error_description: Option<String>,
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// The ID token claims this client reads. Only `sub` and `exp` are required of it; `name`
 /// and `preferred_username` arrive with the `profile` scope.
 #[derive(Debug, Deserialize)]
@@ -368,7 +378,6 @@ struct IdTokenClaims {
     preferred_username: Option<String>,
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// Reads an ID token's claims without verifying its signature, which is the server's job.
 fn id_token_claims(id_token: &str) -> Result<IdTokenClaims, ProtocolError> {
     lore_credential::insecure_decode_token_as::<IdTokenClaims>(id_token)
@@ -376,12 +385,21 @@ fn id_token_claims(id_token: &str) -> Result<IdTokenClaims, ProtocolError> {
         .map_err(|e| ProtocolError::internal(format!("ID token claims are not readable: {e}")))
 }
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
 /// The form fields of one request to the provider's token or device authorization
 /// endpoint.
 type GrantForm = Vec<(&'static str, String)>;
 
-#[allow(dead_code)] // Consumed by the login flows in the following phases.
+/// The authorization-code exchange (RFC 6749 §4.1.3, with RFC 7636 §4.5's verifier).
+fn authorization_code_form(session: &PkceSession, code: &str) -> GrantForm {
+    vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", session.redirect_uri.clone()),
+        ("client_id", session.parts.client_id.clone()),
+        ("code_verifier", session.verifier.clone()),
+    ]
+}
+
 /// Turns a token response into an [`AuthenticationToken`].
 ///
 /// `expected_nonce` is `Some` for a login and `None` for a refresh, where `OpenID` Connect
@@ -427,6 +445,130 @@ fn authentication_token(
         recipients: TokenRecipients::Explicit(vec![parts.issuer_domain.clone()]),
         refresh_token: tokens.refresh_token,
     })
+}
+
+/// A listener on `127.0.0.1:0` waiting for one authorization response.
+struct LoopbackRedirect {
+    port: u16,
+    /// Resolves with the redirect's request target once the browser arrives.
+    target: oneshot::Receiver<Result<String, String>>,
+    /// Closes the listener when it is dropped, so an abandoned login frees the port.
+    listener: AbortOnDropHandle<()>,
+}
+
+/// Binds a loopback listener, per RFC 8252 §7.3's redirection for a native application.
+async fn bind_loopback_redirect() -> Result<LoopbackRedirect, ProtocolError> {
+    let (port_sender, port_receiver) = oneshot::channel();
+    let (target_sender, target_receiver) = oneshot::channel();
+
+    // Bound and accepted inside one net-runtime task: a tokio listener registers with the
+    // reactor of the runtime that created it.
+    let listener = lore_base::lore_spawn_net!(async move {
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                let _ = port_sender.send(Err(format!("could not bind a loopback listener: {e}")));
+                return;
+            }
+        };
+        match listener.local_addr() {
+            Ok(address) => {
+                if port_sender.send(Ok(address.port())).is_err() {
+                    // Nobody is waiting for the login any more.
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = port_sender.send(Err(format!("loopback listener has no address: {e}")));
+                return;
+            }
+        }
+
+        let _ = target_sender.send(accept_authorization_response(listener).await);
+    });
+
+    let port = port_receiver
+        .await
+        .map_err(|e| {
+            ProtocolError::internal(format!("loopback listener task ended before it bound: {e}"))
+        })?
+        .map_err(ProtocolError::internal)?;
+
+    Ok(LoopbackRedirect {
+        port,
+        target: target_receiver,
+        listener: AbortOnDropHandle::new(listener),
+    })
+}
+
+/// Accepts connections until one carries an authorization response, answering each with a
+/// page the user sees in the browser.
+async fn accept_authorization_response(listener: TcpListener) -> Result<String, String> {
+    loop {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| format!("loopback listener failed: {e}"))?;
+
+        let target = read_request_target(&mut stream).await?;
+        // A browser also asks for a favicon, so only a request carrying an authorization
+        // response ends the wait.
+        let is_response = callback_outcome(&target)
+            .is_ok_and(|outcome| outcome.code.is_some() || outcome.error.is_some());
+
+        respond(&mut stream, is_response).await;
+        if is_response {
+            return Ok(target);
+        }
+    }
+}
+
+/// Answers the browser, so the user is left looking at a page rather than a failed request.
+async fn respond(stream: &mut TcpStream, is_response: bool) {
+    const DONE: &str = "Signed in to Lore. You can close this tab and return to the terminal.";
+    let (status, body) = if is_response {
+        ("200 OK", DONE)
+    } else {
+        ("404 Not Found", "Not found.")
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+
+    // A write error is not a failure of the login: the code is already in hand.
+    if let Err(e) = stream.write_all(response.as_bytes()).await {
+        lore_debug!("Could not answer the loopback redirect: {e}");
+    }
+    let _ = stream.shutdown().await;
+}
+
+/// Reads an HTTP request's target out of its start line.
+async fn read_request_target(stream: &mut TcpStream) -> Result<String, String> {
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 1024];
+
+    let line = loop {
+        if let Some(end) = request.windows(2).position(|pair| pair == b"\r\n") {
+            break request[..end].to_vec();
+        }
+        if request.len() > MAX_REQUEST_LINE_BYTES {
+            return Err("redirect request start line is implausibly long".to_string());
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) => return Err("redirect connection closed before it sent a request".to_string()),
+            Ok(read) => request.extend_from_slice(&chunk[..read]),
+            Err(e) => return Err(format!("could not read the redirect request: {e}")),
+        }
+    };
+
+    let line = String::from_utf8_lossy(&line);
+    // "GET /callback?code=...&state=... HTTP/1.1"
+    line.split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+        .ok_or_else(|| format!("redirect request start line is malformed: '{line}'"))
 }
 
 /// The HTTP client, built on the net runtime and pooled so a login's several requests to
@@ -490,13 +632,71 @@ async fn send(request: reqwest::RequestBuilder) -> Result<(StatusCode, String), 
     .map_err(|e| ProtocolError::internal(format!("provider request task: {e}")))?
 }
 
+/// Posts to the token endpoint and reads a success response.
+async fn post_token_request(
+    token_endpoint: &str,
+    form: &GrantForm,
+) -> Result<TokenResponse, ProtocolError> {
+    let client = http_client().await?;
+    let (status, body) = send(client.post(token_endpoint).form(form)).await?;
+
+    if !status.is_success() {
+        let error = serde_json::from_str::<TokenError>(&body).unwrap_or_default();
+        return Err(ProtocolError::internal(format!(
+            "token endpoint answered {status}: {} ({})",
+            error.error.as_deref().unwrap_or("no error code"),
+            error
+                .error_description
+                .as_deref()
+                .unwrap_or("no description")
+        )));
+    }
+
+    serde_json::from_str(&body)
+        .map_err(|e| ProtocolError::internal(format!("token endpoint response is not usable: {e}")))
+}
+
+/// A login this process started and is polling for.
+enum PendingSession {
+    Pkce(PkceSession),
+}
+
+impl PendingSession {
+    fn started(&self) -> Instant {
+        match self {
+            PendingSession::Pkce(session) => session.started,
+        }
+    }
+}
+
+/// Drops the logins that have been in flight for longer than `FLOW_LIFETIME`, so an
+/// abandoned one does not hold its secrets and its loopback port for the process lifetime.
+fn evict_stale(sessions: &mut HashMap<String, PendingSession>, now: Instant) {
+    sessions.retain(|_, session| now.saturating_duration_since(session.started()) < FLOW_LIFETIME);
+}
+
+struct PkceSession {
+    parts: AuthUrlParts,
+    token_endpoint: String,
+    verifier: String,
+    state: String,
+    nonce: String,
+    redirect_uri: String,
+    redirect: oneshot::Receiver<Result<String, String>>,
+    /// Held so that dropping the session closes the loopback listener.
+    _listener: AbortOnDropHandle<()>,
+    started: Instant,
+}
+
 /// Authentication against a standard `OpenID` Connect provider.
 ///
 /// Registered under `oidc+https`, and under `oidc+http` for a loopback provider. One
-/// instance will hold the state of every login in flight; the flows land in the
-/// following phases.
+/// instance holds the state of every login in flight; all of it is process-local and dies
+/// with the command.
 #[derive(Default)]
-pub struct OidcAuthentication {}
+pub struct OidcAuthentication {
+    sessions: Mutex<HashMap<String, PendingSession>>,
+}
 
 /// The discovery document URL for an issuer (Discovery §4). The `.well-known`
 /// suffix joins the issuer with no normalization beyond avoiding a doubled
@@ -522,35 +722,150 @@ impl OidcAuthentication {
 
         parse_discovery(&body, &parts.issuer)
     }
+
+    /// Starts the authorization code flow: binds the loopback redirect, generates the PKCE
+    /// verifier, `state`, and `nonce`, and hands back the provider's authorization URL.
+    async fn start_pkce(
+        &self,
+        parts: AuthUrlParts,
+        discovery: Discovery,
+    ) -> Result<AuthSession, ProtocolError> {
+        let redirect = bind_loopback_redirect().await?;
+        let redirect_uri = format!("http://127.0.0.1:{}{CALLBACK_PATH}", redirect.port);
+
+        let verifier = random_token();
+        let state = random_token();
+        let nonce = random_token();
+        let login_url = authorization_url(
+            &discovery,
+            &parts,
+            &redirect_uri,
+            &state,
+            &nonce,
+            &code_challenge(&verifier),
+        )?;
+
+        // Opaque to the caller: the flow's secrets never leave this process.
+        let session_code = random_token();
+        let mut sessions = self.sessions.lock();
+        evict_stale(&mut sessions, Instant::now());
+        sessions.insert(
+            session_code.clone(),
+            PendingSession::Pkce(PkceSession {
+                parts,
+                token_endpoint: discovery.token_endpoint,
+                verifier,
+                state,
+                nonce,
+                redirect_uri,
+                redirect: redirect.target,
+                _listener: redirect.listener,
+                started: Instant::now(),
+            }),
+        );
+        drop(sessions);
+
+        Ok(AuthSession {
+            session_code,
+            login_url,
+        })
+    }
+
+    /// Takes the PKCE session's secrets out of the map, with the redirect the browser
+    /// delivered. `None` while the browser has not come back.
+    fn take_pkce(
+        &self,
+        session_code: &str,
+    ) -> Result<Option<(PkceSession, String)>, ProtocolError> {
+        let mut sessions = self.sessions.lock();
+        evict_stale(&mut sessions, Instant::now());
+
+        // Removed before the variant is checked, which holds only because every other kind
+        // of session is routed elsewhere before this runs.
+        let Some(PendingSession::Pkce(mut session)) = sessions.remove(session_code) else {
+            return Err(ProtocolError::internal(
+                "no interactive login is in flight for this session",
+            ));
+        };
+
+        // `try_recv` rather than an await, so the map's lock is never held across one.
+        let delivered = match session.redirect.try_recv() {
+            Ok(delivered) => delivered,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                sessions.insert(session_code.to_string(), PendingSession::Pkce(session));
+                return Ok(None);
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                Err("loopback listener ended without delivering a redirect".to_string())
+            }
+        };
+        drop(sessions);
+
+        Ok(Some((session, delivered.map_err(ProtocolError::internal)?)))
+    }
+
+    /// Exchanges an authorization code for tokens (RFC 6749 §4.1.3, with RFC 7636 §4.5's
+    /// verifier).
+    async fn complete_pkce(
+        &self,
+        session: PkceSession,
+        code: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        let form = authorization_code_form(&session, code);
+
+        let tokens = post_token_request(&session.token_endpoint, &form).await?;
+        authentication_token(tokens, Some(&session.nonce), &session.parts)
+    }
 }
 
 #[async_trait]
 impl Authentication for OidcAuthentication {
-    /// Locates and pins the provider; the login flows land in the following phases.
+    /// `client_state` is not used as the OAuth `state`: this implementation generates its
+    /// own.
     async fn start_auth_session(
         &self,
         auth_url: &str,
         _client_state: &str,
-        _flow: LoginFlow,
+        flow: LoginFlow,
         _correlation_id: &str,
     ) -> Result<AuthSession, ProtocolError> {
         let parts = parse_auth_url(auth_url)?;
-        let _discovery = self.discover(&parts).await?;
-        Err(ProtocolError::from(NotSupported {
-            operation: "start_auth_session".to_string(),
-        }))
+        let discovery = self.discover(&parts).await?;
+
+        match flow {
+            LoginFlow::Browser => self.start_pkce(parts, discovery).await,
+            // The device authorization grant lands in the next phase.
+            LoginFlow::NoBrowser => Err(ProtocolError::from(NotSupported {
+                operation: "start_auth_session --no-browser".to_string(),
+            })),
+        }
     }
 
     async fn poll_auth_session(
         &self,
         _auth_url: &str,
         _client_state: &str,
-        _session_code: &str,
+        session_code: &str,
         _correlation_id: &str,
     ) -> Result<Option<AuthenticationToken>, ProtocolError> {
-        Err(ProtocolError::from(NotSupported {
-            operation: "poll_auth_session".to_string(),
-        }))
+        {
+            let mut sessions = self.sessions.lock();
+            evict_stale(&mut sessions, Instant::now());
+            if !matches!(sessions.get(session_code), Some(PendingSession::Pkce(_))) {
+                return Err(ProtocolError::internal(format!(
+                    "no login is in flight for this session; an abandoned one is \
+                     dropped after {}s",
+                    FLOW_LIFETIME.as_secs()
+                )));
+            }
+        }
+
+        let Some((session, target)) = self.take_pkce(session_code)? else {
+            return Ok(None);
+        };
+
+        let code = authorization_code(&callback_outcome(&target)?, &session.state)?;
+        self.complete_pkce(session, &code).await.map(Some)
     }
 
     /// There is no external token to exchange: the provider issues the credential directly.
@@ -633,8 +948,6 @@ impl Authentication for OidcAuthentication {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::types::unsigned_jwt;
 
@@ -1067,6 +1380,87 @@ mod tests {
         );
     }
 
+    /// Answers one HTTP request on a loopback port with a canned body.
+    async fn one_shot_provider(body: impl Into<String>) -> String {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let body = body.into();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("a bound address").port();
+
+        lore_base::lore_spawn_net!(async move {
+            let (mut stream, _) = listener.accept().await.expect("a request");
+
+            // Drain the whole request before answering: a client still writing its body
+            // into a closed socket sees a transport error rather than the response.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(headers_end) = text.find("\r\n\r\n") {
+                    let length: usize = text
+                        .to_ascii_lowercase()
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|rest| rest.split("\r\n").next())
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        });
+
+        format!("http://127.0.0.1:{port}/device")
+    }
+
+    /// The nonce the session generated has to reach the check the exchange performs.
+    #[tokio::test]
+    async fn completing_a_login_refuses_an_id_token_carrying_another_nonce() {
+        let id_token = unsigned_jwt(r#"{"sub":"user-1","exp":1000,"nonce":"another-nonce"}"#);
+        let token_endpoint = one_shot_provider(format!(r#"{{"id_token":"{id_token}"}}"#)).await;
+
+        let (_sender, receiver) = oneshot::channel();
+        let session = PkceSession {
+            parts: parts(),
+            token_endpoint,
+            verifier: "the-verifier".to_string(),
+            state: "the-state".to_string(),
+            nonce: "the-nonce".to_string(),
+            redirect_uri: "http://127.0.0.1:49152/callback".to_string(),
+            redirect: receiver,
+            _listener: AbortOnDropHandle::new(lore_base::lore_spawn_net!(async {})),
+            started: Instant::now(),
+        };
+
+        let error = OidcAuthentication::default()
+            .complete_pkce(session, "the-code")
+            .await
+            .expect_err("this ID token answers some other login");
+
+        assert!(
+            error.to_string().contains("nonce"),
+            "the refusal has to be the nonce check, got: {error}"
+        );
+    }
+
     #[test]
     fn both_oidc_schemes_resolve_through_the_registry() {
         use crate::auth::authentication;
@@ -1075,5 +1469,18 @@ mod tests {
             .expect("oidc+https should be registered");
         authentication::find("oidc+http://127.0.0.1:1411?client_id=lore")
             .expect("oidc+http should be registered");
+    }
+
+    #[tokio::test]
+    async fn polling_an_unknown_session_is_an_error() {
+        let auth = OidcAuthentication::default();
+        auth.poll_auth_session(
+            "oidc+https://id.example.com?client_id=lore",
+            "client-state",
+            "no-such-session",
+            "",
+        )
+        .await
+        .expect_err("there is no such login in flight");
     }
 }

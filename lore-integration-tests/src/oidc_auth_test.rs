@@ -404,3 +404,171 @@ mod oidc_auth_tests {
         Ok(())
     }
 }
+
+/// Raw-tonic gRPC coverage of the same matrix, against `StorageService`: the enforcement
+/// point that calls `verify_authorization` today (`RepositoryService` sits behind the
+/// unfinished `JWTAuthnInterceptor` and doesn't).
+#[cfg(all(test, feature = "oidc_integration_tests"))]
+mod oidc_auth_grpc_tests {
+    use std::net::SocketAddr;
+
+    use lore_proto::lore::storage::v1::QueryRequest;
+    use lore_proto::lore::storage::v1::storage_service_client::StorageServiceClient;
+    use lore_server::auth::jwt::JwtVerifier;
+    use lore_storage::local::immutable_store::ImmutableStoreSettings;
+    use lore_transport::grpc::PARTITION_ID_KEY;
+    use tonic::Code;
+    use tonic::Request;
+    use tonic::metadata::MetadataValue;
+    use tonic::transport::Channel;
+
+    use super::oidc_auth_common::TestResult;
+    use super::oidc_auth_common::forged_token_with_unknown_kid;
+    use super::oidc_auth_common::make_backends;
+    use super::oidc_auth_common::oidc_jwt_verifier;
+    use crate::common::grpc_common::serve_grpc_server;
+    use crate::common::oidc as oidc_common;
+
+    /// Starts a real gRPC server in process; a `Some` verifier routes `StorageService`
+    /// through `JWTInterceptor`.
+    async fn start_grpc_server(
+        jwt_verifier: Option<JwtVerifier>,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let (backend_immutable, backend_mutable) = make_backends(ImmutableStoreSettings {
+            allow_partial_fragment: false,
+            protect_local_fragment: false,
+            implicit_durable_stored: true,
+            ..Default::default()
+        })
+        .await;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let shutdown_tx =
+            serve_grpc_server(listener, backend_immutable, backend_mutable, jwt_verifier).await;
+
+        (format!("http://127.0.0.1:{}", addr.port()), shutdown_tx)
+    }
+
+    async fn connect(url: &str) -> StorageServiceClient<Channel> {
+        StorageServiceClient::connect(url.to_string())
+            .await
+            .expect("connect to in-process test server")
+    }
+
+    /// An empty `Query`, optionally bearing a token; the repository id metadata is always
+    /// set, since its absence gives `InvalidArgument` rather than an auth error.
+    fn query_request(token: Option<&str>) -> Request<QueryRequest> {
+        let mut request = Request::new(QueryRequest { addresses: vec![] });
+
+        let repository = lore_base::types::Partition::from([0xacu8; 16]);
+        let repository_id = MetadataValue::from_bytes(repository.data());
+        request
+            .metadata_mut()
+            .append_bin(PARTITION_ID_KEY, repository_id);
+
+        if let Some(token) = token {
+            let value =
+                MetadataValue::try_from(format!("Bearer {token}")).expect("bearer header value");
+            request.metadata_mut().insert("authorization", value);
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn grpc_anonymous_request_to_authenticated_service_is_rejected() -> TestResult {
+        let fixture = oidc_common::setup().await?;
+        let verifier = oidc_jwt_verifier(&fixture, oidc_common::TEST_CLIENT_ID).await?;
+        let (url, _shutdown) = start_grpc_server(Some(verifier)).await;
+        let mut client = connect(&url).await;
+
+        let status = client
+            .query(query_request(None))
+            .await
+            .expect_err("a request with no bearer token at all must be rejected");
+        assert_eq!(
+            status.code(),
+            Code::Unauthenticated,
+            "missing token is its own signal, not the uniform post-token rejection: {status:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grpc_forged_issuer_token_is_rejected() -> TestResult {
+        let fixture = oidc_common::setup().await?;
+        let verifier = oidc_jwt_verifier(&fixture, oidc_common::TEST_CLIENT_ID).await?;
+        let (url, _shutdown) = start_grpc_server(Some(verifier)).await;
+        let mut client = connect(&url).await;
+
+        let forged = forged_token_with_unknown_kid();
+        let status = client
+            .query(query_request(Some(&forged)))
+            .await
+            .expect_err("a token naming a key PocketID never issued must be rejected");
+        assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grpc_wrong_audience_token_is_rejected() -> TestResult {
+        let fixture = oidc_common::setup().await?;
+        let verifier = oidc_jwt_verifier(&fixture, oidc_common::TEST_CLIENT_ID).await?;
+        let (url, _shutdown) = start_grpc_server(Some(verifier)).await;
+        let mut client = connect(&url).await;
+
+        let grpc_wrong_audience_client = "lore-integration-tests-oidc-grpc-other-audience";
+        fixture
+            .ensure_client(
+                grpc_wrong_audience_client,
+                &[oidc_common::TEST_REDIRECT_URI],
+            )
+            .await?;
+        let user = fixture.create_user("grpcwrongaudience").await?;
+        let tokens = fixture
+            .issue_token_for_client(&user, grpc_wrong_audience_client)
+            .await?;
+
+        let status = client
+            .query(query_request(Some(&tokens.id_token)))
+            .await
+            .expect_err("a real token minted for a different client id must be rejected");
+        assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+        Ok(())
+    }
+
+    /// The wildcard-resource population of the HTTP half, exercised over gRPC.
+    #[tokio::test]
+    async fn grpc_valid_pocketid_token_is_accepted_for_storage_operations() -> TestResult {
+        let fixture = oidc_common::setup().await?;
+        let verifier = oidc_jwt_verifier(&fixture, oidc_common::TEST_CLIENT_ID).await?;
+        let (url, _shutdown) = start_grpc_server(Some(verifier)).await;
+        let mut client = connect(&url).await;
+
+        let user = fixture.create_user("grpcvalid").await?;
+        let tokens = fixture.issue_token(&user).await?;
+
+        let response = client.query(query_request(Some(&tokens.id_token))).await;
+        assert!(
+            response.is_ok(),
+            "authn-only mode must accept any verified token from the trusted issuer for any \
+             repository; instead: {response:?}"
+        );
+        Ok(())
+    }
+
+    /// An unconfigured server (`jwt_verifier: None`) must keep admitting anonymous requests
+    /// to `StorageService`.
+    #[tokio::test]
+    async fn grpc_unconfigured_server_is_unchanged() -> TestResult {
+        let (url, _shutdown) = start_grpc_server(None).await;
+        let mut client = connect(&url).await;
+
+        let response = client.query(query_request(None)).await;
+        assert!(
+            response.is_ok(),
+            "an unconfigured server must not demand authentication: {response:?}"
+        );
+        Ok(())
+    }
+}

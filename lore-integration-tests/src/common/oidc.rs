@@ -6,6 +6,12 @@ use std::error::Error;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use jsonwebtoken::Algorithm;
+use jsonwebtoken::DecodingKey;
+use jsonwebtoken::TokenData;
+use jsonwebtoken::Validation;
+use jsonwebtoken::jwk::AlgorithmParameters;
+use jsonwebtoken::jwk::JwkSet;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,6 +47,17 @@ pub struct TestUser {
 #[derive(Clone, Debug, Deserialize)]
 pub struct TokenSet {
     pub id_token: String,
+}
+
+/// The claims the tests read; `aud` is `Vec<String>` because `PocketID` sends it as
+/// an array.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PocketIdClaims {
+    pub sub: String,
+    pub iss: String,
+    pub aud: Vec<String>,
+    #[serde(default)]
+    pub nonce: Option<String>,
 }
 
 pub struct OidcFixture {
@@ -336,6 +353,81 @@ impl OidcFixture {
         Ok(serde_json::from_value(tokens)?)
     }
 
+    /// Follows `authorization_url` and returns the URL the provider would have
+    /// redirected to, carrying `code` and echoing `state`. Everything it needs comes
+    /// from the URL, as it would for a browser.
+    pub async fn follow_authorization_url(
+        &self,
+        user: &TestUser,
+        authorization_url: &str,
+    ) -> Result<String, Box<dyn Error + 'static>> {
+        let url = reqwest::Url::parse(authorization_url)?;
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        let parameter = |name: &str| -> Result<String, Box<dyn Error + 'static>> {
+            query.get(name).cloned().ok_or_else(|| {
+                anyhow::anyhow!("Authorization URL carries no {name}: {authorization_url}").into()
+            })
+        };
+
+        let redirect_uri = parameter("redirect_uri")?;
+        let state = parameter("state")?;
+        let session_cookie = self.login(user).await?;
+
+        let authorize_body = json!({
+            "clientID": parameter("client_id")?,
+            "scope": parameter("scope")?,
+            "callbackURL": &redirect_uri,
+            "nonce": parameter("nonce")?,
+            "codeChallenge": parameter("code_challenge")?,
+            "codeChallengeMethod": parameter("code_challenge_method")?,
+        });
+        let response = self
+            .client
+            .post(self.url("/api/oidc/authorize"))
+            .header(reqwest::header::COOKIE, &session_cookie)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&authorize_body)?)
+            .send()
+            .await?;
+        let authorization = Self::json_or_error("/api/oidc/authorize", response).await?;
+        let code = authorization["code"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Authorize returned no code, got: {authorization}"))?;
+
+        let mut redirect = reqwest::Url::parse(&redirect_uri)?;
+        redirect
+            .query_pairs_mut()
+            .append_pair("code", code)
+            .append_pair("state", &state);
+        Ok(redirect.into())
+    }
+
+    /// Approves a device `user_code` as `user`, using the session cookie in place of
+    /// the browser a person would approve it in.
+    pub async fn approve_user_code(
+        &self,
+        user: &TestUser,
+        user_code: &str,
+    ) -> Result<(), Box<dyn Error + 'static>> {
+        let session_cookie = self.login(user).await?;
+        let response = self
+            .client
+            .post(self.url("/api/oidc/device/verify"))
+            .query(&[("code", user_code)])
+            .header(reqwest::header::COOKIE, &session_cookie)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            return Err(
+                anyhow::anyhow!("Approving device code failed with {status}: {body}").into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Fetch the issuer's discovery document.
     pub async fn discovery(&self) -> Result<Value, Box<dyn Error + 'static>> {
         let response = self
@@ -344,5 +436,46 @@ impl OidcFixture {
             .send()
             .await?;
         Self::json_or_error("/.well-known/openid-configuration", response).await
+    }
+
+    /// Verifies a token's signature against the issuer's published JWKS (found via
+    /// discovery) and returns its claims.
+    pub async fn validate_token(
+        &self,
+        token: &str,
+        audience: &str,
+    ) -> Result<TokenData<PocketIdClaims>, Box<dyn Error + 'static>> {
+        let discovery = self.discovery().await?;
+        let issuer = discovery["issuer"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Discovery document has no issuer"))?;
+        let jwks_uri = discovery["jwks_uri"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Discovery document has no jwks_uri"))?;
+
+        let jwks: JwkSet =
+            serde_json::from_str(&self.client.get(jwks_uri).send().await?.text().await?)?;
+
+        let header = jsonwebtoken::decode_header(token)?;
+        let kid = header
+            .kid
+            .ok_or_else(|| anyhow::anyhow!("Token header has no kid"))?;
+        let jwk = jwks
+            .find(&kid)
+            .ok_or_else(|| anyhow::anyhow!("JWKS has no key for kid {kid}"))?;
+        let AlgorithmParameters::RSA(rsa) = &jwk.algorithm else {
+            return Err(anyhow::anyhow!("Key {kid} is not RSA: {:?}", jwk.algorithm).into());
+        };
+        let decoding_key = DecodingKey::from_rsa_components(&rsa.n, &rsa.e)?;
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&[issuer]);
+        validation.set_audience(&[audience]);
+
+        Ok(jsonwebtoken::decode::<PocketIdClaims>(
+            token,
+            &decoding_key,
+            &validation,
+        )?)
     }
 }

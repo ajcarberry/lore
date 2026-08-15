@@ -226,6 +226,8 @@ authorize_all_repositories = true
 
 Configuring the OIDC block also fills in the `auth_url` the server advertises to clients (see [Environment discovery](#environment-discovery)), so an operator configures authentication in one place: a server that verifies OpenID Connect tokens also tells clients to log in with OpenID Connect. An explicit `environment.endpoint.auth_url` still wins.
 
+See [Secure a Lore server with OpenID Connect](../how-to/secure-a-lore-server-with-oidc.md) for a full walkthrough.
+
 ## Store settings
 
 Lore Server keeps three stores: an immutable store for content-addressed fragments, a mutable store for branch pointers, and a lock store for distributed locking. Each is configured by a top-level table — `[immutable_store]`, `[mutable_store]`, `[lock_store]` — whose `mode` field selects the backend.

@@ -64,6 +64,11 @@ class LockInvalidPath(LoreException): ...
 class UserNotAuthenticated(LoreException): ...
 
 
+class NotAuthenticatedError(LoreException):
+    """Raised when a repository operation requires a cached token the caller
+    does not have, e.g. against an OIDC-secured server with no prior login."""
+
+
 class LockQueryFailed(LoreException): ...
 
 
@@ -196,6 +201,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Unable to delete default branch", DeleteDefaultError),
     ("Unable to delete a protected branch", DeleteProtectedError),
     ("Not authorized to access repository", ProtectedError),
+    ("Not authenticated", NotAuthenticatedError),
     ("Branch has diverged", BranchDivergedError),
     ("already exists, use switch instead", BranchAlreadyExistsError),
     ("Failed to find path between", BisectDivergentRevisions),

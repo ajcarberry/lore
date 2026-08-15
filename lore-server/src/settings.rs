@@ -207,8 +207,9 @@ fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigErro
     Ok(())
 }
 
-/// Whether a host is this machine, matching the rule `lore-transport` applies to an
-/// `oidc+http` auth URL. `localhost` counts: it resolves to a loopback address.
+/// Whether a host is this machine. `localhost` counts: it resolves to a loopback
+/// address. Deliberately duplicates the rule `lore-transport` applies to an
+/// `oidc+http` auth URL; the crates share no home for it.
 fn is_loopback_host(host: Option<Host<&str>>) -> bool {
     match host {
         Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
@@ -610,8 +611,9 @@ mod tests {
         use super::*;
 
         /// A minimal configuration around the given `[server.auth.oidc]` block;
-        /// empty for no block at all. Leaked because `Settings` deserializes only
-        /// from a `'static` document.
+        /// empty for no block at all. Leaked because `Settings::plugins` holds
+        /// `toml::Value`, which borrows from the document, so `toml::from_str`
+        /// demands a `'static` one.
         fn settings_with_oidc(oidc_block: &str) -> Settings {
             let config = format!(
                 r#"

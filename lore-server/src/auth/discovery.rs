@@ -17,13 +17,13 @@ use crate::auth::jwk::read_capped_body;
 
 /// The two members of a discovery document this server reads.
 #[derive(Debug, Deserialize, PartialEq)]
-pub struct DiscoveryDocument {
+pub(crate) struct DiscoveryDocument {
     pub issuer: String,
     pub jwks_uri: String,
 }
 
 #[derive(Debug, Error)]
-pub enum DiscoveryError {
+pub(crate) enum DiscoveryError {
     #[error("failed to reach the discovery endpoint")]
     FetchFailed,
     #[error("discovery endpoint returned status {0}")]
@@ -61,7 +61,9 @@ fn discovery_fetch_error(error: JWKServiceError) -> DiscoveryError {
 /// The document's own `issuer` member must equal the configured issuer byte for
 /// byte (Discovery §4.3), so a redirect or a compromised well-known path cannot
 /// point the server at somebody else's key set.
-pub async fn fetch_discovery_document(issuer: &str) -> Result<DiscoveryDocument, DiscoveryError> {
+pub(crate) async fn fetch_discovery_document(
+    issuer: &str,
+) -> Result<DiscoveryDocument, DiscoveryError> {
     let url = discovery_url(issuer);
     let client = http_client().map_err(discovery_fetch_error)?;
 

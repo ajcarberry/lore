@@ -107,14 +107,17 @@ pub async fn exchange(
         repo_id_str.clone(),
         recipient_domain.clone(),
     );
-    let mut cache = cache().lock().await;
-
-    lore_trace!(
-        "Check for cached authz token for {cache_key:?} in cache with {} tokens",
-        cache.len()
-    );
-
-    let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
+    // The guard is scoped to the lookup: the token-store read, the refresh grant, and
+    // the exchange below all await the network, and this global guard would serialize
+    // every exchange in the process across them.
+    let mut token = {
+        let cache = cache().lock().await;
+        lore_trace!(
+            "Check for cached authz token for {cache_key:?} in cache with {} tokens",
+            cache.len()
+        );
+        cache.get(&cache_key).cloned().unwrap_or_default()
+    };
 
     // Token store key: "{auth_url}/{repository_id}" (no urc- prefix)
     let token_store_key = format!("{auth_url}/{repo_id_str}");
@@ -137,7 +140,7 @@ pub async fn exchange(
         if let Some(user_info) = lore_credential::user_info_from_token(token.clone()) {
             if !is_expired(user_info.expires) {
                 lore_trace!("Using authz token for {cache_key:?}");
-                cache.insert(cache_key, token.clone());
+                cache().lock().await.insert(cache_key, token.clone());
                 return Ok(token.clone());
             } else {
                 lore_debug!("Authz token for {cache_key:?} has expired");
@@ -209,7 +212,7 @@ pub async fn exchange(
 
     lore_trace!("Cached authz token for {cache_key:?}");
 
-    cache.insert(cache_key, token.clone());
+    cache().lock().await.insert(cache_key, token.clone());
 
     let _ = token_store::store_user_token(&token_store_key, identity, &token, domains)
         .await
@@ -259,14 +262,17 @@ pub async fn exchange_custom_resource(
         resource_id.to_string(),
         recipient_domain.clone(),
     );
-    let mut cache = cache().lock().await;
-
-    lore_trace!(
-        "Check for cached authz token for {cache_key:?} in cache with {} tokens",
-        cache.len()
-    );
-
-    let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
+    // The guard is scoped to the lookup: the token-store read, the refresh grant, and
+    // the exchange below all await the network, and this global guard would serialize
+    // every exchange in the process across them.
+    let mut token = {
+        let cache = cache().lock().await;
+        lore_trace!(
+            "Check for cached authz token for {cache_key:?} in cache with {} tokens",
+            cache.len()
+        );
+        cache.get(&cache_key).cloned().unwrap_or_default()
+    };
 
     // Token store key: "{auth_url}/{resource_id}" -- same shape as the
     // repository variant, with the resource ID taking the repository slot.
@@ -290,7 +296,7 @@ pub async fn exchange_custom_resource(
         if let Some(user_info) = lore_credential::user_info_from_token(token.clone()) {
             if !is_expired(user_info.expires) {
                 lore_trace!("Using authz token for {cache_key:?}");
-                cache.insert(cache_key, token.clone());
+                cache().lock().await.insert(cache_key, token.clone());
                 return Ok(token.clone());
             } else {
                 lore_debug!("Authz token for {cache_key:?} has expired");
@@ -360,7 +366,7 @@ pub async fn exchange_custom_resource(
 
     lore_trace!("Cached authz token for {cache_key:?}");
 
-    cache.insert(cache_key, token.clone());
+    cache().lock().await.insert(cache_key, token.clone());
 
     let _ = token_store::store_user_token(&token_store_key, identity, &token, domains)
         .await

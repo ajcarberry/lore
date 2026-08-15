@@ -91,13 +91,11 @@ pub enum JwtVerifierError {
     NotAuthorized,
 }
 
-/// Which claim shapes `verify_token_internal` accepts, and whether a
-/// successfully-decoded token is granted the all-repositories wildcard.
+/// Which claim shape `verify_token_internal` decodes, and with it whether a
+/// verified token is granted the all-repositories wildcard.
 ///
 /// By the constructors' convention only [`JwtVerifier::oidc`], built from a
-/// configured `[server.auth.oidc]` block, produces `Oidc`. That gate is what
-/// keeps the third, minimal claim decode from widening the token set a
-/// `[server.auth.jwk]`-only deployment accepts.
+/// configured `[server.auth.oidc]` block, produces `Oidc`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum JwtVerifierMode {
     /// Only Lore's own claim shapes (`AuthorizationToken`, `JWTUserInfo`)
@@ -163,8 +161,8 @@ fn key_may_be_stale(error: &JwtVerifierError) -> bool {
 /// Log a claim-decode failure at the level its kind deserves, and carry it on.
 ///
 /// An expired token is an ordinary event on any path a client can reach, so it stays at
-/// `debug`. Both terminal decode arms of [`JwtVerifier::verify_token_internal`] end here,
-/// so the level does not depend on which claim shape was tried last.
+/// `debug`. Both terminal decodes of [`JwtVerifier::verify_token_internal`] end here,
+/// so the level does not depend on which claim shape was tried.
 fn decode_failure(error: jsonwebtoken::errors::Error) -> JwtVerifierError {
     if matches!(
         error.kind(),

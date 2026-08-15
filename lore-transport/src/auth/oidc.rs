@@ -63,8 +63,9 @@ const DEFAULT_DEVICE_INTERVAL: Duration = Duration::from_secs(5);
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
 /// How long a login may stay in flight before its session and loopback listener are
-/// dropped, on the next start or poll. Longer than any caller's polling window.
-const FLOW_LIFETIME: Duration = Duration::from_secs(600);
+/// dropped, on the next start or poll. Minutes past the longest caller polling window
+/// (550s), so a slow provider cannot run a live poll loop into the eviction.
+const FLOW_LIFETIME: Duration = Duration::from_secs(900);
 
 /// Bytes of entropy behind a code verifier and a `state`. 32 bytes base64url-encode to 43
 /// characters, the minimum RFC 7636 §4.1 allows for a verifier.

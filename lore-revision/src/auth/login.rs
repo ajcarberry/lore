@@ -12,6 +12,7 @@ use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
 use lore_transport::Authentication;
 use lore_transport::AuthenticationToken;
+use lore_transport::LoginFlow;
 use lore_transport::auth::authentication;
 use tokio::time::sleep;
 use url::Url;
@@ -124,18 +125,16 @@ async fn exchange_token(
             user_info.id
         );
 
-        let decoded_token = insecure_decode_token(&authn.token).internal("decoding token")?;
-        verify_jwt_usage_for_remote(
-            &decoded_token.claims,
-            &domain_from_url_or_url(recipient_url),
-        )
-        .forward::<LoginError>("verifying JWT usage for remote")?;
+        let acceptable_root_domains = authn
+            .recipients
+            .domains_for(&authn.token, &domain_from_url_or_url(recipient_url))
+            .forward::<LoginError>("verifying JWT usage for remote")?;
 
         token_store::store_user_token(
             auth_url.as_str(),
             user_info.id.as_str(),
             &authn.token,
-            decoded_token.claims.acceptable_root_domains(),
+            acceptable_root_domains,
         )
         .await
         .forward::<LoginError>("storing user token")?;
@@ -278,10 +277,17 @@ pub async fn interactive(
     let client_state = Uuid::new_v4().to_string();
     lore_debug!("ClientState {}", client_state);
 
-    // 2. Start auth session via the Authentication implementation
+    // 2. Start auth session via the Authentication implementation. `--no-browser`
+    //    selects a login ceremony that can finish without one; an implementation
+    //    with a single ceremony ignores it.
+    let flow = if no_browser {
+        LoginFlow::NoBrowser
+    } else {
+        LoginFlow::Browser
+    };
     lore_debug!("Authenticating using {auth_url}");
     let session = auth_impl
-        .start_auth_session(&auth_url, &client_state, &correlation_id)
+        .start_auth_session(&auth_url, &client_state, flow, &correlation_id)
         .await
         .forward::<InteractiveLoginError>("starting auth session")?;
 
@@ -311,8 +317,9 @@ pub async fn interactive(
     .await?;
 
     // 4. Verify the given remote can be trusted with this JWT.
-    let decoded_token = insecure_decode_token(&authn.token).internal("decoding token")?;
-    verify_jwt_usage_for_remote(&decoded_token.claims, &domain_from_url_or_url(&remote_url))
+    let acceptable_root_domains = authn
+        .recipients
+        .domains_for(&authn.token, &domain_from_url_or_url(&remote_url))
         .forward::<InteractiveLoginError>("verifying JWT usage for remote")?;
 
     lore_debug!("Auth successful");
@@ -320,7 +327,7 @@ pub async fn interactive(
         auth_url.as_str(),
         authn.user_id.as_str(),
         authn.token.as_str(),
-        decoded_token.claims.acceptable_root_domains(),
+        acceptable_root_domains,
     )
     .await
     .forward::<InteractiveLoginError>("storing user token")?;

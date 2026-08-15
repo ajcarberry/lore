@@ -14,6 +14,7 @@ use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
 use crate::error::ProtocolError;
 use crate::grpc::CorrelationInterceptor;
 use crate::traits::Authentication;
+use crate::traits::LoginFlow;
 use crate::types::*;
 
 /// Strips the custom scheme from an auth URL and returns an HTTPS URL
@@ -83,10 +84,12 @@ pub struct UcsAuthentication;
 
 #[async_trait]
 impl Authentication for UcsAuthentication {
+    /// UCS Auth has one login ceremony, so `flow` selects nothing and is ignored.
     async fn start_auth_session(
         &self,
         auth_url: &str,
         client_state: &str,
+        _flow: LoginFlow,
         _correlation_id: &str,
     ) -> Result<AuthSession, ProtocolError> {
         let mut client = connect_client(auth_url).await?;
@@ -130,8 +133,7 @@ impl Authentication for UcsAuthentication {
                 user_id: token.user_id,
                 user_name: token.user_name,
                 expires_ms: token.expires_at.max(0) as u64,
-                // Populated by orchestration layer via JWT decode, not the proto response
-                acceptable_root_domains: Vec::new(),
+                recipients: TokenRecipients::SelfDescribing,
                 refresh_token: None,
             })),
             None => Ok(None),
@@ -166,8 +168,7 @@ impl Authentication for UcsAuthentication {
             user_id: user_token.user_id,
             user_name: user_token.user_name,
             expires_ms: user_token.expires_at.max(0) as u64,
-            // Populated by orchestration layer via JWT decode, not the proto response
-            acceptable_root_domains: Vec::new(),
+            recipients: TokenRecipients::SelfDescribing,
             refresh_token: None,
         })
     }
@@ -226,8 +227,7 @@ impl Authentication for UcsAuthentication {
         Ok(AuthorizationToken {
             token: token.user_token,
             expires_ms: token.expires_at.max(0) as u64,
-            // Populated by orchestration layer via JWT decode, not the proto response
-            acceptable_root_domains: Vec::new(),
+            recipients: TokenRecipients::SelfDescribing,
         })
     }
 

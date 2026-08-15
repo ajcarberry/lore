@@ -2943,6 +2943,7 @@ version = "0.8.7-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "dashmap",
  "futures",

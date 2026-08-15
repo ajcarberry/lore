@@ -19,10 +19,8 @@ use lore_base::lore_trace;
 use lore_base::lore_warn;
 use lore_base::types::RepositoryId;
 use lore_credential::get_domain_or_empty;
-use lore_credential::insecure_decode_token;
 use lore_credential::token_store;
 use lore_credential::token_store::tokens_only_for_recipient_domain;
-use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 
@@ -60,6 +58,12 @@ pub fn is_expired(expires: u64) -> bool {
         .unwrap_or_default()
         .as_millis();
     current_time >= expires
+}
+
+/// Maps a refused or undecodable token to the error `exchange` reports.
+fn recipient_refused(err: lore_credential::JwtUsageError) -> ExchangeError {
+    lore_warn!("{err}");
+    ExchangeError::internal_with_context(err, "The token is not suitable for what you intend to do")
 }
 
 /// Exchanges an authentication token for a repository-scoped authorization
@@ -186,16 +190,10 @@ pub async fn exchange(
     if token.is_empty() {
         return Err(ExchangeError::internal("Empty token response"));
     }
-    let decoded_token = insecure_decode_token(&token)
-        .internal("Could not decode token")
-        .map_err(ExchangeError::from)?;
-    verify_jwt_usage_for_remote(&decoded_token.claims, &recipient_domain).map_err(|err| {
-        lore_warn!("{err}");
-        ExchangeError::internal_with_context(
-            err,
-            "The token is not suitable for what you intend to do",
-        )
-    })?;
+    let domains = authz
+        .recipients
+        .domains_for(&token, &recipient_domain)
+        .map_err(recipient_refused)?;
 
     lore_trace!(
         "Authorization with user token successful in {} ms",
@@ -206,16 +204,11 @@ pub async fn exchange(
 
     cache.insert(cache_key, token.clone());
 
-    let _ = token_store::store_user_token(
-        &token_store_key,
-        identity,
-        &token,
-        decoded_token.claims.acceptable_root_domains(),
-    )
-    .await
-    .map_err(|err| {
-        lore_warn!("Failed to store token: {err}");
-    });
+    let _ = token_store::store_user_token(&token_store_key, identity, &token, domains)
+        .await
+        .map_err(|err| {
+            lore_warn!("Failed to store token: {err}");
+        });
 
     Ok(token)
 }
@@ -344,16 +337,10 @@ pub async fn exchange_custom_resource(
     if token.is_empty() {
         return Err(ExchangeError::internal("Empty token response"));
     }
-    let decoded_token = insecure_decode_token(&token)
-        .internal("Could not decode token")
-        .map_err(ExchangeError::from)?;
-    verify_jwt_usage_for_remote(&decoded_token.claims, &recipient_domain).map_err(|err| {
-        lore_warn!("{err}");
-        ExchangeError::internal_with_context(
-            err,
-            "The token is not suitable for what you intend to do",
-        )
-    })?;
+    let domains = authz
+        .recipients
+        .domains_for(&token, &recipient_domain)
+        .map_err(recipient_refused)?;
 
     lore_trace!(
         "Authorization with user token successful in {} ms",
@@ -364,16 +351,11 @@ pub async fn exchange_custom_resource(
 
     cache.insert(cache_key, token.clone());
 
-    let _ = token_store::store_user_token(
-        &token_store_key,
-        identity,
-        &token,
-        decoded_token.claims.acceptable_root_domains(),
-    )
-    .await
-    .map_err(|err| {
-        lore_warn!("Failed to store token: {err}");
-    });
+    let _ = token_store::store_user_token(&token_store_key, identity, &token, domains)
+        .await
+        .map_err(|err| {
+            lore_warn!("Failed to store token: {err}");
+        });
 
     Ok(token)
 }

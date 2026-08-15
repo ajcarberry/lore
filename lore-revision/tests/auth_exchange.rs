@@ -24,8 +24,10 @@ mod tests {
     use lore_transport::Authentication;
     use lore_transport::AuthenticationToken;
     use lore_transport::AuthorizationToken;
+    use lore_transport::LoginFlow;
     use lore_transport::ProtocolError;
     use lore_transport::ResolvedUser;
+    use lore_transport::TokenRecipients;
     use lore_transport::auth::authentication;
 
     struct TestAuthentication {
@@ -40,7 +42,7 @@ mod tests {
                     Ok(AuthorizationToken {
                         token: "authz-token".into(),
                         expires_ms: u64::MAX,
-                        acceptable_root_domains: vec![],
+                        recipients: TokenRecipients::SelfDescribing,
                     })
                 }),
             }
@@ -65,6 +67,7 @@ mod tests {
             &self,
             _auth_url: &str,
             _client_state: &str,
+            _flow: LoginFlow,
             _correlation_id: &str,
         ) -> Result<AuthSession, ProtocolError> {
             Err(ProtocolError::from(NotSupported {
@@ -295,7 +298,12 @@ mod tests {
 
         let auth = authentication::find(&format!("{scheme}://auth.test.com")).unwrap();
         let result = auth
-            .start_auth_session(&format!("{scheme}://auth.test.com"), "state", "corr")
+            .start_auth_session(
+                &format!("{scheme}://auth.test.com"),
+                "state",
+                LoginFlow::Browser,
+                "corr",
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().is_not_supported());

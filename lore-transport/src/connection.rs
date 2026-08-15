@@ -1089,14 +1089,17 @@ mod tests {
             user_id: "user-1".into(),
             user_name: "Alice".into(),
             expires_ms: 1700000000000,
-            acceptable_root_domains: vec!["example.com".into()],
+            recipients: TokenRecipients::Explicit(vec!["example.com".into()]),
             refresh_token: Some("refresh-abc".into()),
         };
         assert_eq!(token.token, "jwt-token");
         assert_eq!(token.user_id, "user-1");
         assert_eq!(token.user_name, "Alice");
         assert_eq!(token.expires_ms, 1700000000000);
-        assert_eq!(token.acceptable_root_domains, vec!["example.com"]);
+        assert_eq!(
+            token.recipients,
+            TokenRecipients::Explicit(vec!["example.com".into()])
+        );
         assert_eq!(token.refresh_token.as_deref(), Some("refresh-abc"));
     }
 
@@ -1107,7 +1110,7 @@ mod tests {
             user_id: "user-1".into(),
             user_name: "Alice".into(),
             expires_ms: 1700000000000,
-            acceptable_root_domains: vec![],
+            recipients: TokenRecipients::SelfDescribing,
             refresh_token: None,
         };
         assert!(token.refresh_token.is_none());
@@ -1118,11 +1121,17 @@ mod tests {
         let token = AuthorizationToken {
             token: "authz-jwt".into(),
             expires_ms: 1700000060000,
-            acceptable_root_domains: vec!["repo.example.com".into(), "cdn.example.com".into()],
+            recipients: TokenRecipients::Explicit(vec![
+                "repo.example.com".into(),
+                "cdn.example.com".into(),
+            ]),
         };
         assert_eq!(token.token, "authz-jwt");
         assert_eq!(token.expires_ms, 1700000060000);
-        assert_eq!(token.acceptable_root_domains.len(), 2);
+        assert_eq!(
+            token.recipients,
+            TokenRecipients::Explicit(vec!["repo.example.com".into(), "cdn.example.com".into()])
+        );
     }
 
     #[test]

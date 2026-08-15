@@ -769,21 +769,14 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
     Ok(identities)
 }
 
-/// Encrypts and stores (or replaces) the refresh token for an identity.
+/// Locks the store, applies `update` to the identity's entry, and persists.
 ///
-/// Called by orchestration after login or successful refresh. Overwrites
-/// any existing refresh token atomically.
-pub async fn store_refresh_token(
+/// Returns `TokenNotFound` when no entry exists for the identity.
+async fn update_identity_entry(
     auth_endpoint: &str,
     identity: &str,
-    refresh_token: &str,
+    update: impl FnOnce(&mut IdentityToken),
 ) -> Result<(), TokenStoreError> {
-    let auth_endpoint = auth_endpoint.trim_end_matches('/');
-
-    let encrypted_refresh = encrypt_token(refresh_token).await?;
-
-    lore_trace!("Store refresh token for {identity} at {auth_endpoint}");
-
     let token_map = token_map();
     let mut map_lock = token_map.lock().await;
     let guard = lock_token_map().await?;
@@ -799,11 +792,9 @@ pub async fn store_refresh_token(
             .iter_mut()
             .find(|entry| entry.user_id == identity)
     {
-        token_entry.refresh_token = Some(encrypted_refresh);
+        update(token_entry);
     } else {
-        lore_debug!(
-            "No identity entry found for {identity} at {auth_endpoint}, cannot store refresh token"
-        );
+        lore_debug!("No identity entry found for {identity} at {auth_endpoint}, cannot update it");
         return Err(TokenNotFound.into());
     }
 
@@ -812,6 +803,60 @@ pub async fn store_refresh_token(
     } else {
         Err(TokenStoreError::internal("Failed to store token map"))
     }
+}
+
+/// Encrypts and stores (or replaces) the refresh token for an identity.
+///
+/// Called by orchestration after login or successful refresh. Overwrites
+/// any existing refresh token atomically.
+pub async fn store_refresh_token(
+    auth_endpoint: &str,
+    identity: &str,
+    refresh_token: &str,
+) -> Result<(), TokenStoreError> {
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
+
+    let encrypted_refresh = encrypt_token(refresh_token).await?;
+
+    lore_trace!("Store refresh token for {identity} at {auth_endpoint}");
+
+    update_identity_entry(auth_endpoint, identity, |token_entry| {
+        token_entry.refresh_token = Some(encrypted_refresh);
+    })
+    .await
+}
+
+/// Replaces an identity's stored authentication token with a refreshed one,
+/// rotating the refresh token when the provider issued a new one.
+///
+/// Keeps the acceptable-root-domain set recorded at login rather than taking
+/// it from the refreshed token: a refresh must not widen where the credential
+/// may go.
+///
+/// Returns `TokenNotFound` when there is no stored login to refresh.
+pub async fn store_refreshed_user_token(
+    auth_endpoint: &str,
+    identity: &str,
+    token: &str,
+    rotated_refresh_token: Option<&str>,
+) -> Result<(), TokenStoreError> {
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
+
+    let encrypted_token = encrypt_token(token).await?;
+    let encrypted_refresh = match rotated_refresh_token {
+        Some(refresh_token) => Some(encrypt_token(refresh_token).await?),
+        None => None,
+    };
+
+    lore_trace!("Store refreshed user {identity} token for auth endpoint {auth_endpoint}");
+
+    update_identity_entry(auth_endpoint, identity, |token_entry| {
+        token_entry.token = encrypted_token;
+        if encrypted_refresh.is_some() {
+            token_entry.refresh_token = encrypted_refresh;
+        }
+    })
+    .await
 }
 
 /// Loads and decrypts the refresh token for an identity.

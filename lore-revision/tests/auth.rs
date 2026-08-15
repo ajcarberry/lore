@@ -47,7 +47,7 @@ mod tests {
             JWTUserInfo {
                 issuer: "my_test_issuer.example.com".to_string(),
                 user_id: "my_user_id".into(),
-                name: "my_name".into(),
+                name: Some("my_name".into()),
                 preferred_username: None,
                 is_service_account: None,
                 expires: 1,
@@ -123,6 +123,17 @@ mod tests {
             verify_jwt_usage_for_remote(&token, "lore.epicgames.net").unwrap();
             // The look-alike registrable domain does not.
             verify_jwt_usage_for_remote(&token, "evilepicgames.net").unwrap_err();
+        }
+
+        /// The mismatch that makes the JWT-derived set unusable for `OpenID` Connect: `aud`
+        /// carries a client id and `iss` a URL, and neither is a domain a remote matches.
+        #[test]
+        fn oidc_shaped_claims_cannot_derive_their_own_recipients() {
+            let mut token = make_jwt_with_audience(vec!["lore".to_string()]);
+            token.issuer = "https://id.example.com".to_string();
+
+            verify_jwt_usage_for_remote(&token, "lore.example.com").unwrap_err();
+            verify_jwt_usage_for_remote(&token, "id.example.com").unwrap_err();
         }
     }
 }

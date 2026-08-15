@@ -42,5 +42,5 @@ uuid = { workspace = true }
 
 [features]
 integration_tests = []
-oidc_integration_tests = ["integration_tests", "dep:tokio-stream", "dep:tonic"]
+oidc_integration_tests = ["dep:tonic"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]

@@ -375,7 +375,9 @@ mod tests {
     /// file rather than the OS keyring.
     ///
     /// One directory for the whole binary, because `LORE_AUTH_PATH` and the loaded token map
-    /// are both process-wide. Tests stay independent by using an auth URL of their own.
+    /// are both process-wide. Tests stay independent by using an auth URL of their own. The
+    /// `OnceLock` is what serializes the environment write: concurrent callers block until
+    /// it has run, and none of them observes the variables unset.
     fn isolated_credential_store() -> &'static TempDir {
         static AUTH_DIR: OnceLock<TempDir> = OnceLock::new();
         AUTH_DIR.get_or_init(|| {
@@ -417,10 +419,6 @@ mod tests {
     }
 
     /// The token-recipient guard, on the path an explicit identity takes.
-    ///
-    /// `exchange` loads the stored authentication token by the auth service's domain, so a
-    /// remote advertising the auth URL the user logged in against would otherwise be handed
-    /// that user's credential under an OIDC passthrough.
     #[tokio::test]
     async fn exchange_refuses_a_recipient_the_stored_token_does_not_name() {
         let scheme = "test-exchange-recipient-guard";
@@ -469,8 +467,8 @@ mod tests {
         );
     }
 
-    /// A token that expired since the last command is traded for a new one, and the
-    /// operation goes through on it rather than demanding an interactive login.
+    /// A token that expired since the last command is traded for a new one instead of
+    /// demanding an interactive login.
     #[tokio::test]
     async fn an_expired_token_is_refreshed_and_the_operation_proceeds() {
         let scheme = "test-refresh-proceeds";
@@ -506,9 +504,8 @@ mod tests {
         );
     }
 
-    /// The producer half of the token-recipient guard, on a refreshed token: what a refresh
-    /// persists has to be what the login persisted, because the acceptable set names the
-    /// remote the login was performed against and the provider cannot know it.
+    /// The token-recipient guard on a refreshed token: a refresh persists the recipients
+    /// the login recorded, which the provider does not know.
     #[tokio::test]
     async fn a_refreshed_token_keeps_the_recipients_the_login_recorded() {
         let scheme = "test-refresh-recipient-guard";

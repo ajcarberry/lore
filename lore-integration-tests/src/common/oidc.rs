@@ -24,8 +24,12 @@ pub(crate) mod oidc_common {
     use serde_json::json;
     use tracing::info;
 
-    /// Must match the port published for `pocket-id` in `compose.yaml`.
-    const POCKET_ID_URL: &str = "http://127.0.0.1:1411";
+    /// `LORE_TEST_POCKET_ID_URL`, falling back to the port published for `pocket-id` in
+    /// `compose.yaml`.
+    fn pocket_id_url() -> String {
+        std::env::var("LORE_TEST_POCKET_ID_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:1411".to_string())
+    }
 
     /// Hardcoded in lore-integration-tests/compose.yaml as `STATIC_API_KEY`.
     const API_KEY: &str = "lorelocaltestapikeylorelocaltestapikey";
@@ -95,14 +99,13 @@ pub(crate) mod oidc_common {
     /// Points the fixture at the compose-managed `PocketID` and ensures the shared OIDC
     /// client exists.
     ///
-    /// Idempotent under parallel tests: a losing racer treats `PocketID`'s duplicate-client
-    /// rejection as success.
+    /// Idempotent: a duplicate-client 400 means another test already registered it.
     pub async fn setup() -> Result<OidcFixture, Box<dyn Error + 'static>> {
         let _ = tracing_subscriber::fmt::try_init();
 
         let fixture = OidcFixture {
             client: reqwest::Client::builder().build()?,
-            base_url: POCKET_ID_URL.to_string(),
+            base_url: pocket_id_url(),
         };
 
         fixture.wait_until_ready().await?;
@@ -185,6 +188,22 @@ pub(crate) mod oidc_common {
                 .await?)
         }
 
+        /// Replace an existing resource, authenticated as the static admin user.
+        async fn admin_put(
+            &self,
+            path: &str,
+            body: Value,
+        ) -> Result<reqwest::Response, Box<dyn Error + 'static>> {
+            Ok(self
+                .client
+                .put(self.url(path))
+                .header("X-API-KEY", API_KEY)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(serde_json::to_vec(&body)?)
+                .send()
+                .await?)
+        }
+
         /// Fails with the endpoint's own error text, the only place `PocketID` explains
         /// validation failures.
         async fn json_or_error(
@@ -194,7 +213,7 @@ pub(crate) mod oidc_common {
             let status = response.status();
             let body = response.text().await?;
             if !status.is_success() {
-                return Err(anyhow::anyhow!("POST {path} failed with {status}: {body}").into());
+                return Err(anyhow::anyhow!("{path} failed with {status}: {body}").into());
             }
             Ok(serde_json::from_str(if body.is_empty() {
                 "{}"
@@ -203,31 +222,30 @@ pub(crate) mod oidc_common {
             })?)
         }
 
-        /// Register a public PKCE client, tolerating one that is already there.
+        /// Register a public PKCE client, updating one that is already there so its
+        /// callback URLs match this run rather than whatever an older run registered.
         pub async fn ensure_client(
             &self,
             client_id: &str,
             callback_urls: &[&str],
         ) -> Result<(), Box<dyn Error + 'static>> {
-            let response = self
-                .admin_post(
-                    "/api/oidc/clients",
-                    json!({
-                        "id": client_id,
-                        "name": client_id,
-                        "callbackURLs": callback_urls,
-                        // Public + PKCE is what a CLI is: no client secret to ship.
-                        "isPublic": true,
-                        "pkceEnabled": true,
-                    }),
-                )
-                .await?;
+            let client = json!({
+                "id": client_id,
+                "name": client_id,
+                "callbackURLs": callback_urls,
+                // Public + PKCE is what a CLI is: no client secret to ship.
+                "isPublic": true,
+                "pkceEnabled": true,
+            });
+            let response = self.admin_post("/api/oidc/clients", client.clone()).await?;
 
-            // Losing this race is normal: the container persists across runs, and
-            // PocketID reports the collision as a 400 naming the id.
+            // Idempotent: a duplicate-client 400 means another test already registered it.
             if response.status() == StatusCode::BAD_REQUEST {
                 let body = response.text().await?;
                 if body.contains("already in use") {
+                    let path = format!("/api/oidc/clients/{client_id}");
+                    let response = self.admin_put(&path, client).await?;
+                    Self::json_or_error(&path, response).await?;
                     return Ok(());
                 }
                 return Err(anyhow::anyhow!("Could not create OIDC client: {body}").into());
@@ -376,11 +394,9 @@ pub(crate) mod oidc_common {
             Ok(serde_json::from_value(tokens)?)
         }
 
-        /// Plays the browser for one authorization-code flow: follows `authorization_url`
-        /// and returns the URL the provider would have redirected to, carrying `code` and
-        /// echoing `state`.
-        ///
-        /// Reads everything it needs from the URL, since that is all a browser is given.
+        /// Follows `authorization_url` and returns the URL the provider would have
+        /// redirected to, carrying `code` and echoing `state`. Everything it needs comes
+        /// from the URL, as it would for a browser.
         pub async fn follow_authorization_url(
             &self,
             user: &TestUser,
@@ -444,8 +460,8 @@ pub(crate) mod oidc_common {
             Ok(serde_json::from_value(authorization)?)
         }
 
-        /// Approves a device `user_code` as `user`, standing in for the human half of the
-        /// flow via the session cookie.
+        /// Approves a device `user_code` as `user`, using the session cookie in place of
+        /// the browser a person would approve it in.
         pub async fn approve_user_code(
             &self,
             user: &TestUser,
@@ -544,175 +560,5 @@ pub(crate) mod oidc_common {
                 &validation,
             )?)
         }
-    }
-
-    /// A `PocketID` container, driven only through its documented API, issues a real signed
-    /// token for a user it has never logged in.
-    ///
-    /// Requires the compose stack (`docker compose --file lore-integration-tests/compose.yaml
-    /// up --detach pocket-id`).
-    #[tokio::test]
-    async fn pocket_id_issues_a_verifiable_token_without_a_browser() {
-        let fixture = setup().await.expect("PocketID fixture setup failed");
-        let user = fixture
-            .create_user("loretest")
-            .await
-            .expect("Could not provision a test user");
-
-        let tokens = fixture
-            .issue_token(&user)
-            .await
-            .expect("Could not issue a token");
-
-        // Both tokens must verify against the JWKS that discovery points at.
-        for token in [&tokens.id_token, &tokens.access_token] {
-            let claims = fixture
-                .validate_token(token, TEST_CLIENT_ID)
-                .await
-                .expect("Token did not validate against the issuer's JWKS")
-                .claims;
-
-            assert_eq!(claims.iss, fixture.issuer(), "Wrong issuer");
-            assert_eq!(
-                claims.aud,
-                vec![TEST_CLIENT_ID.to_string()],
-                "Wrong audience"
-            );
-            assert_eq!(claims.sub, user.id, "Token is for the wrong subject");
-        }
-
-        let id_claims = fixture
-            .validate_token(&tokens.id_token, TEST_CLIENT_ID)
-            .await
-            .expect("id_token did not validate")
-            .claims;
-        assert_eq!(
-            id_claims.preferred_username.as_deref(),
-            Some(user.username.as_str())
-        );
-        assert_eq!(id_claims.email.as_deref(), Some(user.email.as_str()));
-        assert_eq!(id_claims.token_type.as_deref(), Some("id-token"));
-        assert!(tokens.expires_in > 0, "Token expires immediately");
-        assert!(id_claims.exp > 0, "id_token carries no expiry");
-        // The nonce binds the token to this exchange.
-        assert!(
-            id_claims.nonce.is_some(),
-            "id_token did not echo the request nonce"
-        );
-
-        // The refresh grant keeps a `lore` session alive past expiry.
-        assert!(
-            tokens.refresh_token.is_some(),
-            "No refresh token issued for a public PKCE client"
-        );
-
-        // A token minted for another client must not pass as one of ours.
-        let other_client = "lore-integration-tests-other";
-        fixture
-            .ensure_client(other_client, &[TEST_REDIRECT_URI])
-            .await
-            .expect("Could not create the second client");
-        let other = fixture
-            .issue_token_for_client(&user, other_client)
-            .await
-            .expect("Could not issue a token for the second client");
-        assert!(
-            fixture
-                .validate_token(&other.id_token, TEST_CLIENT_ID)
-                .await
-                .is_err(),
-            "A token issued for {other_client} validated as {TEST_CLIENT_ID}"
-        );
-    }
-
-    /// The device authorization grant (RFC 8628), driven end to end with no browser.
-    ///
-    /// Requires the compose stack (`docker compose --file lore-integration-tests/compose.yaml
-    /// up --detach pocket-id`).
-    #[tokio::test]
-    async fn pocket_id_device_grant_completes_without_a_browser() {
-        let fixture = setup().await.expect("PocketID fixture setup failed");
-
-        // The client keys off the advertisement rather than assuming support.
-        let discovery = fixture
-            .discovery()
-            .await
-            .expect("Could not fetch the discovery document");
-        assert_eq!(
-            discovery["device_authorization_endpoint"].as_str(),
-            Some(format!("{}/api/oidc/device/authorize", fixture.issuer()).as_str()),
-            "Discovery does not advertise a device authorization endpoint"
-        );
-        let grant_types = discovery["grant_types_supported"]
-            .as_array()
-            .expect("Discovery has no grant_types_supported");
-        assert!(
-            grant_types
-                .iter()
-                .any(|grant| grant.as_str() == Some("urn:ietf:params:oauth:grant-type:device_code")),
-            "Discovery does not advertise the device_code grant: {grant_types:?}"
-        );
-
-        let user = fixture
-            .create_user("loredevice")
-            .await
-            .expect("Could not provision a test user");
-
-        // Leg one: the headless client asks for a code, holding no credentials.
-        let authorization = fixture
-            .start_device_authorization()
-            .await
-            .expect("Could not start a device authorization");
-        assert!(!authorization.user_code.is_empty(), "No user code issued");
-        assert!(
-            authorization.verification_uri.starts_with(fixture.issuer()),
-            "Verification URI {} is not on the issuer",
-            authorization.verification_uri
-        );
-        assert!(
-            authorization.expires_in > 0,
-            "Device code expires immediately"
-        );
-        assert!(authorization.interval > 0, "No poll interval advertised");
-
-        // Leg two: approval, standing in for the human reading the code off a terminal.
-        fixture
-            .approve_user_code(&user, &authorization.user_code)
-            .await
-            .expect("Could not approve the device user code");
-
-        // Leg three: the client collects real tokens for the approved code.
-        let tokens = fixture
-            .redeem_device_code(&authorization.device_code)
-            .await
-            .expect("Could not redeem the device code");
-
-        let claims = fixture
-            .validate_token(&tokens.id_token, TEST_CLIENT_ID)
-            .await
-            .expect("Device-flow id_token did not validate against the issuer's JWKS")
-            .claims;
-        assert_eq!(claims.sub, user.id, "Token is for the wrong subject");
-        assert_eq!(claims.iss, fixture.issuer(), "Wrong issuer");
-        assert_eq!(
-            claims.aud,
-            vec![TEST_CLIENT_ID.to_string()],
-            "Wrong audience"
-        );
-
-        // The refresh grant has to work for a device login too.
-        assert!(
-            tokens.refresh_token.is_some(),
-            "No refresh token issued for the device grant"
-        );
-
-        // A device code is single-use: redeeming it twice must not mint a second token.
-        assert!(
-            fixture
-                .redeem_device_code(&authorization.device_code)
-                .await
-                .is_err(),
-            "The same device code was redeemed twice"
-        );
     }
 }

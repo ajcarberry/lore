@@ -10,8 +10,10 @@
 #[cfg(all(test, feature = "oidc_integration_tests"))]
 mod oidc_client_tests {
     use std::error::Error;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
+    use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::RepositoryId;
     use lore_credential::token_store;
     use lore_credential::token_store::tokens_only_for_recipient_domain;
@@ -24,6 +26,7 @@ mod oidc_client_tests {
     use crate::common::oidc::oidc_common;
     use crate::common::oidc::oidc_common::OidcFixture;
     use crate::common::oidc::oidc_common::TestUser;
+    use crate::setup_execution;
 
     /// A client of its own, registered with a wildcard port so any loopback redirect is
     /// registered.
@@ -32,6 +35,13 @@ mod oidc_client_tests {
     /// The wildcard that makes RFC 8252 §7.3's ephemeral port workable against redirect-URI
     /// validation.
     const CALLBACK_URL: &str = "http://127.0.0.1:*/callback";
+
+    /// The remote the staged login was performed against.
+    const REMOTE_DOMAIN: &str = "repo.example.com";
+
+    /// The ceiling on every poll loop below, in 500ms steps.
+    const POLL_ATTEMPTS: usize = 60;
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
     /// `oidc+http`, accepted only because the issuer is loopback.
     fn auth_url(issuer: &str) -> String {
@@ -49,367 +59,13 @@ mod oidc_client_tests {
         Ok((fixture, user, auth_url))
     }
 
-    /// Runs the browser half of a PKCE login and returns the resulting token.
-    async fn login_with_pkce(
-        auth: &OidcAuthentication,
-        fixture: &OidcFixture,
-        user: &TestUser,
-        auth_url: &str,
-    ) -> Result<AuthenticationToken, Box<dyn Error + 'static>> {
-        let session = auth
-            .start_auth_session(auth_url, "client-state", LoginFlow::Browser, "")
-            .await?;
-
-        // Nothing has arrived at the listener yet, so the flow is genuinely pending.
-        assert_eq!(
-            auth.poll_auth_session(auth_url, "client-state", &session.session_code, "")
-                .await?
-                .map(|token| token.user_id),
-            None,
-            "poll answered before the browser had been anywhere"
-        );
-
-        let redirect = fixture
-            .follow_authorization_url(user, &session.login_url)
-            .await?;
-        deliver(&redirect).await?;
-
-        // The listener records the delivered code on its own task, so poll a few times
-        // rather than assuming the token is ready the instant `deliver` returns, the way a
-        // real client polls instead of expecting the first poll to succeed.
-        for _ in 0..20 {
-            if let Some(token) = auth
-                .poll_auth_session(auth_url, "client-state", &session.session_code, "")
-                .await?
-            {
-                return Ok(token);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        Err(anyhow::anyhow!("Poll returned no token after the redirect").into())
-    }
-
-    /// Fetches a redirect URL, putting the authorization response in front of the loopback
-    /// listener.
-    async fn deliver(redirect: &str) -> Result<(), Box<dyn Error + 'static>> {
-        let response = reqwest::Client::new().get(redirect).send().await?;
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Loopback listener answered {} for the redirect",
-                response.status()
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    /// The authorization code flow with PKCE over a loopback redirect, end to end against a
-    /// real provider.
-    ///
-    /// Requires the compose stack (`docker compose --file lore-integration-tests/compose.yaml
-    /// up --detach pocket-id`).
-    #[tokio::test]
-    async fn pkce_login_yields_a_verifiable_id_token() {
-        let (fixture, user, auth_url) = setup().await.expect("PocketID fixture setup failed");
-        let auth = OidcAuthentication::default();
-
-        let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
-            .await
-            .expect("The PKCE login should complete");
-
-        // The credential is the ID token, verified against the provider's own JWKS — the
-        // same path the server takes.
-        let claims = fixture
-            .validate_token(&token.token, CLIENT_ID)
-            .await
-            .expect("The credential did not verify against the issuer's JWKS")
-            .claims;
-        assert_eq!(claims.sub, user.id, "Token is for the wrong subject");
-        assert_eq!(claims.iss, fixture.issuer(), "Wrong issuer");
-        assert_eq!(claims.aud, vec![CLIENT_ID.to_string()], "Wrong audience");
-        assert!(
-            claims.nonce.is_some(),
-            "The implementation asked for no nonce, so a replay would be undetectable"
-        );
-
-        assert_eq!(token.user_id, user.id, "user_id should be the subject");
-        assert!(token.expires_ms > 0, "Token carries no expiry");
-        // `offline_access` is requested precisely so the session outlives the first token.
-        assert!(
-            token.refresh_token.is_some(),
-            "No refresh token, so the session cannot be kept alive"
-        );
-
-        // The token may go back to its issuer, and the orchestration layer adds the remote.
-        assert_eq!(
-            token.recipients,
-            TokenRecipients::Explicit(vec![format!("{}/", fixture.issuer())]),
-            "The implementation should name the issuer as a recipient, and nothing else"
-        );
-    }
-
-    /// An authorization response belonging to another session must not be exchanged: the
-    /// `state` check refuses it before the code is used (RFC 9700).
-    ///
-    /// Requires the compose stack (see above).
-    #[tokio::test]
-    async fn pkce_refuses_a_response_with_the_wrong_state() {
-        let (fixture, user, auth_url) = setup().await.expect("PocketID fixture setup failed");
-        let auth = OidcAuthentication::default();
-
-        let session = auth
-            .start_auth_session(&auth_url, "client-state", LoginFlow::Browser, "")
-            .await
-            .expect("The login should start");
-
-        // A real code from a real consent, delivered under somebody else's state.
-        let redirect = fixture
-            .follow_authorization_url(&user, &session.login_url)
-            .await
-            .expect("The consent leg should complete");
-        let mut tampered = reqwest::Url::parse(&redirect).expect("The redirect should be a URL");
-        let query: Vec<(String, String)> = tampered
-            .query_pairs()
-            .map(|(key, value)| {
-                if key == "state" {
-                    (key.into_owned(), "another-sessions-state".to_string())
-                } else {
-                    (key.into_owned(), value.into_owned())
-                }
-            })
-            .collect();
-        tampered.query_pairs_mut().clear().extend_pairs(&query);
-        deliver(tampered.as_str())
-            .await
-            .expect("The listener should still answer the request");
-
-        // The listener records the delivered response on its own task, so poll until it has
-        // been processed rather than assuming the first poll sees it, then confirm the
-        // mismatched state was refused.
-        let mut outcome = auth
-            .poll_auth_session(&auth_url, "client-state", &session.session_code, "")
-            .await;
-        for _ in 0..20 {
-            if matches!(outcome, Ok(None)) {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                outcome = auth
-                    .poll_auth_session(&auth_url, "client-state", &session.session_code, "")
-                    .await;
-            } else {
-                break;
-            }
-        }
-        outcome.expect_err("A response carrying another session's state must not be exchanged");
-    }
-
-    /// The device authorization grant behind `lore login --no-browser`, driven with no
-    /// browser and no human.
-    ///
-    /// Requires the compose stack (see above).
-    #[tokio::test]
-    async fn device_grant_login_yields_a_verifiable_id_token() {
-        let (fixture, user, auth_url) = setup().await.expect("PocketID fixture setup failed");
-        let auth = OidcAuthentication::default();
-
-        let session = auth
-            .start_auth_session(&auth_url, "client-state", LoginFlow::NoBrowser, "")
-            .await
-            .expect("The device authorization should start");
-
-        // `login_url` is the provider's complete verification URI, carrying the user code.
-        assert!(
-            session.login_url.starts_with(fixture.issuer()),
-            "Verification URI {} is not on the issuer",
-            session.login_url
-        );
-        let user_code = reqwest::Url::parse(&session.login_url)
-            .expect("The verification URI should be a URL")
-            .query_pairs()
-            .find(|(key, _)| key == "code" || key == "user_code")
-            .map(|(_, value)| value.into_owned())
-            .expect("The verification URI carries no user code");
-
-        // RFC 8628 §3.5's `authorization_pending` is reported by the trait as `None`, not
-        // a failure.
-        assert!(
-            auth.poll_auth_session(&auth_url, "client-state", &session.session_code, "")
-                .await
-                .expect("authorization_pending is not a failure")
-                .is_none(),
-            "Poll returned a token before anybody approved"
-        );
-
-        // The human half: reading the code off the terminal and confirming it.
-        fixture
-            .approve_user_code(&user, &user_code)
-            .await
-            .expect("Could not approve the device user code");
-
-        // Honoring the provider's advertised interval means an immediate second poll
-        // wouldn't reach the network.
-        tokio::time::sleep(Duration::from_secs(6)).await;
-
-        let token = auth
-            .poll_auth_session(&auth_url, "client-state", &session.session_code, "")
-            .await
-            .expect("The approved device code should redeem")
-            .expect("The approved device code returned no token");
-
-        let claims = fixture
-            .validate_token(&token.token, CLIENT_ID)
-            .await
-            .expect("The credential did not verify against the issuer's JWKS")
-            .claims;
-        assert_eq!(claims.sub, user.id, "Token is for the wrong subject");
-        assert_eq!(token.user_id, user.id);
-        assert!(
-            token.refresh_token.is_some(),
-            "A headless host would have to re-run the whole ceremony on every expiry"
-        );
-    }
-
-    /// The refresh grant: a stored refresh token yields a new ID token and a rotated
-    /// refresh token.
-    ///
-    /// Requires the compose stack (see above).
-    #[tokio::test]
-    async fn refresh_grant_yields_a_new_token_and_rotates_the_refresh_token() {
-        let (fixture, user, auth_url) = setup().await.expect("PocketID fixture setup failed");
-        let auth = OidcAuthentication::default();
-
-        let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
-            .await
-            .expect("The PKCE login should complete");
-        let refresh_token = token
-            .refresh_token
-            .clone()
-            .expect("The login issued no refresh token");
-
-        let refreshed = auth
-            .refresh_authentication(&auth_url, &refresh_token, "")
-            .await
-            .expect("The refresh grant should succeed");
-
-        let claims = fixture
-            .validate_token(&refreshed.token, CLIENT_ID)
-            .await
-            .expect("The refreshed credential did not verify against the issuer's JWKS")
-            .claims;
-        assert_eq!(
-            claims.sub, user.id,
-            "Refreshed token is for another subject"
-        );
-        assert_eq!(refreshed.user_id, user.id);
-        assert_eq!(
-            refreshed.recipients, token.recipients,
-            "A refreshed token has the same recipients as the one it replaces"
-        );
-
-        let rotated = refreshed
-            .refresh_token
-            .expect("The refresh grant returned no new refresh token");
-        assert_ne!(
-            rotated, refresh_token,
-            "The refresh token was not rotated, so a stolen one stays usable"
-        );
-    }
-
-    /// The refresh grant reached the way it is in production: by an ordinary repository
-    /// operation whose stored login has aged out.
-    ///
-    /// Expiry is staged (not waited for, since `PocketID`'s lifetimes run in hours); the
-    /// client checks no signature, so a past `exp` is expired as far as it's concerned.
-    ///
-    /// Requires the compose stack (see above).
-    #[tokio::test]
-    async fn an_expired_login_is_refreshed_by_the_exchange_path() {
-        let (fixture, user, auth_url) = setup().await.expect("PocketID fixture setup failed");
-        isolated_credential_store();
-        let auth = OidcAuthentication::default();
-
-        let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
-            .await
-            .expect("The PKCE login should complete");
-        let refresh_token = token
-            .refresh_token
-            .clone()
-            .expect("The login issued no refresh token");
-        let expired = with_expiry_in_the_past(&token.token);
-
-        // What a login leaves behind, some hours later.
-        token_store::store_user_token(
-            &auth_url,
-            &token.user_id,
-            &expired,
-            vec![REMOTE_DOMAIN.to_string()],
-        )
-        .await
-        .expect("Failed to store the expired authentication token");
-        token_store::store_refresh_token(&auth_url, &token.user_id, &refresh_token)
-            .await
-            .expect("Failed to store the refresh token");
-
-        let authz = lore_transport::auth::exchange::exchange(
-            &auth_url,
-            &token.user_id,
-            RepositoryId::default(),
-            REMOTE_DOMAIN.to_string(),
-        )
-        .await
-        .expect("The operation should proceed on a refreshed credential, with no new login");
-
-        assert_ne!(
-            authz, expired,
-            "The expired credential was presented, so the server would refuse the operation"
-        );
-        let claims = fixture
-            .validate_token(&authz, CLIENT_ID)
-            .await
-            .expect("The refreshed credential did not verify against the issuer's JWKS")
-            .claims;
-
-        // A different token isn't necessarily a live one: only `exp` proves the refresh
-        // bought time.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("The clock is before the epoch")
-            .as_secs() as i64;
-        assert!(
-            claims.exp > now,
-            "The refreshed credential expired at {} and it is now {now}",
-            claims.exp
-        );
-
-        // PocketID retires the refresh token it's given, so storing the rotated one is
-        // what survives the next expiry.
-        let stored_refresh = token_store::load_refresh_token(&auth_url, &token.user_id)
-            .await
-            .expect("The refresh token is gone, so the next expiry needs a login");
-        assert_ne!(
-            stored_refresh, refresh_token,
-            "The rotated refresh token was not stored, so the session dies at the next expiry"
-        );
-
-        // And the refresh did not widen where the credential may be sent.
-        assert!(
-            token_store::load_user_token(
-                &auth_url,
-                &token.user_id,
-                tokens_only_for_recipient_domain("elsewhere.example.com".to_string()),
-            )
-            .await
-            .is_err(),
-            "The refreshed token is offered to a remote the login never named"
-        );
-    }
-
-    /// The remote the staged login was performed against.
-    const REMOTE_DOMAIN: &str = "repo.example.com";
-
     /// Points the credential store at its own directory with a file-based encryption key,
     /// avoiding a macOS keychain prompt.
+    ///
+    /// The `OnceLock` is what serializes the environment write: concurrent callers block
+    /// until it has run, and none of them observes the variables unset.
     fn isolated_credential_store() {
-        static AUTH_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        static AUTH_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
         AUTH_DIR.get_or_init(|| {
             let auth_dir = tempfile::tempdir().expect("Failed to create a credential store dir");
             unsafe {
@@ -444,35 +100,426 @@ mod oidc_client_tests {
         )
     }
 
-    /// `exchange_for_repository` returns the authentication token unchanged: nothing to
-    /// exchange with, nothing to mint.
+    /// Runs the browser half of a PKCE login and returns the resulting token.
+    async fn login_with_pkce(
+        auth: &OidcAuthentication,
+        fixture: &OidcFixture,
+        user: &TestUser,
+        auth_url: &str,
+    ) -> Result<AuthenticationToken, Box<dyn Error + 'static>> {
+        let session = auth
+            .start_auth_session(auth_url, "client-state", LoginFlow::Browser, "")
+            .await?;
+
+        // The listener has been given nothing yet, so the flow is pending.
+        assert_eq!(
+            auth.poll_auth_session(auth_url, "client-state", &session.session_code, "")
+                .await?
+                .map(|token| token.user_id),
+            None,
+            "poll answered before the browser had been anywhere"
+        );
+
+        let redirect = fixture
+            .follow_authorization_url(user, &session.login_url)
+            .await?;
+        deliver(&redirect).await?;
+
+        // The listener records the delivered code on its own task, so poll until it has.
+        for _ in 0..POLL_ATTEMPTS {
+            if let Some(token) = auth
+                .poll_auth_session(auth_url, "client-state", &session.session_code, "")
+                .await?
+            {
+                return Ok(token);
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        Err(anyhow::anyhow!("Poll returned no token after the redirect").into())
+    }
+
+    /// Fetches a redirect URL, putting the authorization response in front of the loopback
+    /// listener.
+    async fn deliver(redirect: &str) -> Result<(), Box<dyn Error + 'static>> {
+        let response = reqwest::Client::new().get(redirect).send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Loopback listener answered {} for the redirect",
+                response.status()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The authorization code flow with PKCE over a loopback redirect, end to end against a
+    /// real provider.
+    ///
+    /// Requires the compose stack (`docker compose --file lore-integration-tests/compose.yaml
+    /// up --detach pocket-id`).
+    #[tokio::test]
+    async fn pkce_login_yields_a_verifiable_id_token() {
+        LORE_CONTEXT
+            .scope(setup_execution("test".to_string()), async move {
+                let (fixture, user, auth_url) =
+                    setup().await.expect("PocketID fixture setup failed");
+                let auth = OidcAuthentication::default();
+
+                let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
+                    .await
+                    .expect("The PKCE login should complete");
+
+                // The credential is the ID token, verified against the provider's own JWKS
+                // — the same path the server takes.
+                let claims = fixture
+                    .validate_token(&token.token, CLIENT_ID)
+                    .await
+                    .expect("The credential did not verify against the issuer's JWKS")
+                    .claims;
+                assert_eq!(claims.sub, user.id, "Token is for the wrong subject");
+                assert_eq!(claims.iss, fixture.issuer(), "Wrong issuer");
+                assert_eq!(claims.aud, vec![CLIENT_ID.to_string()], "Wrong audience");
+                assert!(
+                    claims.nonce.is_some(),
+                    "The implementation asked for no nonce, so a replay would be undetectable"
+                );
+
+                assert_eq!(token.user_id, user.id, "user_id should be the subject");
+                assert!(token.expires_ms > 0, "Token carries no expiry");
+                // `offline_access` is requested precisely so the session outlives the first
+                // token.
+                assert!(
+                    token.refresh_token.is_some(),
+                    "No refresh token, so the session cannot be kept alive"
+                );
+
+                // The token may go back to its issuer, and the orchestration layer adds the
+                // remote.
+                assert_eq!(
+                    token.recipients,
+                    TokenRecipients::Explicit(vec![format!("{}/", fixture.issuer())]),
+                    "The implementation should name the issuer as a recipient, and nothing else"
+                );
+            })
+            .await;
+    }
+
+    /// An authorization response belonging to another session must not be exchanged: the
+    /// `state` check refuses it before the code is used (RFC 9700).
+    ///
+    /// Requires the compose stack (see above).
+    #[tokio::test]
+    async fn pkce_refuses_a_response_with_the_wrong_state() {
+        LORE_CONTEXT
+            .scope(setup_execution("test".to_string()), async move {
+                let (fixture, user, auth_url) =
+                    setup().await.expect("PocketID fixture setup failed");
+                let auth = OidcAuthentication::default();
+
+                let session = auth
+                    .start_auth_session(&auth_url, "client-state", LoginFlow::Browser, "")
+                    .await
+                    .expect("The login should start");
+
+                // A real code from a real consent, delivered under somebody else's state.
+                let redirect = fixture
+                    .follow_authorization_url(&user, &session.login_url)
+                    .await
+                    .expect("The consent leg should complete");
+                let mut tampered =
+                    reqwest::Url::parse(&redirect).expect("The redirect should be a URL");
+                let query: Vec<(String, String)> = tampered
+                    .query_pairs()
+                    .map(|(key, value)| {
+                        if key == "state" {
+                            (key.into_owned(), "another-sessions-state".to_string())
+                        } else {
+                            (key.into_owned(), value.into_owned())
+                        }
+                    })
+                    .collect();
+                tampered.query_pairs_mut().clear().extend_pairs(&query);
+                deliver(tampered.as_str())
+                    .await
+                    .expect("The listener should still answer the request");
+
+                // The client's contract is an error on a state mismatch, so a token is the
+                // only outcome that fails the test.
+                for _ in 0..POLL_ATTEMPTS {
+                    match auth
+                        .poll_auth_session(&auth_url, "client-state", &session.session_code, "")
+                        .await
+                    {
+                        Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
+                        Ok(Some(_)) => {
+                            panic!("A response carrying another session's state was exchanged")
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// The device authorization grant behind `lore login --no-browser`, driven with no
+    /// browser and no human.
+    ///
+    /// Requires the compose stack (see above).
+    #[tokio::test]
+    async fn device_grant_login_yields_a_verifiable_id_token() {
+        LORE_CONTEXT
+            .scope(setup_execution("test".to_string()), async move {
+                let (fixture, user, auth_url) =
+                    setup().await.expect("PocketID fixture setup failed");
+                let auth = OidcAuthentication::default();
+
+                let session = auth
+                    .start_auth_session(&auth_url, "client-state", LoginFlow::NoBrowser, "")
+                    .await
+                    .expect("The device authorization should start");
+
+                // `login_url` is the provider's complete verification URI, carrying the user
+                // code.
+                assert!(
+                    session.login_url.starts_with(fixture.issuer()),
+                    "Verification URI {} is not on the issuer",
+                    session.login_url
+                );
+                let user_code = reqwest::Url::parse(&session.login_url)
+                    .expect("The verification URI should be a URL")
+                    .query_pairs()
+                    .find(|(key, _)| key == "code" || key == "user_code")
+                    .map(|(_, value)| value.into_owned())
+                    .expect("The verification URI carries no user code");
+
+                // RFC 8628 §3.5's `authorization_pending` is reported by the trait as
+                // `None`, not a failure.
+                assert!(
+                    auth.poll_auth_session(&auth_url, "client-state", &session.session_code, "")
+                        .await
+                        .expect("authorization_pending is not a failure")
+                        .is_none(),
+                    "Poll returned a token before anybody approved"
+                );
+
+                // The approval a person would give after reading the code off the terminal.
+                fixture
+                    .approve_user_code(&user, &user_code)
+                    .await
+                    .expect("Could not approve the device user code");
+
+                // The client honors the provider's advertised interval, so a poll before it
+                // elapses answers without reaching the network.
+                let mut redeemed = None;
+                for _ in 0..POLL_ATTEMPTS {
+                    if let Some(token) = auth
+                        .poll_auth_session(&auth_url, "client-state", &session.session_code, "")
+                        .await
+                        .expect("The approved device code should redeem")
+                    {
+                        redeemed = Some(token);
+                        break;
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                let token = redeemed.expect("The approved device code returned no token");
+
+                let claims = fixture
+                    .validate_token(&token.token, CLIENT_ID)
+                    .await
+                    .expect("The credential did not verify against the issuer's JWKS")
+                    .claims;
+                assert_eq!(claims.sub, user.id, "Token is for the wrong subject");
+                assert_eq!(token.user_id, user.id);
+                assert!(
+                    token.refresh_token.is_some(),
+                    "A headless host would have to re-run the whole ceremony on every expiry"
+                );
+            })
+            .await;
+    }
+
+    /// The refresh grant: a stored refresh token yields a new ID token and a rotated
+    /// refresh token.
+    ///
+    /// Requires the compose stack (see above).
+    #[tokio::test]
+    async fn refresh_grant_yields_a_new_token_and_rotates_the_refresh_token() {
+        LORE_CONTEXT
+            .scope(setup_execution("test".to_string()), async move {
+                let (fixture, user, auth_url) =
+                    setup().await.expect("PocketID fixture setup failed");
+                let auth = OidcAuthentication::default();
+
+                let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
+                    .await
+                    .expect("The PKCE login should complete");
+                let refresh_token = token
+                    .refresh_token
+                    .clone()
+                    .expect("The login issued no refresh token");
+
+                let refreshed = auth
+                    .refresh_authentication(&auth_url, &refresh_token, "")
+                    .await
+                    .expect("The refresh grant should succeed");
+
+                let claims = fixture
+                    .validate_token(&refreshed.token, CLIENT_ID)
+                    .await
+                    .expect("The refreshed credential did not verify against the issuer's JWKS")
+                    .claims;
+                assert_eq!(
+                    claims.sub, user.id,
+                    "Refreshed token is for another subject"
+                );
+                assert_eq!(refreshed.user_id, user.id);
+                assert_eq!(
+                    refreshed.recipients, token.recipients,
+                    "A refreshed token has the same recipients as the one it replaces"
+                );
+
+                let rotated = refreshed
+                    .refresh_token
+                    .expect("The refresh grant returned no new refresh token");
+                assert_ne!(
+                    rotated, refresh_token,
+                    "The refresh token was not rotated, so a stolen one stays usable"
+                );
+            })
+            .await;
+    }
+
+    /// The refresh grant reached the way it is in production: by an ordinary repository
+    /// operation whose stored login has aged out.
+    ///
+    /// Expiry is staged (not waited for, since `PocketID`'s lifetimes run in hours); the
+    /// client checks no signature, so a past `exp` is expired as far as it's concerned.
+    ///
+    /// Requires the compose stack (see above).
+    #[tokio::test]
+    async fn an_expired_login_is_refreshed_by_the_exchange_path() {
+        LORE_CONTEXT
+            .scope(setup_execution("test".to_string()), async move {
+                let (fixture, user, auth_url) =
+                    setup().await.expect("PocketID fixture setup failed");
+                isolated_credential_store();
+                let auth = OidcAuthentication::default();
+
+                let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
+                    .await
+                    .expect("The PKCE login should complete");
+                let refresh_token = token
+                    .refresh_token
+                    .clone()
+                    .expect("The login issued no refresh token");
+                let expired = with_expiry_in_the_past(&token.token);
+
+                // What a login leaves behind, some hours later.
+                token_store::store_user_token(
+                    &auth_url,
+                    &token.user_id,
+                    &expired,
+                    vec![REMOTE_DOMAIN.to_string()],
+                )
+                .await
+                .expect("Failed to store the expired authentication token");
+                token_store::store_refresh_token(&auth_url, &token.user_id, &refresh_token)
+                    .await
+                    .expect("Failed to store the refresh token");
+
+                let authz = lore_transport::auth::exchange::exchange(
+                    &auth_url,
+                    &token.user_id,
+                    RepositoryId::default(),
+                    REMOTE_DOMAIN.to_string(),
+                )
+                .await
+                .expect(
+                    "The operation should proceed on a refreshed credential, with no new login",
+                );
+
+                assert_ne!(
+                    authz, expired,
+                    "The expired credential was presented, so the server would refuse the \
+                     operation"
+                );
+                let claims = fixture
+                    .validate_token(&authz, CLIENT_ID)
+                    .await
+                    .expect("The refreshed credential did not verify against the issuer's JWKS")
+                    .claims;
+
+                // Only `exp` shows the refresh bought time.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("The clock is before the epoch")
+                    .as_secs() as i64;
+                assert!(
+                    claims.exp > now,
+                    "The refreshed credential expired at {} and it is now {now}",
+                    claims.exp
+                );
+
+                // PocketID retires the refresh token it's given, so storing the rotated one
+                // is what survives the next expiry.
+                let stored_refresh = token_store::load_refresh_token(&auth_url, &token.user_id)
+                    .await
+                    .expect("The refresh token is gone, so the next expiry needs a login");
+                assert_ne!(
+                    stored_refresh, refresh_token,
+                    "The rotated refresh token was not stored, so the session dies at the next \
+                     expiry"
+                );
+
+                // And the refresh did not widen where the credential may be sent.
+                assert!(
+                    token_store::load_user_token(
+                        &auth_url,
+                        &token.user_id,
+                        tokens_only_for_recipient_domain("elsewhere.example.com".to_string()),
+                    )
+                    .await
+                    .is_err(),
+                    "The refreshed token is offered to a remote the login never named"
+                );
+            })
+            .await;
+    }
+
+    /// `exchange_for_repository` returns the authentication token unchanged.
     ///
     /// Requires the compose stack (see above).
     #[tokio::test]
     async fn exchange_for_repository_passes_the_id_token_through() {
-        let (fixture, user, auth_url) = setup().await.expect("PocketID fixture setup failed");
-        let auth = OidcAuthentication::default();
+        LORE_CONTEXT
+            .scope(setup_execution("test".to_string()), async move {
+                let (fixture, user, auth_url) =
+                    setup().await.expect("PocketID fixture setup failed");
+                let auth = OidcAuthentication::default();
 
-        let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
-            .await
-            .expect("The PKCE login should complete");
+                let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
+                    .await
+                    .expect("The PKCE login should complete");
 
-        let authz = auth
-            .exchange_for_repository(&auth_url, &token.token, RepositoryId::default(), "")
-            .await
-            .expect("The passthrough should succeed");
+                let authz = auth
+                    .exchange_for_repository(&auth_url, &token.token, RepositoryId::default(), "")
+                    .await
+                    .expect("The passthrough should succeed");
 
-        assert_eq!(
-            authz.token, token.token,
-            "The authorization token is the authentication token"
-        );
-        assert_eq!(authz.expires_ms, token.expires_ms);
-        assert_eq!(authz.recipients, token.recipients);
+                assert_eq!(
+                    authz.token, token.token,
+                    "The authorization token is the authentication token"
+                );
+                assert_eq!(authz.expires_ms, token.expires_ms);
+                assert_eq!(authz.recipients, token.recipients);
 
-        // And it is still the provider's own signed token, not something Lore minted.
-        fixture
-            .validate_token(&authz.token, CLIENT_ID)
-            .await
-            .expect("The passed-through token did not verify against the issuer's JWKS");
+                // And it is still the provider's own signed token, not something Lore minted.
+                fixture
+                    .validate_token(&authz.token, CLIENT_ID)
+                    .await
+                    .expect("The passed-through token did not verify against the issuer's JWKS");
+            })
+            .await;
     }
 }

@@ -7,6 +7,7 @@ mod hashicorp;
 mod locks_test;
 mod oidc_auth_test;
 mod oidc_client_test;
+mod oidc_fixture_test;
 mod presign_test;
 mod remote_store_test;
 mod replication_service_test;

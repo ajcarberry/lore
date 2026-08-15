@@ -8,33 +8,30 @@
 //! `JwkServiceImpl` with no `OidcJwkService` wrap; that wrap is covered by
 //! `build_jwt_verifier`'s own unit tests.
 //!
-//! Runs only under the `integration_tests` feature, which also pulls in the raw gRPC
+//! Runs only under the `oidc_integration_tests` feature, which also pulls in the raw gRPC
 //! clients needed to attach an arbitrary bearer token.
 
 #[cfg(all(test, feature = "oidc_integration_tests"))]
-mod oidc_auth_tests {
+mod oidc_auth_common {
     use std::error::Error;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_server::auth::jwk::JWKService;
     use lore_server::auth::jwk::JWKServiceSettings;
     use lore_server::auth::jwk::JwkServiceImpl;
     use lore_server::auth::jwt::JwtVerifier;
-    use lore_server::http::server::LoreHttpServerSettings;
-    use lore_server::http::server::ServerHealth;
-    use lore_server::http::server::ServerState;
-    use lore_server::http::server::create_router;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
     use crate::common::oidc::oidc_common;
     use crate::setup_execution;
 
-    type TestResult = Result<(), Box<dyn Error>>;
+    pub type TestResult = Result<(), Box<dyn Error>>;
 
-    async fn make_backends() -> (
+    pub async fn make_backends(
+        immutable_settings: ImmutableStoreSettings,
+    ) -> (
         Arc<dyn lore_storage::ImmutableStore>,
         Arc<dyn lore_storage::MutableStore>,
     ) {
@@ -45,10 +42,7 @@ mod oidc_auth_tests {
                     None::<&str>,
                     ImmutableStoreCreateOptions::none(),
                     false,
-                    ImmutableStoreSettings {
-                        implicit_durable_stored: true,
-                        ..Default::default()
-                    },
+                    immutable_settings,
                 )
                 .await
                 .unwrap();
@@ -68,7 +62,7 @@ mod oidc_auth_tests {
     }
 
     /// A `JwtVerifier` pointed at `PocketID`'s real JWKS, discovered rather than hardcoded.
-    async fn oidc_jwt_verifier(
+    pub async fn oidc_jwt_verifier(
         fixture: &oidc_common::OidcFixture,
         audience: &str,
     ) -> Result<JwtVerifier, Box<dyn Error>> {
@@ -91,11 +85,62 @@ mod oidc_auth_tests {
         ))
     }
 
+    /// A self-signed forgery naming an unknown kid and issuer, standing in for a token
+    /// from another provider.
+    pub fn forged_token_with_unknown_kid() -> String {
+        use jsonwebtoken::Algorithm;
+        use jsonwebtoken::EncodingKey;
+        use jsonwebtoken::Header;
+        use jsonwebtoken::encode;
+
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("attacker-controlled-kid-not-in-pocketid-jwks".to_string());
+        let claims = serde_json::json!({
+            "sub": "attacker",
+            "iss": "https://not-pocket-id.example.invalid",
+            "aud": oidc_common::TEST_CLIENT_ID,
+            "iat": 1,
+            "exp": 9_999_999_999u64,
+            "env": "test",
+            "name": "test",
+            "preferred_username": "test",
+        });
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_secret(b"attacker-controlled-secret"),
+        )
+        .expect("encode forged token")
+    }
+}
+
+#[cfg(all(test, feature = "oidc_integration_tests"))]
+mod oidc_auth_tests {
+    use std::error::Error;
+    use std::time::Duration;
+
+    use lore_server::auth::jwt::JwtVerifier;
+    use lore_server::http::server::LoreHttpServerSettings;
+    use lore_server::http::server::ServerHealth;
+    use lore_server::http::server::ServerState;
+    use lore_server::http::server::create_router;
+    use lore_storage::local::immutable_store::ImmutableStoreSettings;
+
+    use super::oidc_auth_common::TestResult;
+    use super::oidc_auth_common::forged_token_with_unknown_kid;
+    use super::oidc_auth_common::make_backends;
+    use super::oidc_auth_common::oidc_jwt_verifier;
+    use crate::common::oidc::oidc_common;
+
     /// Start a real HTTP server, in process, over fresh in-memory backends.
     async fn start_http_server(
         jwt_verifier: Option<JwtVerifier>,
     ) -> (String, tokio::sync::oneshot::Sender<()>) {
-        let (immutable_store, mutable_store) = make_backends().await;
+        let (immutable_store, mutable_store) = make_backends(ImmutableStoreSettings {
+            implicit_durable_stored: true,
+            ..Default::default()
+        })
+        .await;
         let state = ServerState {
             immutable_store,
             mutable_store,
@@ -117,23 +162,33 @@ mod oidc_auth_tests {
         let base_url = format!("http://127.0.0.1:{}", addr.port());
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
         // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
-            axum::serve(listener, app)
+            let outcome = axum::serve(listener, app)
                 .with_graceful_shutdown(async {
                     shutdown_rx.await.ok();
                 })
-                .await
-                .unwrap();
+                .await;
+            let _ = stopped_tx.send(match outcome {
+                Ok(()) => "stopped before the test finished".to_string(),
+                Err(error) => format!("failed: {error}"),
+            });
         });
 
+        let mut ready = false;
         for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            if let Ok(reason) = stopped_rx.try_recv() {
+                panic!("test server on {addr} {reason}");
+            }
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                ready = true;
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(ready, "test server on {addr} never accepted a connection");
 
         (base_url, shutdown_tx)
     }
@@ -217,13 +272,16 @@ mod oidc_auth_tests {
         let verifier = oidc_jwt_verifier(&fixture, oidc_common::TEST_CLIENT_ID).await?;
         let (base_url, _shutdown) = start_http_server(Some(verifier)).await;
 
-        let other_client_id = "lore-integration-tests-oidc-p3-http-other";
+        let http_wrong_audience_client = "lore-integration-tests-oidc-http-other-audience";
         fixture
-            .ensure_client(other_client_id, &[oidc_common::TEST_REDIRECT_URI])
+            .ensure_client(
+                http_wrong_audience_client,
+                &[oidc_common::TEST_REDIRECT_URI],
+            )
             .await?;
-        let user = fixture.create_user("p3httpwrongaud").await?;
+        let user = fixture.create_user("httpwrongaudience").await?;
         let tokens = fixture
-            .issue_token_for_client(&user, other_client_id)
+            .issue_token_for_client(&user, http_wrong_audience_client)
             .await?;
 
         let response = reqwest::Client::new()
@@ -253,7 +311,7 @@ mod oidc_auth_tests {
         let verifier = oidc_jwt_verifier(&fixture, oidc_common::TEST_CLIENT_ID).await?;
         let (base_url, _shutdown) = start_http_server(Some(verifier)).await;
 
-        let user = fixture.create_user("p3httpvalid").await?;
+        let user = fixture.create_user("httpvalid").await?;
         let tokens = fixture.issue_token(&user).await?;
 
         let response = reqwest::Client::new()
@@ -343,34 +401,6 @@ mod oidc_auth_tests {
             &EncodingKey::from_secret(modulus.as_bytes()),
         )?)
     }
-
-    /// A self-signed forgery naming an unknown kid and issuer, standing in for a token
-    /// from another provider.
-    fn forged_token_with_unknown_kid() -> String {
-        use jsonwebtoken::Algorithm;
-        use jsonwebtoken::EncodingKey;
-        use jsonwebtoken::Header;
-        use jsonwebtoken::encode;
-
-        let mut header = Header::new(Algorithm::HS256);
-        header.kid = Some("attacker-controlled-kid-not-in-pocketid-jwks".to_string());
-        let claims = serde_json::json!({
-            "sub": "attacker",
-            "iss": "https://not-pocket-id.example.invalid",
-            "aud": oidc_common::TEST_CLIENT_ID,
-            "iat": 1,
-            "exp": 9_999_999_999u64,
-            "env": "test",
-            "name": "test",
-            "preferred_username": "test",
-        });
-        encode(
-            &header,
-            &claims,
-            &EncodingKey::from_secret(b"attacker-controlled-secret"),
-        )
-        .expect("encode forged token")
-    }
 }
 
 /// Raw-tonic gRPC coverage of the same matrix, against `StorageService`: the enforcement
@@ -379,99 +409,41 @@ mod oidc_auth_tests {
 #[cfg(all(test, feature = "oidc_integration_tests"))]
 mod oidc_auth_grpc_tests {
     use std::collections::HashMap;
-    use std::error::Error;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use lore_base::runtime::LORE_CONTEXT;
     use lore_proto::lore::storage::v1::QueryRequest;
     use lore_proto::lore::storage::v1::storage_service_client::StorageServiceClient;
     use lore_revision::environment::EnvironmentConfig;
-    use lore_server::auth::jwk::JWKService;
-    use lore_server::auth::jwk::JWKServiceSettings;
-    use lore_server::auth::jwk::JwkServiceImpl;
     use lore_server::auth::jwt::JwtVerifier;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
     use lore_server::hooks::HookDispatcher;
-    use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use tonic::Code;
     use tonic::Request;
     use tonic::metadata::MetadataValue;
     use tonic::transport::Channel;
 
+    use super::oidc_auth_common::TestResult;
+    use super::oidc_auth_common::forged_token_with_unknown_kid;
+    use super::oidc_auth_common::make_backends;
+    use super::oidc_auth_common::oidc_jwt_verifier;
     use crate::common::oidc::oidc_common;
-    use crate::setup_execution;
-
-    type TestResult = Result<(), Box<dyn Error>>;
-
-    async fn make_backends() -> (
-        Arc<dyn lore_storage::ImmutableStore>,
-        Arc<dyn lore_storage::MutableStore>,
-    ) {
-        let execution = setup_execution("test".to_string());
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let backend_immutable = lore_storage::local::immutable_store::create(
-                    None::<&str>,
-                    ImmutableStoreCreateOptions::none(),
-                    false,
-                    ImmutableStoreSettings {
-                        allow_partial_fragment: false,
-                        protect_local_fragment: false,
-                        implicit_durable_stored: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap();
-
-                let backend_mutable: Arc<dyn lore_storage::MutableStore> =
-                    lore_storage::local::mutable_store::create(
-                        None::<&str>,
-                        lore_storage::MutableStoreSettings::default(),
-                        backend_immutable.clone(),
-                    )
-                    .await
-                    .unwrap();
-
-                (backend_immutable, backend_mutable)
-            })
-            .await
-    }
-
-    /// Same discovery-driven construction as the HTTP half.
-    async fn oidc_jwt_verifier(
-        fixture: &oidc_common::OidcFixture,
-        audience: &str,
-    ) -> Result<JwtVerifier, Box<dyn Error>> {
-        let discovery = fixture.discovery().await?;
-        let jwks_uri = discovery["jwks_uri"]
-            .as_str()
-            .ok_or("PocketID discovery document has no jwks_uri")?
-            .to_string();
-
-        let jwk_service: Arc<dyn JWKService> = Arc::new(JwkServiceImpl::new(JWKServiceSettings {
-            endpoint: jwks_uri,
-        }));
-
-        // Authn-only mode — this matrix's premise — over a bare `JwkServiceImpl`; production
-        // additionally wraps the key service in `OidcJwkService` via `build_jwt_verifier`.
-        Ok(JwtVerifier::oidc(
-            jwk_service,
-            Some(fixture.issuer().to_string()),
-            Some(vec![audience.to_string()]),
-        ))
-    }
 
     /// Starts a real gRPC server in process; a `Some` verifier routes `StorageService`
     /// through `JWTInterceptor`.
     async fn start_grpc_server(
         jwt_verifier: Option<JwtVerifier>,
     ) -> (String, tokio::sync::oneshot::Sender<()>) {
-        let (backend_immutable, backend_mutable) = make_backends().await;
+        let (backend_immutable, backend_mutable) = make_backends(ImmutableStoreSettings {
+            allow_partial_fragment: false,
+            protect_local_fragment: false,
+            implicit_durable_stored: true,
+            ..Default::default()
+        })
+        .await;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
@@ -540,9 +512,8 @@ mod oidc_auth_grpc_tests {
             .expect("connect to in-process test server")
     }
 
-    /// An empty `Query` — the lightest unary call `StorageService` exposes — optionally
-    /// bearing a token; repository id metadata is always set, since its absence gives
-    /// `InvalidArgument`, a false rejection signal.
+    /// An empty `Query`, optionally bearing a token; the repository id metadata is always
+    /// set, since its absence gives `InvalidArgument` rather than an auth error.
     fn query_request(token: Option<&str>) -> Request<QueryRequest> {
         let mut request = Request::new(QueryRequest { addresses: vec![] });
 
@@ -561,32 +532,6 @@ mod oidc_auth_grpc_tests {
             request.metadata_mut().insert("authorization", value);
         }
         request
-    }
-
-    fn forged_token_with_unknown_kid() -> String {
-        use jsonwebtoken::Algorithm;
-        use jsonwebtoken::EncodingKey;
-        use jsonwebtoken::Header;
-        use jsonwebtoken::encode;
-
-        let mut header = Header::new(Algorithm::HS256);
-        header.kid = Some("attacker-controlled-kid-not-in-pocketid-jwks".to_string());
-        let claims = serde_json::json!({
-            "sub": "attacker",
-            "iss": "https://not-pocket-id.example.invalid",
-            "aud": oidc_common::TEST_CLIENT_ID,
-            "iat": 1,
-            "exp": 9_999_999_999u64,
-            "env": "test",
-            "name": "test",
-            "preferred_username": "test",
-        });
-        encode(
-            &header,
-            &claims,
-            &EncodingKey::from_secret(b"attacker-controlled-secret"),
-        )
-        .expect("encode forged token")
     }
 
     #[tokio::test]
@@ -631,13 +576,16 @@ mod oidc_auth_grpc_tests {
         let (url, _shutdown) = start_grpc_server(Some(verifier)).await;
         let mut client = connect(&url).await;
 
-        let other_client_id = "lore-integration-tests-oidc-p3-grpc-other";
+        let grpc_wrong_audience_client = "lore-integration-tests-oidc-grpc-other-audience";
         fixture
-            .ensure_client(other_client_id, &[oidc_common::TEST_REDIRECT_URI])
+            .ensure_client(
+                grpc_wrong_audience_client,
+                &[oidc_common::TEST_REDIRECT_URI],
+            )
             .await?;
-        let user = fixture.create_user("p3grpcwrongaud").await?;
+        let user = fixture.create_user("grpcwrongaudience").await?;
         let tokens = fixture
-            .issue_token_for_client(&user, other_client_id)
+            .issue_token_for_client(&user, grpc_wrong_audience_client)
             .await?;
 
         let status = client
@@ -656,7 +604,7 @@ mod oidc_auth_grpc_tests {
         let (url, _shutdown) = start_grpc_server(Some(verifier)).await;
         let mut client = connect(&url).await;
 
-        let user = fixture.create_user("p3grpcvalid").await?;
+        let user = fixture.create_user("grpcvalid").await?;
         let tokens = fixture.issue_token(&user).await?;
 
         let response = client.query(query_request(Some(&tokens.id_token))).await;

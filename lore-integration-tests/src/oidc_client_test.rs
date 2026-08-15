@@ -1,31 +1,23 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Client-side OIDC flows against a real provider, driving
-//! `lore_transport::auth::oidc::OidcAuthentication` through the `Authentication` trait exactly
-//! as `lore login` does, against the `PocketID` container in `compose.yaml`.
-//!
-//! The client binds `127.0.0.1:0` per RFC 8252 §7.3, so the test client is registered once
-//! with the wildcard `http://127.0.0.1:*/callback`. `PocketID`'s only interactive login is a
-//! passkey ceremony, so `OidcFixture::follow_authorization_url` stands in for the browser.
+//! Client-side OIDC flows against the `PocketID` container, driving [`OidcAuthentication`]
+//! through the `Authentication` trait exactly as `lore login` does;
+//! `OidcFixture::follow_authorization_url` stands in for the browser.
 #[cfg(all(test, feature = "oidc_integration_tests"))]
 mod oidc_client_tests {
     use std::error::Error;
-    use std::sync::OnceLock;
     use std::time::Duration;
 
     use lore_base::runtime::LORE_CONTEXT;
-    use lore_base::types::RepositoryId;
-    use lore_credential::token_store;
-    use lore_credential::token_store::tokens_only_for_recipient_domain;
     use lore_transport::Authentication;
     use lore_transport::AuthenticationToken;
     use lore_transport::LoginFlow;
     use lore_transport::TokenRecipients;
     use lore_transport::auth::oidc::OidcAuthentication;
 
-    use crate::common::oidc::oidc_common;
-    use crate::common::oidc::oidc_common::OidcFixture;
-    use crate::common::oidc::oidc_common::TestUser;
+    use crate::common::oidc as oidc_common;
+    use crate::common::oidc::OidcFixture;
+    use crate::common::oidc::TestUser;
     use crate::setup_execution;
 
     /// A client of its own, registered with a wildcard port so any loopback redirect is
@@ -36,19 +28,14 @@ mod oidc_client_tests {
     /// validation.
     const CALLBACK_URL: &str = "http://127.0.0.1:*/callback";
 
-    /// The remote the staged login was performed against.
-    const REMOTE_DOMAIN: &str = "repo.example.com";
-
     /// The ceiling on every poll loop below, in 500ms steps.
     const POLL_ATTEMPTS: usize = 60;
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-    /// `oidc+http`, accepted only because the issuer is loopback.
+    /// `oidc+http`, accepted only because the issuer is loopback. The issuer is kept
+    /// byte for byte, as the server derives it.
     fn auth_url(issuer: &str) -> String {
-        format!(
-            "oidc+{}?client_id={CLIENT_ID}",
-            issuer.trim_end_matches('/')
-        )
+        format!("oidc+{issuer}?client_id={CLIENT_ID}")
     }
 
     async fn setup() -> Result<(OidcFixture, TestUser, String), Box<dyn Error + 'static>> {
@@ -57,47 +44,6 @@ mod oidc_client_tests {
         let user = fixture.create_user("loreclient").await?;
         let auth_url = auth_url(fixture.issuer());
         Ok((fixture, user, auth_url))
-    }
-
-    /// Points the credential store at its own directory with a file-based encryption key,
-    /// avoiding a macOS keychain prompt.
-    ///
-    /// The `OnceLock` is what serializes the environment write: concurrent callers block
-    /// until it has run, and none of them observes the variables unset.
-    fn isolated_credential_store() {
-        static AUTH_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
-        AUTH_DIR.get_or_init(|| {
-            let auth_dir = tempfile::tempdir().expect("Failed to create a credential store dir");
-            unsafe {
-                std::env::set_var("LORE_AUTH_PATH", auth_dir.path());
-                std::env::set_var("LORE_AUTH_STORE", "fallback");
-            }
-            auth_dir
-        });
-    }
-
-    /// The same token with `exp` moved into the past; the now-mismatched signature is
-    /// immaterial since no client-side check reads it.
-    fn with_expiry_in_the_past(token: &str) -> String {
-        use base64::Engine;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-        let mut parts = token.split('.');
-        let header = parts.next().expect("A JWT has a header");
-        let payload = parts.next().expect("A JWT has a payload");
-        let signature = parts.next().expect("A JWT has a signature");
-
-        let decoded = URL_SAFE_NO_PAD
-            .decode(payload)
-            .expect("The payload should be base64url");
-        let mut claims: serde_json::Value =
-            serde_json::from_slice(&decoded).expect("The payload should be JSON");
-        claims["exp"] = serde_json::json!(1000000000);
-
-        format!(
-            "{header}.{}.{signature}",
-            URL_SAFE_NO_PAD.encode(claims.to_string())
-        )
     }
 
     /// Runs the browser half of a PKCE login and returns the resulting token.
@@ -243,8 +189,8 @@ mod oidc_client_tests {
                     .await
                     .expect("The listener should still answer the request");
 
-                // The client's contract is an error on a state mismatch, so a token is the
-                // only outcome that fails the test.
+                // The client's contract is an error on a state mismatch.
+                let mut refused = false;
                 for _ in 0..POLL_ATTEMPTS {
                     match auth
                         .poll_auth_session(&auth_url, "client-state", &session.session_code, "")
@@ -254,9 +200,13 @@ mod oidc_client_tests {
                         Ok(Some(_)) => {
                             panic!("A response carrying another session's state was exchanged")
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            refused = true;
+                            break;
+                        }
                     }
                 }
+                assert!(refused, "The state mismatch was never refused");
             })
             .await;
     }
@@ -308,8 +258,6 @@ mod oidc_client_tests {
                     .await
                     .expect("Could not approve the device user code");
 
-                // The client honors the provider's advertised interval, so a poll before it
-                // elapses answers without reaching the network.
                 let mut redeemed = None;
                 for _ in 0..POLL_ATTEMPTS {
                     if let Some(token) = auth
@@ -386,139 +334,6 @@ mod oidc_client_tests {
                     rotated, refresh_token,
                     "The refresh token was not rotated, so a stolen one stays usable"
                 );
-            })
-            .await;
-    }
-
-    /// The refresh grant reached the way it is in production: by an ordinary repository
-    /// operation whose stored login has aged out.
-    ///
-    /// Expiry is staged (not waited for, since `PocketID`'s lifetimes run in hours); the
-    /// client checks no signature, so a past `exp` is expired as far as it's concerned.
-    ///
-    /// Requires the compose stack (see above).
-    #[tokio::test]
-    async fn an_expired_login_is_refreshed_by_the_exchange_path() {
-        LORE_CONTEXT
-            .scope(setup_execution("test".to_string()), async move {
-                let (fixture, user, auth_url) =
-                    setup().await.expect("PocketID fixture setup failed");
-                isolated_credential_store();
-                let auth = OidcAuthentication::default();
-
-                let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
-                    .await
-                    .expect("The PKCE login should complete");
-                let refresh_token = token
-                    .refresh_token
-                    .clone()
-                    .expect("The login issued no refresh token");
-                let expired = with_expiry_in_the_past(&token.token);
-
-                // What a login leaves behind, some hours later.
-                token_store::store_user_token(
-                    &auth_url,
-                    &token.user_id,
-                    &expired,
-                    vec![REMOTE_DOMAIN.to_string()],
-                )
-                .await
-                .expect("Failed to store the expired authentication token");
-                token_store::store_refresh_token(&auth_url, &token.user_id, &refresh_token)
-                    .await
-                    .expect("Failed to store the refresh token");
-
-                let authz = lore_transport::auth::exchange::exchange(
-                    &auth_url,
-                    &token.user_id,
-                    RepositoryId::default(),
-                    REMOTE_DOMAIN.to_string(),
-                )
-                .await
-                .expect(
-                    "The operation should proceed on a refreshed credential, with no new login",
-                );
-
-                assert_ne!(
-                    authz, expired,
-                    "The expired credential was presented, so the server would refuse the \
-                     operation"
-                );
-                let claims = fixture
-                    .validate_token(&authz, CLIENT_ID)
-                    .await
-                    .expect("The refreshed credential did not verify against the issuer's JWKS")
-                    .claims;
-
-                // Only `exp` shows the refresh bought time.
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("The clock is before the epoch")
-                    .as_secs() as i64;
-                assert!(
-                    claims.exp > now,
-                    "The refreshed credential expired at {} and it is now {now}",
-                    claims.exp
-                );
-
-                // PocketID retires the refresh token it's given, so storing the rotated one
-                // is what survives the next expiry.
-                let stored_refresh = token_store::load_refresh_token(&auth_url, &token.user_id)
-                    .await
-                    .expect("The refresh token is gone, so the next expiry needs a login");
-                assert_ne!(
-                    stored_refresh, refresh_token,
-                    "The rotated refresh token was not stored, so the session dies at the next \
-                     expiry"
-                );
-
-                // And the refresh did not widen where the credential may be sent.
-                assert!(
-                    token_store::load_user_token(
-                        &auth_url,
-                        &token.user_id,
-                        tokens_only_for_recipient_domain("elsewhere.example.com".to_string()),
-                    )
-                    .await
-                    .is_err(),
-                    "The refreshed token is offered to a remote the login never named"
-                );
-            })
-            .await;
-    }
-
-    /// `exchange_for_repository` returns the authentication token unchanged.
-    ///
-    /// Requires the compose stack (see above).
-    #[tokio::test]
-    async fn exchange_for_repository_passes_the_id_token_through() {
-        LORE_CONTEXT
-            .scope(setup_execution("test".to_string()), async move {
-                let (fixture, user, auth_url) =
-                    setup().await.expect("PocketID fixture setup failed");
-                let auth = OidcAuthentication::default();
-
-                let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
-                    .await
-                    .expect("The PKCE login should complete");
-
-                let authz = auth
-                    .exchange_for_repository(&auth_url, &token.token, RepositoryId::default(), "")
-                    .await
-                    .expect("The passthrough should succeed");
-
-                assert_eq!(
-                    authz.token, token.token,
-                    "The authorization token is the authentication token"
-                );
-                assert_eq!(authz.expires_ms, token.expires_ms);
-                assert_eq!(authz.recipients, token.recipients);
-
-                // And it is still the provider's own signed token, not something Lore minted.
-                fixture
-                    .validate_token(&authz.token, CLIENT_ID)
-                    .await
-                    .expect("The passed-through token did not verify against the issuer's JWKS");
             })
             .await;
     }

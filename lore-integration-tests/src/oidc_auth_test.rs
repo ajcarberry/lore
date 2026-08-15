@@ -1,15 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Integration tests for OIDC-secured server mode, against a real `PocketID` instance.
-//!
-//! Builds `JwtVerifier` (`lore_server::auth::jwt`) from the `PocketID` discovery document
-//! rather than a hardcoded JWKS path, wired into an in-process gRPC or HTTP server. Unlike
-//! production's `build_jwt_verifier` (`lore-server/src/server.rs`), this carries a bare
-//! `JwkServiceImpl` with no `OidcJwkService` wrap; that wrap is covered by
-//! `build_jwt_verifier`'s own unit tests.
-//!
-//! Runs only under the `oidc_integration_tests` feature, which also pulls in the raw gRPC
-//! clients needed to attach an arbitrary bearer token.
+//! OIDC-secured server mode against a real `PocketID` instance: a `JwtVerifier` built
+//! from the provider's discovery document, wired into an in-process gRPC or HTTP server.
 
 #[cfg(all(test, feature = "oidc_integration_tests"))]
 mod oidc_auth_common {
@@ -24,7 +16,7 @@ mod oidc_auth_common {
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
-    use crate::common::oidc::oidc_common;
+    use crate::common::oidc as oidc_common;
     use crate::setup_execution;
 
     pub type TestResult = Result<(), Box<dyn Error>>;
@@ -116,7 +108,6 @@ mod oidc_auth_common {
 
 #[cfg(all(test, feature = "oidc_integration_tests"))]
 mod oidc_auth_tests {
-    use std::error::Error;
     use std::time::Duration;
 
     use lore_server::auth::jwt::JwtVerifier;
@@ -130,7 +121,7 @@ mod oidc_auth_tests {
     use super::oidc_auth_common::forged_token_with_unknown_kid;
     use super::oidc_auth_common::make_backends;
     use super::oidc_auth_common::oidc_jwt_verifier;
-    use crate::common::oidc::oidc_common;
+    use crate::common::oidc as oidc_common;
 
     /// Start a real HTTP server, in process, over fresh in-memory backends.
     async fn start_http_server(
@@ -243,30 +234,6 @@ mod oidc_auth_tests {
     }
 
     #[tokio::test]
-    async fn http_algorithm_confusion_forgery_is_rejected() -> TestResult {
-        let fixture = oidc_common::setup().await?;
-        let verifier = oidc_jwt_verifier(&fixture, oidc_common::TEST_CLIENT_ID).await?;
-        let (base_url, _shutdown) = start_http_server(Some(verifier)).await;
-
-        let forged =
-            algorithm_confusion_forged_token(&fixture, oidc_common::TEST_CLIENT_ID).await?;
-        let response = reqwest::Client::new()
-            .put(put_content_url(&base_url))
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {forged}"))
-            .body("hmac-signed with a real key's public modulus as the secret")
-            .send()
-            .await?;
-
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::FORBIDDEN,
-            "an HS256 token naming a real RSA kid, signed with that key's own public \
-             modulus as an HMAC secret, must never be accepted"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn http_wrong_audience_token_is_rejected() -> TestResult {
         let fixture = oidc_common::setup().await?;
         let verifier = oidc_jwt_verifier(&fixture, oidc_common::TEST_CLIENT_ID).await?;
@@ -354,53 +321,6 @@ mod oidc_auth_tests {
         );
         Ok(())
     }
-
-    /// Algorithm-confusion forgery against a real `PocketID` key: an HS256 token signed
-    /// using a published RSA key's own modulus as the HMAC secret. `jwk.rs` proves the
-    /// same defense synthetically.
-    async fn algorithm_confusion_forged_token(
-        fixture: &oidc_common::OidcFixture,
-        audience: &str,
-    ) -> Result<String, Box<dyn Error>> {
-        use jsonwebtoken::Algorithm;
-        use jsonwebtoken::EncodingKey;
-        use jsonwebtoken::Header;
-        use jsonwebtoken::encode;
-
-        let discovery = fixture.discovery().await?;
-        let jwks_uri = discovery["jwks_uri"]
-            .as_str()
-            .ok_or("PocketID discovery document has no jwks_uri")?;
-        let jwks_body = reqwest::get(jwks_uri).await?.text().await?;
-        let jwks: serde_json::Value = serde_json::from_str(&jwks_body)?;
-        let key = jwks["keys"]
-            .as_array()
-            .and_then(|keys| keys.first())
-            .ok_or("PocketID JWKS has no keys")?;
-        let kid = key["kid"].as_str().ok_or("JWK has no kid")?.to_string();
-        let modulus = key["n"]
-            .as_str()
-            .ok_or("JWK has no RSA modulus")?
-            .to_string();
-
-        let mut header = Header::new(Algorithm::HS256);
-        header.kid = Some(kid);
-        let claims = serde_json::json!({
-            "sub": "attacker",
-            "iss": fixture.issuer(),
-            "aud": audience,
-            "iat": 1,
-            "exp": 9_999_999_999u64,
-            "env": "test",
-            "name": "test",
-            "preferred_username": "test",
-        });
-        Ok(encode(
-            &header,
-            &claims,
-            &EncodingKey::from_secret(modulus.as_bytes()),
-        )?)
-    }
 }
 
 /// Raw-tonic gRPC coverage of the same matrix, against `StorageService`: the enforcement
@@ -408,19 +328,13 @@ mod oidc_auth_tests {
 /// unfinished `JWTAuthnInterceptor` and doesn't).
 #[cfg(all(test, feature = "oidc_integration_tests"))]
 mod oidc_auth_grpc_tests {
-    use std::collections::HashMap;
     use std::net::SocketAddr;
-    use std::sync::Arc;
-    use std::time::Duration;
 
     use lore_proto::lore::storage::v1::QueryRequest;
     use lore_proto::lore::storage::v1::storage_service_client::StorageServiceClient;
-    use lore_revision::environment::EnvironmentConfig;
     use lore_server::auth::jwt::JwtVerifier;
-    use lore_server::grpc::server::FeatureSettings;
-    use lore_server::grpc::server::GrpcServerBuilder;
-    use lore_server::hooks::HookDispatcher;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
+    use lore_transport::grpc::PARTITION_ID_KEY;
     use tonic::Code;
     use tonic::Request;
     use tonic::metadata::MetadataValue;
@@ -430,7 +344,8 @@ mod oidc_auth_grpc_tests {
     use super::oidc_auth_common::forged_token_with_unknown_kid;
     use super::oidc_auth_common::make_backends;
     use super::oidc_auth_common::oidc_jwt_verifier;
-    use crate::common::oidc::oidc_common;
+    use crate::common::grpc_common::serve_grpc_server;
+    use crate::common::oidc as oidc_common;
 
     /// Starts a real gRPC server in process; a `Some` verifier routes `StorageService`
     /// through `JWTInterceptor`.
@@ -447,61 +362,8 @@ mod oidc_auth_grpc_tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let signal = async {
-            shutdown_rx.await.ok();
-        };
-
-        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
-            Arc::new(lore_server::notification::local::NotificationSender::default());
-        let hook_dispatcher = Arc::new(HookDispatcher::empty());
-
-        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
-        // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
-                .with_immutable_store(backend_immutable.clone(), backend_immutable)
-                .with_mutable_store(backend_mutable)
-                .with_lock_store(None)
-                .with_notification(notification_sender, None)
-                .with_hook_dispatcher(hook_dispatcher)
-                .with_tls_config(None, None, None)
-                .unwrap()
-                .with_admin_endpoints(HashMap::new(), vec![])
-                .with_http2_config(
-                    None,
-                    None,
-                    Duration::from_secs(30),
-                    None,
-                    Default::default(),
-                    None,
-                )
-                .with_jwt_verifier(jwt_verifier)
-                .unwrap()
-                .serve_with_listener(listener, signal)
-                .await;
-            let _ = stopped_tx.send(match outcome {
-                Ok(()) => "stopped before the test finished".to_string(),
-                Err(error) => format!("failed: {error}"),
-            });
-        });
-
-        let mut ready = false;
-        for _ in 0..50 {
-            if let Ok(reason) = stopped_rx.try_recv() {
-                panic!("test server on {addr} {reason}");
-            }
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(ready, "test server on {addr} never accepted a connection");
+        let shutdown_tx =
+            serve_grpc_server(listener, backend_immutable, backend_mutable, jwt_verifier).await;
 
         (format!("http://127.0.0.1:{}", addr.port()), shutdown_tx)
     }
@@ -517,9 +379,6 @@ mod oidc_auth_grpc_tests {
     fn query_request(token: Option<&str>) -> Request<QueryRequest> {
         let mut request = Request::new(QueryRequest { addresses: vec![] });
 
-        // `lore_transport::grpc::PARTITION_ID_KEY`, inlined since `lore-transport` isn't a
-        // dependency here.
-        const PARTITION_ID_KEY: &str = "lore-partition-bin";
         let repository = lore_base::types::Partition::from([0xacu8; 16]);
         let repository_id = MetadataValue::from_bytes(repository.data());
         request

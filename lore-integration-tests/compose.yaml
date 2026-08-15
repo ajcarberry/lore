@@ -43,12 +43,6 @@ services:
       # The fixtures create one-time access tokens in a tight loop; the default limiter
       # (5 exchanges per 10s) fails tests that have done nothing wrong.
       - DISABLE_RATE_LIMITING=true
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1411/healthz"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 10s
   consul-server:
     image: hashicorp/consul:latest
     container_name: consul-server

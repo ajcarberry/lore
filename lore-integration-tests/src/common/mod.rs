@@ -1,6 +1,94 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+#[cfg(all(test, feature = "oidc_integration_tests"))]
 pub(crate) mod oidc;
+
+/// Shared bootstrap for tests that serve a real gRPC server in process.
+#[cfg(all(
+    test,
+    any(feature = "integration_tests", feature = "oidc_integration_tests")
+))]
+pub(crate) mod grpc_common {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use lore_revision::environment::EnvironmentConfig;
+    use lore_server::auth::jwt::JwtVerifier;
+    use lore_server::grpc::server::FeatureSettings;
+    use lore_server::grpc::server::GrpcServerBuilder;
+    use lore_server::hooks::HookDispatcher;
+
+    /// Serves a real gRPC server on `listener` over the given stores and returns once it
+    /// accepts connections, panicking if it stops first. A `Some` verifier routes the
+    /// storage services through `JWTInterceptor`.
+    pub async fn serve_grpc_server(
+        listener: std::net::TcpListener,
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+        jwt_verifier: Option<JwtVerifier>,
+    ) -> tokio::sync::oneshot::Sender<()> {
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let signal = async {
+            shutdown_rx.await.ok();
+        };
+
+        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
+            Arc::new(lore_server::notification::local::NotificationSender::default());
+        let hook_dispatcher = Arc::new(HookDispatcher::empty());
+
+        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
+        // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            let outcome = GrpcServerBuilder::new()
+                .with_environment(EnvironmentConfig::default())
+                .with_feature(FeatureSettings::default())
+                .with_immutable_store(immutable_store.clone(), immutable_store)
+                .with_mutable_store(mutable_store)
+                .with_lock_store(None)
+                .with_notification(notification_sender, None)
+                .with_hook_dispatcher(hook_dispatcher)
+                .with_tls_config(None, None, None)
+                .unwrap()
+                .with_admin_endpoints(HashMap::new(), vec![])
+                .with_http2_config(
+                    None,
+                    None,
+                    Duration::from_secs(30),
+                    None,
+                    Default::default(),
+                    None,
+                )
+                .with_jwt_verifier(jwt_verifier)
+                .unwrap()
+                .serve_with_listener(listener, signal)
+                .await;
+            let _ = stopped_tx.send(match outcome {
+                Ok(()) => "stopped before the test finished".to_string(),
+                Err(error) => format!("failed: {error}"),
+            });
+        });
+
+        // A server that never starts must say so, rather than leaving a client to wait on a
+        // socket nothing is answering.
+        let mut ready = false;
+        for _ in 0..50 {
+            if let Ok(reason) = stopped_rx.try_recv() {
+                panic!("test server on {addr} {reason}");
+            }
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ready, "test server on {addr} never accepted a connection");
+
+        shutdown_tx
+    }
+}
 
 #[cfg(all(test, feature = "integration_tests"))]
 pub(crate) mod aws_common {

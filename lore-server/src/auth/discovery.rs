@@ -6,7 +6,6 @@
 //!
 //! The server reads two members: `issuer`, checked against the configured
 //! issuer, and `jwks_uri`, which becomes the `JWKService` endpoint.
-#![allow(dead_code)] // Consumed by the verifier wiring in a following phase.
 use serde::Deserialize;
 use thiserror::Error;
 use tracing::warn;

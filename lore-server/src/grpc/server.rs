@@ -456,6 +456,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             service_settings,
             user_agent_filter,
             forwarded_requests,
+            advertised_auth_url: None,
         })
     }
 }
@@ -478,9 +479,20 @@ pub struct MaybeJwtVerifier {
     service_settings: Option<GrpcPublicServicesSettings>,
     user_agent_filter: Arc<UserAgentFilter>,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
+    advertised_auth_url: Option<String>,
 }
 
 impl GrpcServerBuilder<MaybeJwtVerifier> {
+    /// Sets the OIDC login URL advertised in the `EnvironmentGet` response when the
+    /// environment carries no `auth_url` of its own. Applied only to the copy the
+    /// environment services serve, so the derived `oidc+https://…` string never
+    /// reaches an internal consumer (e.g. the `ReBAC` dial target for repository
+    /// create/delete).
+    pub fn with_advertised_auth_url(mut self, advertised_auth_url: Option<String>) -> Self {
+        self.0.advertised_auth_url = advertised_auth_url;
+        self
+    }
+
     fn make_lock_service(
         services_settings: &Option<GrpcPublicServicesSettings>,
         inner: LoreLockService,
@@ -561,8 +573,17 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             rpc_timeout,
         );
 
-        let environment_svc = LoreEnvironmentService::new(self.0.environment.clone());
-        let environment_v1_svc = LoreEnvironmentV1Service::new(self.0.environment);
+        // The advertised copy exists only here: internal consumers keep reading
+        // `self.0.environment`, whose `auth_url` never carries an `oidc+…` scheme.
+        let mut advertised = self.0.environment;
+        if let Some(auth_url) = self.0.advertised_auth_url {
+            let endpoint = advertised.endpoint.get_or_insert_with(Default::default);
+            if endpoint.auth_url.as_deref().unwrap_or_default().is_empty() {
+                endpoint.auth_url = Some(auth_url);
+            }
+        }
+        let environment_svc = LoreEnvironmentService::new(advertised.clone());
+        let environment_v1_svc = LoreEnvironmentV1Service::new(advertised);
         let lock_svc = match self.0.lock_store {
             Some(lock_store) => {
                 info!("Enabling LockService");

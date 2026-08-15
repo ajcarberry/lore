@@ -175,18 +175,11 @@ This field is optional. When it's absent, the server starts with the presigned U
 
 ### Environment discovery
 
-`[environment]` is what the server advertises to clients through the unauthenticated `EnvironmentService/EnvironmentGet` call every client makes while connecting. It has two optional sub-tables: `[environment.endpoint]`, the per-service URLs clients should use, and `[environment.config]`, server-tunable values clients read (query-batch size and compression mode). When a field is empty or a table is absent, clients fall back to the URL or default they were configured with. URLs are stored verbatim and expected to be fully qualified (`scheme://host[:port][/path]`).
-
-`[environment.endpoint]`:
+`[environment.endpoint]` holds the per-service URLs the server advertises to clients through the unauthenticated `EnvironmentService/EnvironmentGet` call every client makes while connecting.
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `auth_url` | none | The endpoint clients use to authenticate. Clients read its scheme to select an authentication backend (`ucs-auth`, `oidc+https`, ...). When `[server.auth.oidc]` is set and this is empty, the server derives it as `oidc+https://{issuer}?client_id={client_id}` (`oidc+http` for an `http://` issuer); an explicit value always wins. Leaving both this and the OIDC block unset is what makes a token-verifying server report no authentication to clients. |
-| `repository_url` | none | Repository-management service endpoint. |
-| `storage_url` | none | Storage service endpoint. |
-| `revision_url` | none | Revision-graph service endpoint. |
-| `lock_url` | none | Lock service endpoint. |
-| `notification_url` | none | Notification service endpoint. |
+| `auth_url` | none | The endpoint clients use to authenticate. Clients read its scheme to select an authentication backend (`ucs-auth`, `oidc+https`, ...). When `[server.auth.oidc]` is set and this is empty, the server derives it as `oidc+{issuer}?client_id={client_id}`; an explicit value always wins. Leaving both this and the OIDC block unset is what makes a token-verifying server report no authentication to clients. |
 
 ### Authentication
 
@@ -214,17 +207,15 @@ jwt_audience = ["lore-service"]
 endpoint = "https://accounts.example.com/.well-known/jwks.json"
 ```
 
-When a `[server.auth.oidc]` block is also present, `jwt_issuer`, `jwt_audience`, and `[server.auth.jwk].endpoint` each override the value that block would otherwise derive. Setting one explicitly is how a static `file://` key set or a hand-configured issuer stays in use; setting `jwt_issuer` to a value that disagrees with the provider's own issuer makes the server verify against that value rather than the discovered one, so leave it unset unless the override is deliberate.
-
 `[server.auth.oidc]`: direct verification of a standard OpenID Connect provider's tokens, configured with an issuer and a client id. At startup the server fetches `{issuer}/.well-known/openid-configuration`, checks the document's `issuer` against the configured one, and feeds `jwks_uri` to the same key-set machinery `[server.auth.jwk]` uses directly.
 
-The `oidc` block does not replace `jwt_issuer`, `jwt_audience`, and `[server.auth.jwk].endpoint`; it derives them. When one of those is set explicitly, the explicit value always wins over the derived one — so a `file://` key set stays usable without network access, and an operator who points the server at a static JWKS by hand keeps doing so. An explicit `jwt_issuer` that disagrees with the provider's own issuer also wins, and the server then verifies against it rather than the discovered value, so leave it unset unless that is deliberate.
+The `oidc` block does not replace `jwt_issuer`, `jwt_audience`, and `[server.auth.jwk].endpoint`; it derives them, and an explicit value always wins over the derived one — so a static `file://` key set or a hand-configured issuer stays in use. An explicit `jwt_issuer` that disagrees with the provider's own issuer also wins, and the server then verifies against it rather than the discovered value, so leave these unset unless the override is deliberate.
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `issuer` | none (required) | The provider's issuer identifier, exactly as it publishes it — the same string it puts in the `iss` claim. |
+| `issuer` | none (required) | The provider's issuer identifier, exactly as it publishes it — the same string it puts in the `iss` claim. It must carry no query or fragment. |
 | `client_id` | none (required) | The public client id registered for Lore with the provider. |
-| `authorize_all_repositories` | none (required) | Has no default. A configured block that omits this, or sets it to `false`, fails startup validation: a verified token authorizes every repository on the server, and per-repository authorization from provider claims is not implemented, so an operator has to say explicitly that the coarse grant is what they want. |
+| `authorize_all_repositories` | none (required) | A configured block that omits this, or sets it to `false`, fails startup validation: a verified token authorizes every repository on the server, and per-repository authorization from provider claims is not implemented, so an operator has to say explicitly that the coarse grant is what they want. |
 
 ```toml
 [server.auth.oidc]

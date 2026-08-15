@@ -48,10 +48,20 @@ from pocket_id import PocketIdClient
 
 logger = logging.getLogger(__name__)
 
-# The CLI's own ceiling is ~150s (lore-revision/src/auth/login.rs
-# POLLING_INTERVAL_SECS / POLLING_MAX_RETRIES); this leaves room to land within
-# one poll interval of approval without waiting that ceiling out on a hang.
+# The CLI's own no-browser ceiling is ~550s (lore-revision/src/auth/login.rs
+# NO_BROWSER_POLLING_MAX_RETRIES); this leaves room to land within one poll
+# interval of approval without waiting that ceiling out on a hang.
 DEVICE_LOGIN_TIMEOUT = 60
+
+
+def _oidc_repo(new_lore_repo, remote_url) -> Lore:
+    """A repo pointed at the OIDC server, with the credential store kept in the
+    test's own directory: the key encrypting the token file defaults to the OS
+    keyring, which on macOS blocks a CLI login behind a GUI prompt no test can
+    answer."""
+    repo: Lore = new_lore_repo(create_repo=False, remote_url=remote_url)
+    repo.environment_vars.setdefault("LORE_AUTH_STORE", "fallback")
+    return repo
 
 
 @pytest.fixture(scope="module")
@@ -175,7 +185,7 @@ class TestOidcAuth:
     ):
         """A repository operation against an OIDC-secured server with no
         cached token must fail cleanly, not hang or crash."""
-        repo: Lore = new_lore_repo(create_repo=False, remote_url=oidc_lore_server)
+        repo = _oidc_repo(new_lore_repo, oidc_lore_server)
 
         with pytest.raises(NotAuthenticatedError):
             repo.repository_create()
@@ -183,7 +193,7 @@ class TestOidcAuth:
     def test_no_browser_login_completes_the_device_flow(
         self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
     ):
-        repo: Lore = new_lore_repo(create_repo=False, remote_url=oidc_lore_server)
+        repo = _oidc_repo(new_lore_repo, oidc_lore_server)
 
         output, returncode = _login_no_browser(repo, pocket_id, pocket_id_user)
 
@@ -199,7 +209,7 @@ class TestOidcAuth:
         `verify_jwt_usage_for_remote` on that stored token. Before the fix in
         `lore-transport/src/auth/exchange.rs`, this failed even though login
         (the previous test) succeeded."""
-        repo: Lore = new_lore_repo(create_repo=False, remote_url=oidc_lore_server)
+        repo = _oidc_repo(new_lore_repo, oidc_lore_server)
         _, returncode = _login_no_browser(repo, pocket_id, pocket_id_user)
         assert returncode == 0
 
@@ -210,7 +220,7 @@ class TestOidcAuth:
     ):
         """`auth info` reports the logged-in identity, and after `logout` the
         same repository operation that just succeeded fails again."""
-        repo: Lore = new_lore_repo(create_repo=False, remote_url=oidc_lore_server)
+        repo = _oidc_repo(new_lore_repo, oidc_lore_server)
         _, returncode = _login_no_browser(repo, pocket_id, pocket_id_user)
         assert returncode == 0
         # `auth info`/`logout` resolve their auth endpoint from the local repo's
@@ -236,7 +246,7 @@ class TestOidcAuth:
         the same creator-ownership check an unconfigured server uses. This is
         the coverage for that fallback -- proving it completes cleanly rather
         than protocol-erroring the way an unguarded ReBAC dial would."""
-        repo: Lore = new_lore_repo(create_repo=False, remote_url=oidc_lore_server)
+        repo = _oidc_repo(new_lore_repo, oidc_lore_server)
         _, returncode = _login_no_browser(repo, pocket_id, pocket_id_user)
         assert returncode == 0
         repo.repository_create()

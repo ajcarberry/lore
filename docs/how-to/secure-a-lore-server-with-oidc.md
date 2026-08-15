@@ -33,7 +33,7 @@ A Lore server with no authentication serves anyone who can reach the port: every
     authorize_all_repositories = true
     ```
 
-    `issuer` must match the value your provider publishes in its tokens' `iss` claim, byte for byte. The server checks it against the provider's discovery document at startup and refuses to start on a mismatch.
+    `issuer` must match the value your provider publishes in its tokens' `iss` claim, byte for byte. The server checks it against the provider's discovery document at startup and refuses to start on a mismatch (unless an explicit `[server.auth.jwk].endpoint` skips the discovery fetch).
 
     > [!IMPORTANT]
     > `authorize_all_repositories = true` is the entire authorization model this mode offers: any identity your provider admits can read and write **every** repository on the server — no per-repository distinction, no read-only identity, no administrative separation. Run one server per trust boundary. The setting has no default, so omitting it fails startup rather than deciding for you.

@@ -13,14 +13,9 @@ Everything here goes around it using documented endpoints only: the container is
 started with `STATIC_API_KEY`, which provisions an admin on first boot (so there is
 no setup wizard), and a user is logged in by minting a one-time access token as that
 admin and exchanging it for the session cookie a passkey login would have produced.
-With the cookie, `POST /api/oidc/authorize` returns an authorization code without
-rendering any HTML.
-
-Every token handed out here is minted and signed by PocketID. Nothing is faked.
+With the cookie, a device user code is approved without rendering any HTML.
 """
 
-import base64
-import hashlib
 import http.cookies
 import json
 import logging
@@ -48,8 +43,6 @@ TEST_CLIENT_ID = "lore-integration-tests"
 # PocketID validates redirects against the client's registered callbacks, but nothing
 # listens here: the code comes back in the authorize response, not via a redirect.
 TEST_REDIRECT_URI = "http://127.0.0.1:19999/callback"
-
-SCOPE = "openid profile email"
 
 
 class PocketIdError(Exception):
@@ -140,10 +133,6 @@ class PocketIdClient:
         """The issuer PocketID signs tokens with, for a server's OIDC config."""
         return self.base_url
 
-    def discovery(self) -> dict:
-        _, _, document = self._request("GET", "/.well-known/openid-configuration")
-        return document
-
     def ensure_client(
         self, client_id: str = TEST_CLIENT_ID, callback_urls: list[str] | None = None
     ) -> str:
@@ -221,60 +210,6 @@ class PocketIdClient:
             f"(got {list(jar.keys())})"
         )
 
-    def issue_token(self, user: dict, client_id: str = TEST_CLIENT_ID) -> dict:
-        """Complete an authorization-code + PKCE exchange as `user`.
-
-        Returns PocketID's token response: access_token, id_token, refresh_token.
-        """
-        session_cookie = self.login(user)
-
-        verifier = _b64url(secrets.token_bytes(32))
-        challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
-        nonce = secrets.token_hex(16)
-
-        # The endpoint PocketID's own web UI calls once a user approves the client.
-        # With a session cookie it needs no browser and renders no HTML.
-        _, _, authorization = self._request(
-            "POST",
-            "/api/oidc/authorize",
-            {
-                "clientID": client_id,
-                "scope": SCOPE,
-                "callbackURL": TEST_REDIRECT_URI,
-                "nonce": nonce,
-                "codeChallenge": challenge,
-                "codeChallengeMethod": "S256",
-            },
-            headers={"Cookie": session_cookie},
-        )
-        if "code" not in authorization:
-            raise PocketIdError(f"Authorize returned no code: {authorization}")
-
-        _, _, tokens = self._request(
-            "POST",
-            "/api/oidc/token",
-            {
-                "grant_type": "authorization_code",
-                "code": authorization["code"],
-                "redirect_uri": TEST_REDIRECT_URI,
-                "client_id": client_id,
-                "code_verifier": verifier,
-            },
-            form=True,
-        )
-        tokens["nonce"] = nonce
-        return tokens
-
-    def start_device_authorization(self, client_id: str = TEST_CLIENT_ID) -> dict:
-        """Begin an RFC 8628 device authorization, as a headless client would."""
-        _, _, response = self._request(
-            "POST",
-            "/api/oidc/device/authorize",
-            {"client_id": client_id, "scope": SCOPE},
-            form=True,
-        )
-        return response
-
     def approve_user_code(self, user: dict, user_code: str) -> None:
         """Approve a device user code as `user`.
 
@@ -288,64 +223,6 @@ class PocketIdClient:
             "/api/oidc/device/verify?code=" + urllib.parse.quote(user_code),
             headers={"Cookie": session_cookie},
         )
-
-    def validate_token(self, token: str, audience: str = TEST_CLIENT_ID) -> dict:
-        """Verify a token's RS256 signature against the issuer's published JWKS and
-        return its claims, the way a server would.
-
-        The JWKS URL is followed from the discovery document rather than assumed, so
-        a token that passes here passes through the path the Lore server uses. The
-        RSA check is done by hand to keep the e2e suite free of a crypto dependency.
-        """
-        discovery = self.discovery()
-        _, _, jwks = self._request(
-            "GET", urllib.parse.urlparse(discovery["jwks_uri"]).path
-        )
-
-        header_b64, claims_b64, signature_b64 = token.split(".")
-        header = json.loads(_b64url_decode(header_b64))
-        claims = json.loads(_b64url_decode(claims_b64))
-
-        if header.get("alg") != "RS256":
-            raise PocketIdError(f"Unexpected signing algorithm: {header.get('alg')}")
-
-        key = next((k for k in jwks["keys"] if k["kid"] == header["kid"]), None)
-        if key is None:
-            raise PocketIdError(f"JWKS has no key for kid {header['kid']}")
-
-        modulus = int.from_bytes(_b64url_decode(key["n"]), "big")
-        exponent = int.from_bytes(_b64url_decode(key["e"]), "big")
-        signature = int.from_bytes(_b64url_decode(signature_b64), "big")
-
-        size = (modulus.bit_length() + 7) // 8
-        recovered = pow(signature, exponent, modulus).to_bytes(size, "big")
-        digest = hashlib.sha256(f"{header_b64}.{claims_b64}".encode()).digest()
-        # PKCS#1 v1.5: 0x00 0x01 <0xff padding> 0x00 <SHA-256 DigestInfo> <digest>
-        digest_info = bytes.fromhex("3031300d060960864801650304020105000420")
-        padding_len = size - 3 - len(digest_info) - len(digest)
-        expected = b"\x00\x01" + b"\xff" * padding_len + b"\x00" + digest_info + digest
-        if recovered != expected:
-            raise PocketIdError("Token signature did not verify against the JWKS")
-
-        if claims["iss"] != discovery["issuer"]:
-            raise PocketIdError(
-                f"Token issuer {claims['iss']} is not {discovery['issuer']}"
-            )
-        # PocketID sends aud as an array, so a string compare would always fail.
-        if audience not in claims["aud"]:
-            raise PocketIdError(
-                f"Token audience {claims['aud']} does not include {audience}"
-            )
-
-        return claims
-
-
-def _b64url(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-
-
-def _b64url_decode(value: str) -> bytes:
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 @pytest.fixture(scope="session")

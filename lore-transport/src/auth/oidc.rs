@@ -31,7 +31,6 @@ use lore_base::error::NotAuthenticated;
 use lore_base::error::NotAuthorized;
 use lore_base::error::NotSupported;
 use lore_base::lore_debug;
-use lore_base::lore_info;
 use lore_base::types::RepositoryId;
 use parking_lot::Mutex;
 use reqwest::StatusCode;
@@ -41,6 +40,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
+use tokio_util::task::AbortOnDropHandle;
 use url::Host;
 use url::Url;
 
@@ -76,6 +76,11 @@ const DEFAULT_DEVICE_INTERVAL: Duration = Duration::from_secs(5);
 /// What a `slow_down` adds to the poll interval (RFC 8628 §3.5).
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
+/// How long a login may stay in flight before its session and loopback listener are
+/// dropped, on the next start or poll. Longer than any polling window a caller may use, so
+/// a session is never reclaimed under one, and in the range of a device code's `expires_in`.
+const FLOW_LIFETIME: Duration = Duration::from_secs(600);
+
 /// Bytes of entropy behind a code verifier and a `state`. 32 bytes base64url-encode to 43
 /// characters, the minimum RFC 7636 §4.1 allows for a verifier.
 const RANDOM_BYTES: usize = 32;
@@ -96,11 +101,7 @@ struct AuthUrlParts {
 /// `oidc+http` is accepted only for a loopback host: plain HTTP anywhere else would put an
 /// authorization code and an ID token on the wire in the clear.
 fn parse_auth_url(auth_url: &str) -> Result<AuthUrlParts, ProtocolError> {
-    let (scheme, rest) = auth_url.split_once("://").ok_or_else(|| {
-        ProtocolError::internal(format!(
-            "invalid OIDC auth URL (missing scheme): '{auth_url}'"
-        ))
-    })?;
+    let scheme = crate::auth::authentication::parse_scheme(auth_url)?;
     let transport = match scheme {
         "oidc+https" => "https",
         "oidc+http" => "http",
@@ -110,11 +111,12 @@ fn parse_auth_url(auth_url: &str) -> Result<AuthUrlParts, ProtocolError> {
             )));
         }
     };
+    let rest = &auth_url[scheme.len() + "://".len()..];
 
     // Recovered textually rather than by re-serializing a parsed URL, so the issuer
     // survives byte for byte. It carries no query or fragment (Discovery §2), so everything
     // up to the first `?` or `#` is the issuer.
-    let issuer_tail = rest.split(['?', '#']).next().unwrap_or(rest);
+    let issuer_tail = rest.split_once(['?', '#']).map_or(rest, |(head, _)| head);
     let issuer = format!("{transport}://{issuer_tail}");
 
     let url = Url::parse(&format!("{transport}://{rest}"))
@@ -147,8 +149,6 @@ fn parse_auth_url(auth_url: &str) -> Result<AuthUrlParts, ProtocolError> {
 
     Ok(AuthUrlParts {
         issuer,
-        // The same derivation the recipient guard applies to a remote URL, so both entries
-        // in a token's acceptable set are directly comparable.
         issuer_domain: lore_credential::domain_from_url_or_url(&issuer_url),
         client_id,
     })
@@ -165,7 +165,7 @@ fn is_loopback(host: Option<Host<&str>>) -> bool {
 }
 
 /// The members of the discovery document this client uses.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Discovery {
     issuer: String,
     authorization_endpoint: String,
@@ -206,9 +206,8 @@ fn parse_discovery(body: &str, expected_issuer: &str) -> Result<Discovery, Proto
 /// Holds an endpoint the provider advertised to the rule `parse_auth_url` holds a
 /// configured issuer to: https, or http only to a loopback host.
 ///
-/// A discovery document is remote input, and the authorization endpoint is handed to
-/// `open::that`: unchecked, a `javascript:` or `file:` endpoint is a local-code-execution
-/// primitive.
+/// A discovery document is remote input, so anything else -- a `javascript:` or `file:`
+/// endpoint, for one -- is refused here rather than opened or dialed later.
 fn check_endpoint(member: &str, endpoint: &str) -> Result<(), ProtocolError> {
     let url = Url::parse(endpoint).map_err(|e| {
         ProtocolError::internal(format!(
@@ -231,11 +230,6 @@ fn check_endpoint(member: &str, endpoint: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-/// A fresh code verifier, drawn from the unreserved set RFC 7636 §4.1 requires.
-fn code_verifier() -> String {
-    random_token()
-}
-
 /// The S256 code challenge for a verifier (RFC 7636 §4.2).
 fn code_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(ring::digest::digest(
@@ -244,12 +238,8 @@ fn code_challenge(verifier: &str) -> String {
     ))
 }
 
-/// An unguessable value for `state`, generated here rather than taken from the caller.
-fn random_state() -> String {
-    random_token()
-}
-
-/// `RANDOM_BYTES` of entropy, base64url without padding.
+/// `RANDOM_BYTES` of entropy, base64url without padding: 43 characters from the unreserved
+/// set, which is what RFC 7636 §4.1 asks of a code verifier.
 fn random_token() -> String {
     URL_SAFE_NO_PAD.encode(rand::random::<[u8; RANDOM_BYTES]>())
 }
@@ -287,7 +277,7 @@ fn authorization_url(
 }
 
 /// What the browser delivered to the loopback redirect.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct CallbackOutcome {
     state: Option<String>,
     code: Option<String>,
@@ -355,7 +345,7 @@ fn authorization_code(
 }
 
 /// A token endpoint success response. The ID token is the credential.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 struct TokenResponse {
     /// Optional on a refresh: `OpenID` Connect Core §12.2 does not oblige a provider to
     /// reissue an ID token for a refresh grant.
@@ -366,7 +356,7 @@ struct TokenResponse {
 }
 
 /// A token endpoint error response (RFC 6749 §5.2).
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct TokenError {
     #[serde(default)]
     error: Option<String>,
@@ -376,7 +366,7 @@ struct TokenError {
 
 /// The ID token claims this client reads. Only `sub` and `exp` are required of it; `name`
 /// and `preferred_username` arrive with the `profile` scope.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct IdTokenClaims {
     sub: String,
     exp: u64,
@@ -388,36 +378,10 @@ struct IdTokenClaims {
     preferred_username: Option<String>,
 }
 
-/// Reads a JWT's claims without verifying its signature.
-///
-/// Verification is the server's job. This client reads only the `nonce` it compares, the
-/// identity it displays, and the expiry the credential store keys on, out of a token it has
-/// just received over TLS from a pinned discovery document's token endpoint.
-fn decode_unverified<T: serde::de::DeserializeOwned>(
-    token: &str,
-) -> Result<T, jsonwebtoken::errors::Error> {
-    let header = jsonwebtoken::decode_header(token)?;
-
-    let mut validation = jsonwebtoken::Validation::new(header.alg);
-    validation.insecure_disable_signature_validation();
-    validation.validate_aud = false;
-    validation.validate_exp = false;
-    validation.validate_nbf = false;
-    // Nothing here is a security check, so a shape that omits a claim this client does not
-    // read must not be rejected on `jsonwebtoken`'s default required set.
-    validation.required_spec_claims.clear();
-
-    jsonwebtoken::decode::<T>(
-        token,
-        &jsonwebtoken::DecodingKey::from_secret(&[]),
-        &validation,
-    )
-    .map(|data| data.claims)
-}
-
-/// Reads an ID token's claims without verifying its signature.
+/// Reads an ID token's claims without verifying its signature, which is the server's job.
 fn id_token_claims(id_token: &str) -> Result<IdTokenClaims, ProtocolError> {
-    decode_unverified(id_token)
+    lore_credential::insecure_decode_token_as::<IdTokenClaims>(id_token)
+        .map(|data| data.claims)
         .map_err(|e| ProtocolError::internal(format!("ID token claims are not readable: {e}")))
 }
 
@@ -474,17 +438,13 @@ fn authentication_token(
     expected_nonce: Option<&str>,
     parts: &AuthUrlParts,
 ) -> Result<AuthenticationToken, ProtocolError> {
-    let (id_token, claims) = tokens
-        .id_token
-        .as_deref()
-        .map(|token| id_token_claims(token).map(|claims| (token.to_string(), claims)))
-        .transpose()?
-        .ok_or_else(|| {
-            ProtocolError::internal(
-                "the token endpoint returned no id_token, so this deployment has no \
-                 credential to present",
-            )
-        })?;
+    let Some(id_token) = tokens.id_token.as_deref() else {
+        return Err(ProtocolError::internal(
+            "the token endpoint returned no id_token, so this deployment has no \
+             credential to present",
+        ));
+    };
+    let claims = id_token_claims(id_token)?;
 
     // Core §3.1.3.3: a login response always carries an ID token, and the nonce travels
     // on it.
@@ -504,7 +464,7 @@ fn authentication_token(
         .unwrap_or(claims.sub);
 
     Ok(AuthenticationToken {
-        token: id_token,
+        token: id_token.to_string(),
         user_id,
         user_name,
         // Claims count seconds since the epoch; every other Lore timestamp is milliseconds.
@@ -517,7 +477,7 @@ fn authentication_token(
 }
 
 /// A device authorization response (RFC 8628 §3.2).
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct DeviceAuthorization {
     device_code: String,
     user_code: String,
@@ -552,7 +512,7 @@ fn device_login_url(authorization: &DeviceAuthorization) -> String {
 }
 
 /// What one poll of the token endpoint established, during a device grant.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum DeviceStep {
     Pending,
     /// The provider asked for a longer interval (RFC 8628 §3.5).
@@ -596,11 +556,9 @@ fn device_poll_step(status: StatusCode, body: &str) -> Result<DeviceStep, Protoc
     }
 }
 
-/// When the next poll of a device grant is allowed.
-///
-/// RFC 8628 §3.5 makes honoring `interval` a client obligation. The caller's own polling
-/// loop runs at a separate period, so this gate keeps the provider's number authoritative.
-#[derive(Clone, Debug)]
+/// When the next poll of a device grant is allowed, honoring the provider's `interval`
+/// (RFC 8628 §3.5) independently of the caller's own polling period.
+#[derive(Debug)]
 struct PollSchedule {
     interval: Duration,
     last_poll: Option<Instant>,
@@ -637,19 +595,18 @@ struct LoopbackRedirect {
     port: u16,
     /// Resolves with the redirect's request target once the browser arrives.
     target: oneshot::Receiver<Result<String, String>>,
+    /// Closes the listener when it is dropped, so an abandoned login frees the port.
+    listener: AbortOnDropHandle<()>,
 }
 
-/// Binds a loopback listener and waits, on the net runtime, for the browser to arrive.
-///
-/// RFC 8252 §7.3 specifies loopback redirection for a native application: the kernel binds
-/// the response to the process holding the port, so no client secret is needed.
+/// Binds a loopback listener, per RFC 8252 §7.3's redirection for a native application.
 async fn bind_loopback_redirect() -> Result<LoopbackRedirect, ProtocolError> {
     let (port_sender, port_receiver) = oneshot::channel();
     let (target_sender, target_receiver) = oneshot::channel();
 
     // Bound and accepted inside one net-runtime task: a tokio listener registers with the
     // reactor of the runtime that created it.
-    lore_base::lore_spawn_net!(async move {
+    let listener = lore_base::lore_spawn_net!(async move {
         let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await {
             Ok(listener) => listener,
             Err(e) => {
@@ -683,6 +640,7 @@ async fn bind_loopback_redirect() -> Result<LoopbackRedirect, ProtocolError> {
     Ok(LoopbackRedirect {
         port,
         target: target_receiver,
+        listener: AbortOnDropHandle::new(listener),
     })
 }
 
@@ -756,9 +714,8 @@ async fn read_request_target(stream: &mut TcpStream) -> Result<String, String> {
         .ok_or_else(|| format!("redirect request start line is malformed: '{line}'"))
 }
 
-/// The pooled HTTP client, built on the net runtime.
-///
-/// Pooled so a login's several requests to the same provider share one TLS handshake.
+/// The HTTP client, built on the net runtime and pooled so a login's several requests to
+/// the same provider share one TLS handshake.
 async fn http_client() -> Result<reqwest::Client, ProtocolError> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     if let Some(client) = CLIENT.get() {
@@ -781,10 +738,8 @@ async fn http_client() -> Result<reqwest::Client, ProtocolError> {
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
-/// Issues a request from the net runtime and reads a capped response body.
-///
-/// Awaited inside `lore_spawn_net!` rather than merely built there: reqwest connects while
-/// the request future is polled, so this is what binds the connection to the net runtime.
+/// Issues a request and reads a capped response body. Awaited inside `lore_spawn_net!`
+/// rather than merely built there: reqwest connects while the request future is polled.
 async fn send(request: reqwest::RequestBuilder) -> Result<(StatusCode, String), ProtocolError> {
     lore_base::lore_spawn_net!(async move {
         let mut response = request
@@ -815,10 +770,49 @@ async fn send(request: reqwest::RequestBuilder) -> Result<(StatusCode, String), 
     .map_err(|e| ProtocolError::internal(format!("provider request task: {e}")))?
 }
 
+/// Posts to the token endpoint and reads a success response.
+async fn post_token_request(
+    token_endpoint: &str,
+    form: &GrantForm,
+) -> Result<TokenResponse, ProtocolError> {
+    let client = http_client().await?;
+    let (status, body) = send(client.post(token_endpoint).form(form)).await?;
+
+    if !status.is_success() {
+        let error = serde_json::from_str::<TokenError>(&body).unwrap_or_default();
+        return Err(ProtocolError::internal(format!(
+            "token endpoint answered {status}: {} ({})",
+            error.error.as_deref().unwrap_or("no error code"),
+            error
+                .error_description
+                .as_deref()
+                .unwrap_or("no description")
+        )));
+    }
+
+    serde_json::from_str(&body)
+        .map_err(|e| ProtocolError::internal(format!("token endpoint response is not usable: {e}")))
+}
+
 /// A login this process started and is polling for.
 enum PendingSession {
     Pkce(PkceSession),
     Device(DeviceSession),
+}
+
+impl PendingSession {
+    fn started(&self) -> Instant {
+        match self {
+            PendingSession::Pkce(session) => session.started,
+            PendingSession::Device(session) => session.started,
+        }
+    }
+}
+
+/// Drops the logins that have been in flight for longer than `FLOW_LIFETIME`, so an
+/// abandoned one does not hold its secrets and its loopback port for the process lifetime.
+fn evict_stale(sessions: &mut HashMap<String, PendingSession>, now: Instant) {
+    sessions.retain(|_, session| now.saturating_duration_since(session.started()) < FLOW_LIFETIME);
 }
 
 struct PkceSession {
@@ -829,6 +823,9 @@ struct PkceSession {
     nonce: String,
     redirect_uri: String,
     redirect: oneshot::Receiver<Result<String, String>>,
+    /// Held so that dropping the session closes the loopback listener.
+    _listener: AbortOnDropHandle<()>,
+    started: Instant,
 }
 
 struct DeviceSession {
@@ -838,6 +835,7 @@ struct DeviceSession {
     /// handle the caller polls with is a separate, opaque string.
     device_code: String,
     schedule: PollSchedule,
+    started: Instant,
 }
 
 /// Authentication against a standard `OpenID` Connect provider.
@@ -876,9 +874,9 @@ impl OidcAuthentication {
         let redirect = bind_loopback_redirect().await?;
         let redirect_uri = format!("http://127.0.0.1:{}{CALLBACK_PATH}", redirect.port);
 
-        let verifier = code_verifier();
-        let state = random_state();
-        let nonce = random_state();
+        let verifier = random_token();
+        let state = random_token();
+        let nonce = random_token();
         let login_url = authorization_url(
             &discovery,
             &parts,
@@ -890,7 +888,9 @@ impl OidcAuthentication {
 
         // Opaque to the caller: the flow's secrets never leave this process.
         let session_code = random_token();
-        self.sessions.lock().insert(
+        let mut sessions = self.sessions.lock();
+        evict_stale(&mut sessions, Instant::now());
+        sessions.insert(
             session_code.clone(),
             PendingSession::Pkce(PkceSession {
                 parts,
@@ -900,8 +900,11 @@ impl OidcAuthentication {
                 nonce,
                 redirect_uri,
                 redirect: redirect.target,
+                _listener: redirect.listener,
+                started: Instant::now(),
             }),
         );
+        drop(sessions);
 
         Ok(AuthSession {
             session_code,
@@ -915,22 +918,25 @@ impl OidcAuthentication {
         parts: AuthUrlParts,
         discovery: Discovery,
     ) -> Result<AuthSession, ProtocolError> {
+        let Discovery {
+            token_endpoint,
+            device_authorization_endpoint,
+            ..
+        } = discovery;
+
         // There is no fallback: the browser flow's redirect goes to a loopback listener on
         // this host, so an authorization URL for another device could never complete.
-        let endpoint = discovery
-            .device_authorization_endpoint
-            .clone()
-            .ok_or_else(|| {
-                ProtocolError::from(NotSupported {
-                    operation: format!(
-                        "login without a browser against {}: the provider advertises no \
-                         device_authorization_endpoint, so the device authorization grant \
-                         (RFC 8628) is unavailable. Log in from a host with a browser, \
-                         without --no-browser",
-                        parts.issuer
-                    ),
-                })
-            })?;
+        let endpoint = device_authorization_endpoint.ok_or_else(|| {
+            ProtocolError::from(NotSupported {
+                operation: format!(
+                    "login without a browser against {}: the provider advertises no \
+                     device_authorization_endpoint, so the device authorization grant \
+                     (RFC 8628) is unavailable. Log in from a host with a browser, \
+                     without --no-browser",
+                    parts.issuer
+                ),
+            })
+        })?;
 
         let form = device_authorization_form(&parts);
 
@@ -950,7 +956,7 @@ impl OidcAuthentication {
 
         // RFC 8628 §5.2: the user has to be able to compare the code the terminal shows
         // with the one the provider shows.
-        lore_info!(
+        lore_debug!(
             "Enter code {} at {} to authorize this login",
             authorization.user_code,
             authorization.verification_uri
@@ -960,15 +966,19 @@ impl OidcAuthentication {
         // Opaque, as in the PKCE flow: the handle travels out through a layer that logs it,
         // and the device code redeems this login's tokens on its own.
         let session_code = random_token();
-        self.sessions.lock().insert(
+        let mut sessions = self.sessions.lock();
+        evict_stale(&mut sessions, Instant::now());
+        sessions.insert(
             session_code.clone(),
             PendingSession::Device(DeviceSession {
                 parts,
-                token_endpoint: discovery.token_endpoint,
+                token_endpoint,
                 device_code: authorization.device_code,
                 schedule: PollSchedule::new(authorization.interval),
+                started: Instant::now(),
             }),
         );
+        drop(sessions);
 
         Ok(AuthSession {
             session_code,
@@ -983,25 +993,26 @@ impl OidcAuthentication {
         session_code: &str,
     ) -> Result<Option<(PkceSession, String)>, ProtocolError> {
         let mut sessions = self.sessions.lock();
+        evict_stale(&mut sessions, Instant::now());
 
-        // `try_recv` rather than an await, so the map's lock is never held across one.
-        let delivered = match sessions.get_mut(session_code) {
-            Some(PendingSession::Pkce(session)) => match session.redirect.try_recv() {
-                Ok(delivered) => delivered,
-                Err(oneshot::error::TryRecvError::Empty) => return Ok(None),
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    Err("loopback listener ended without delivering a redirect".to_string())
-                }
-            },
-            _ => {
-                return Err(ProtocolError::internal(
-                    "no interactive login is in flight for this session",
-                ));
-            }
+        // Removed before the variant is checked, which holds only because every other kind
+        // of session is routed elsewhere before this runs.
+        let Some(PendingSession::Pkce(mut session)) = sessions.remove(session_code) else {
+            return Err(ProtocolError::internal(
+                "no interactive login is in flight for this session",
+            ));
         };
 
-        let Some(PendingSession::Pkce(session)) = sessions.remove(session_code) else {
-            return Err(ProtocolError::internal("login session vanished mid-poll"));
+        // `try_recv` rather than an await, so the map's lock is never held across one.
+        let delivered = match session.redirect.try_recv() {
+            Ok(delivered) => delivered,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                sessions.insert(session_code.to_string(), PendingSession::Pkce(session));
+                return Ok(None);
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                Err("loopback listener ended without delivering a redirect".to_string())
+            }
         };
         drop(sessions);
 
@@ -1017,36 +1028,8 @@ impl OidcAuthentication {
     ) -> Result<AuthenticationToken, ProtocolError> {
         let form = authorization_code_form(&session, code);
 
-        let tokens = self
-            .post_token_request(&session.token_endpoint, &form)
-            .await?;
+        let tokens = post_token_request(&session.token_endpoint, &form).await?;
         authentication_token(tokens, Some(&session.nonce), &session.parts)
-    }
-
-    /// Posts to the token endpoint and reads a success response.
-    async fn post_token_request(
-        &self,
-        token_endpoint: &str,
-        form: &[(&str, String)],
-    ) -> Result<TokenResponse, ProtocolError> {
-        let client = http_client().await?;
-        let (status, body) = send(client.post(token_endpoint).form(form)).await?;
-
-        if !status.is_success() {
-            let error = serde_json::from_str::<TokenError>(&body).unwrap_or_default();
-            return Err(ProtocolError::internal(format!(
-                "token endpoint answered {status}: {} ({})",
-                error.error.as_deref().unwrap_or("no error code"),
-                error
-                    .error_description
-                    .as_deref()
-                    .unwrap_or("no description")
-            )));
-        }
-
-        serde_json::from_str(&body).map_err(|e| {
-            ProtocolError::internal(format!("token endpoint response is not usable: {e}"))
-        })
     }
 
     /// One poll of a device grant. Returns `None` while approval is outstanding.
@@ -1058,6 +1041,7 @@ impl OidcAuthentication {
         // reach the network.
         let (token_endpoint, parts, device_code) = {
             let mut sessions = self.sessions.lock();
+            evict_stale(&mut sessions, Instant::now());
             let Some(PendingSession::Device(session)) = sessions.get_mut(session_code) else {
                 return Err(ProtocolError::internal(
                     "no device authorization is in flight for this session",
@@ -1188,9 +1172,7 @@ impl Authentication for OidcAuthentication {
 
         let form = refresh_form(&parts, refresh_token);
 
-        let tokens = self
-            .post_token_request(&discovery.token_endpoint, &form)
-            .await?;
+        let tokens = post_token_request(&discovery.token_endpoint, &form).await?;
         // OpenID Connect Core §12.2 makes `nonce` optional on a refreshed ID token.
         authentication_token(tokens, None, &parts)
     }
@@ -1247,6 +1229,7 @@ impl Authentication for OidcAuthentication {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::unsigned_jwt;
 
     const DISCOVERY_JSON: &str = r#"{
         "issuer": "https://id.example.com",
@@ -1255,16 +1238,6 @@ mod tests {
         "device_authorization_endpoint": "https://id.example.com/device",
         "jwks_uri": "https://id.example.com/jwks.json"
     }"#;
-
-    /// A JWT with the given claims and a signature nothing checks.
-    fn unsigned_jwt(claims: &str) -> String {
-        format!(
-            "{}.{}.{}",
-            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
-            URL_SAFE_NO_PAD.encode(claims),
-            URL_SAFE_NO_PAD.encode("not-a-signature"),
-        )
-    }
 
     fn parts() -> AuthUrlParts {
         AuthUrlParts {
@@ -1289,7 +1262,7 @@ mod tests {
 
     #[test]
     fn code_verifier_uses_the_rfc_7636_length_and_alphabet() {
-        let verifier = code_verifier();
+        let verifier = random_token();
         assert!(
             (43..=128).contains(&verifier.len()),
             "verifier length {} is outside 43..=128",
@@ -1301,7 +1274,7 @@ mod tests {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')),
             "verifier {verifier} uses characters outside the unreserved set"
         );
-        assert_ne!(verifier, code_verifier(), "verifier is not random");
+        assert_ne!(verifier, random_token(), "verifier is not random");
     }
 
     #[test]
@@ -1782,8 +1755,6 @@ mod tests {
     }
 
     /// The nonce the session generated has to reach the check the exchange performs.
-    /// Passing `None` there leaves every unit test of the check itself green while a
-    /// login completes on an ID token minted for a different one.
     #[tokio::test]
     async fn completing_a_login_refuses_an_id_token_carrying_another_nonce() {
         let id_token = unsigned_jwt(r#"{"sub":"user-1","exp":1000,"nonce":"another-nonce"}"#);
@@ -1798,6 +1769,8 @@ mod tests {
             nonce: "the-nonce".to_string(),
             redirect_uri: "http://127.0.0.1:49152/callback".to_string(),
             redirect: receiver,
+            _listener: AbortOnDropHandle::new(lore_base::lore_spawn_net!(async {})),
+            started: Instant::now(),
         };
 
         let error = OidcAuthentication::default()

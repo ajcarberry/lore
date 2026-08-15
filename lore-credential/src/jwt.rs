@@ -71,6 +71,14 @@ where
 pub fn insecure_decode_token(
     token: &str,
 ) -> Result<TokenData<JWTUserInfo>, jsonwebtoken::errors::Error> {
+    insecure_decode_token_as::<JWTUserInfo>(token)
+}
+
+/// Decodes a JWT's claims as `T` without verifying the signature. Only for
+/// reading claims out of a token something else has verified or will verify.
+pub fn insecure_decode_token_as<T: serde::de::DeserializeOwned>(
+    token: &str,
+) -> Result<TokenData<T>, jsonwebtoken::errors::Error> {
     let header = jsonwebtoken::decode_header(token)?;
     let key = jsonwebtoken::DecodingKey::from_secret(&[]);
     let mut validation = jsonwebtoken::Validation::new(header.alg);
@@ -78,7 +86,8 @@ pub fn insecure_decode_token(
     validation.validate_aud = false;
     validation.validate_exp = false;
     validation.validate_nbf = false;
-    jsonwebtoken::decode::<JWTUserInfo>(token, &key, &validation)
+    validation.required_spec_claims.clear();
+    jsonwebtoken::decode::<T>(token, &key, &validation)
 }
 
 pub fn user_info_from_token(token: String) -> Option<UserInfo> {
@@ -87,12 +96,12 @@ pub fn user_info_from_token(token: String) -> Option<UserInfo> {
     };
     Some(UserInfo {
         id: token_data.claims.user_id.clone(),
-        // Falls back to the subject identifier, so a provider that sends no `name` does
-        // not fail the lookup.
+        // A provider may omit `name`; prefer the username over the raw subject id.
         name: token_data
             .claims
             .name
             .clone()
+            .or_else(|| token_data.claims.preferred_username.clone())
             .unwrap_or_else(|| token_data.claims.user_id.clone()),
         token,
         preferred_username: token_data.claims.preferred_username.unwrap_or_default(),

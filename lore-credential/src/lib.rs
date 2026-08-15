@@ -10,6 +10,7 @@ pub use jwt::JwtUsageError;
 pub use jwt::UserInfo;
 pub use jwt::domain_in_root_domains;
 pub use jwt::insecure_decode_token;
+pub use jwt::insecure_decode_token_as;
 pub use jwt::user_info;
 pub use jwt::user_info_from_token;
 pub use jwt::verify_jwt_usage_for_remote;

@@ -82,6 +82,14 @@ fn parse_auth_url(auth_url: &str) -> Result<AuthUrlParts, ProtocolError> {
         )));
     }
 
+    // Not a legal issuer component (Discovery §2), and the discovery fetch
+    // would otherwise send whatever a hostile auth URL embedded.
+    if !issuer_url.username().is_empty() || issuer_url.password().is_some() {
+        return Err(ProtocolError::internal(format!(
+            "OIDC auth URL '{auth_url}' embeds credentials in the issuer -- refused"
+        )));
+    }
+
     let mut client_id = None;
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
@@ -126,8 +134,10 @@ struct Discovery {
 
 /// Parses a discovery document and pins it to the issuer that was configured.
 ///
-/// The `issuer` member must equal the configured issuer byte for byte (Discovery §4.3), so a
-/// redirect or a compromised well-known path cannot substitute another provider's endpoints.
+/// The `issuer` member must equal the configured issuer byte for byte (Discovery §4.3), which
+/// refuses a *different provider's* genuine document. A forged response echoes the expected
+/// issuer, so the pin is paired with transport-level checks: the client follows no redirects,
+/// and every advertised endpoint is held to https-or-loopback by `check_endpoint`.
 fn parse_discovery(body: &str, expected_issuer: &str) -> Result<Discovery, ProtocolError> {
     let discovery: Discovery = serde_json::from_str(body).map_err(|e| {
         ProtocolError::internal(format!(
@@ -176,6 +186,14 @@ fn check_endpoint(member: &str, endpoint: &str) -> Result<(), ProtocolError> {
         )));
     }
 
+    // Embedded credentials would ride along on every request to the endpoint,
+    // and nothing legitimate puts them in a discovery document.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ProtocolError::internal(format!(
+            "provider advertises {member} '{endpoint}', which embeds credentials -- refused"
+        )));
+    }
+
     Ok(())
 }
 
@@ -194,6 +212,11 @@ async fn http_client() -> Result<reqwest::Client, ProtocolError> {
             .tls_built_in_native_certs(true)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            // The discovery pin inspects a body field the responder authors, so
+            // origin integrity has to come from the transport: no redirects,
+            // which could otherwise carry a fetch across origins or down to
+            // plaintext.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
     })
     .await
@@ -243,10 +266,19 @@ async fn send(request: reqwest::RequestBuilder) -> Result<(StatusCode, String), 
 #[derive(Default)]
 pub struct OidcAuthentication {}
 
+/// The discovery document URL for an issuer (Discovery §4). The `.well-known`
+/// suffix joins the issuer with no normalization beyond avoiding a doubled
+/// slash — the same rule the server's fetch applies, so both sides resolve a
+/// trailing-slash issuer to the same document while pinning the untrimmed
+/// string.
+fn discovery_url(issuer: &str) -> String {
+    format!("{}{DISCOVERY_PATH}", issuer.trim_end_matches('/'))
+}
+
 impl OidcAuthentication {
     /// Fetches and pins the provider's discovery document.
     async fn discover(&self, parts: &AuthUrlParts) -> Result<Discovery, ProtocolError> {
-        let url = format!("{}{DISCOVERY_PATH}", parts.issuer);
+        let url = discovery_url(&parts.issuer);
         let client = http_client().await?;
         let (status, body) = send(client.get(&url)).await?;
 
@@ -511,6 +543,39 @@ mod tests {
                 "the diagnostic must name the member at fault, got: {error}"
             );
         }
+    }
+
+    /// The server's fetch trims trailing slashes the same way, so a provider
+    /// publishing `https://id.example.com/realms/studio/` verifies server-side
+    /// *and* logs in client-side, while the issuer pin still compares the
+    /// untrimmed string.
+    #[test]
+    fn discovery_url_trims_a_trailing_slash_without_touching_the_issuer() {
+        assert_eq!(
+            discovery_url("https://id.example.com/realms/studio/"),
+            "https://id.example.com/realms/studio/.well-known/openid-configuration"
+        );
+        assert_eq!(
+            discovery_url("https://id.example.com"),
+            "https://id.example.com/.well-known/openid-configuration"
+        );
+    }
+
+    #[test]
+    fn discovery_endpoints_embedding_credentials_are_refused() {
+        let body = r#"{"issuer":"https://id.example.com",
+            "authorization_endpoint":"https://user:pass@id.example.com/authorize",
+            "token_endpoint":"https://id.example.com/token"}"#;
+        let error = parse_discovery(body, "https://id.example.com")
+            .expect_err("credentials embedded in an endpoint must be refused");
+        assert!(error.to_string().contains("credentials"), "{error}");
+    }
+
+    #[test]
+    fn auth_url_embedding_credentials_is_refused() {
+        let error = parse_auth_url("oidc+https://user:pass@id.example.com?client_id=lore")
+            .expect_err("credentials embedded in the issuer must be refused");
+        assert!(error.to_string().contains("credentials"), "{error}");
     }
 
     #[test]

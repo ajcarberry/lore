@@ -213,12 +213,14 @@ pub enum TokenRecipients {
 }
 
 impl TokenRecipients {
-    /// The domains `token` may be sent to, always including `recipient_domain`.
+    /// The domains `token` may be sent to, always admitting `recipient_domain`.
     ///
-    /// `SelfDescribing` derives the set from the token's own claims, refusing a
-    /// recipient the claims do not name. `Explicit` is authoritative; the recipient
-    /// is added if absent. Enforcement happens where a stored token is loaded, by
-    /// filtering on the set this returns.
+    /// `SelfDescribing` derives the set from the token's own claims (read without
+    /// signature verification -- something else has verified or will verify the
+    /// token), refusing a recipient the claims do not name; the returned set is
+    /// the claims' own and need not list the recipient verbatim. `Explicit` is
+    /// authoritative; the recipient is added if absent. Enforcement happens where
+    /// a stored token is loaded, by filtering on the set this returns.
     pub fn domains_for(
         &self,
         token: &str,

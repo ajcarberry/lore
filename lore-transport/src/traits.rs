@@ -336,10 +336,9 @@ pub trait Environment: Send + Sync {
 ///
 /// This is a capability, not a preference. An implementation with only one
 /// ceremony ignores it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginFlow {
     /// A redirect back to this host can complete the login.
-    #[default]
     Browser,
     /// The login has to be completed on another device.
     NoBrowser,

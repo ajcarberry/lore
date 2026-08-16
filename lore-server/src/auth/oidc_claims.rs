@@ -28,8 +28,23 @@ pub(crate) struct OidcTokenClaims {
     #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(rename = "aud")]
     audience: Vec<String>,
+    #[serde(rename = "azp")]
+    authorized_party: Option<String>,
     name: Option<String>,
     preferred_username: Option<String>,
+}
+
+impl OidcTokenClaims {
+    /// Core §3.1.3.7 steps 4-5: a token naming several audiences must carry an
+    /// `azp`, and an `azp`, when present, must name this client. The audience
+    /// check alone is membership, which would accept a token minted for
+    /// another application that merely lists this client id in its audience.
+    pub(crate) fn authorized_party_permitted(&self, client_ids: &[String]) -> bool {
+        match &self.authorized_party {
+            Some(azp) => client_ids.iter().any(|id| id == azp),
+            None => self.audience.len() <= 1,
+        }
+    }
 }
 
 impl From<OidcTokenClaims> for AuthorizationToken {
@@ -88,14 +103,24 @@ mod oidc_decode {
     use crate::auth::jwt::JwtVerifier;
     use crate::auth::jwt::JwtVerifierError;
 
-    const AGREED_UPON_ALGORITHM: Algorithm = Algorithm::HS256;
-    const AGREED_UPON_SIGNING_SECRET: &str = "the-secret";
+    /// `EdDSA` rather than an HMAC secret, because the verifier under test
+    /// refuses symmetric algorithms in OIDC mode before any claim is read.
+    const AGREED_UPON_ALGORITHM: Algorithm = Algorithm::EdDSA;
 
-    fn agreed_upon_key() -> (DecodingKey, Algorithm) {
-        (
-            DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
-            AGREED_UPON_ALGORITHM,
-        )
+    fn agreed_upon_keys() -> &'static (EncodingKey, DecodingKey) {
+        static KEYS: std::sync::OnceLock<(EncodingKey, DecodingKey)> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            let pkcs8 =
+                ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                    .expect("generate test keypair");
+            let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+                .expect("parse test keypair");
+            use ring::signature::KeyPair;
+            (
+                EncodingKey::from_ed_der(pkcs8.as_ref()),
+                DecodingKey::from_ed_der(pair.public_key().as_ref()),
+            )
+        })
     }
 
     /// Serves the one key these tokens are signed with, whatever key id is asked
@@ -105,11 +130,33 @@ mod oidc_decode {
     #[async_trait]
     impl JWKService for AgreedUponJWKService {
         async fn get_key(&self, _kid: &str) -> Result<(DecodingKey, Algorithm), JWKServiceError> {
-            Ok(agreed_upon_key())
+            Ok((agreed_upon_keys().1.clone(), AGREED_UPON_ALGORITHM))
         }
 
         fn get_cached_key(&self, _kid: &str) -> Option<(DecodingKey, Algorithm)> {
-            Some(agreed_upon_key())
+            Some((agreed_upon_keys().1.clone(), AGREED_UPON_ALGORITHM))
+        }
+
+        async fn refresh_key(
+            &self,
+            _kid: &str,
+        ) -> Result<Option<(DecodingKey, Algorithm)>, JWKServiceError> {
+            Ok(None)
+        }
+    }
+
+    /// A provider that published a symmetric secret in its key set — the case
+    /// OIDC mode must refuse however the key was obtained.
+    struct SymmetricJWKService;
+
+    #[async_trait]
+    impl JWKService for SymmetricJWKService {
+        async fn get_key(&self, _kid: &str) -> Result<(DecodingKey, Algorithm), JWKServiceError> {
+            Ok((DecodingKey::from_secret(b"published"), Algorithm::HS256))
+        }
+
+        fn get_cached_key(&self, _kid: &str) -> Option<(DecodingKey, Algorithm)> {
+            Some((DecodingKey::from_secret(b"published"), Algorithm::HS256))
         }
 
         async fn refresh_key(
@@ -121,21 +168,20 @@ mod oidc_decode {
     }
 
     fn encode_jwt(jwt_claims: &serde_json::Value) -> String {
-        let jwt_key = EncodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref());
         let jwt_header = {
             let mut header = Header::new(AGREED_UPON_ALGORITHM);
             header.kid = Some("the kid".into());
             header
         };
 
-        encode(&jwt_header, jwt_claims, &jwt_key).unwrap()
+        encode(&jwt_header, jwt_claims, &agreed_upon_keys().0).unwrap()
     }
 
     fn oidc_verifier() -> JwtVerifier {
         JwtVerifier::oidc(
             Arc::new(AgreedUponJWKService),
-            Some("https://id.example.com".to_string()),
-            Some(vec!["lore".to_string()]),
+            "https://id.example.com".to_string(),
+            vec!["lore".to_string()],
         )
     }
 
@@ -267,6 +313,82 @@ mod oidc_decode {
         assert_eq!(token.env, "", "`env` is not read in OIDC mode");
         let resources = token.resources.expect("wildcard resource is populated");
         assert!(resources[0].is_wildcard_resource());
+    }
+
+    /// The symmetric refusal is inside `verify_token_internal`, so it holds
+    /// for any key service an OIDC verifier is built over — there is no
+    /// unwrapped configuration that skips it.
+    #[tokio::test]
+    async fn a_key_served_under_a_symmetric_algorithm_is_refused() {
+        let verifier = JwtVerifier::oidc(
+            Arc::new(SymmetricJWKService),
+            "https://id.example.com".to_string(),
+            vec!["lore".to_string()],
+        );
+        let jwt_key = EncodingKey::from_secret(b"published");
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("the kid".into());
+        let encoded = encode(&header, &minimal_claims(), &jwt_key).unwrap();
+
+        let error = verifier
+            .verify_token(&encoded)
+            .await
+            .expect_err("a published symmetric secret is a signing key for anyone who reads it");
+        assert!(
+            matches!(error, JwtVerifierError::SymmetricAlgorithmRefused),
+            "{error:?}"
+        );
+    }
+
+    /// Core §3.1.3.7 step 4: several audiences without an `azp` is refused —
+    /// membership alone would admit a token minted for another application
+    /// that merely lists this client id.
+    #[tokio::test]
+    async fn several_audiences_without_azp_are_refused() {
+        let mut claims = minimal_claims();
+        claims["aud"] = json!(["lore", "another-app"]);
+        let encoded = encode_jwt(&claims);
+
+        let error = oidc_verifier()
+            .verify_token(&encoded)
+            .await
+            .expect_err("a multi-audience token must say which client it was issued to");
+        assert!(
+            matches!(error, JwtVerifierError::AuthorizedPartyMismatch),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn several_audiences_with_azp_naming_this_client_are_accepted() {
+        let mut claims = minimal_claims();
+        claims["aud"] = json!(["lore", "another-app"]);
+        claims["azp"] = json!("lore");
+        let encoded = encode_jwt(&claims);
+
+        let token = oidc_verifier()
+            .verify_token(&encoded)
+            .await
+            .expect("azp naming this client resolves the multi-audience ambiguity");
+        assert_eq!(token.user_id, "the-subject");
+    }
+
+    /// Core §3.1.3.7 step 5: an `azp` naming another client is refused even
+    /// when the audience alone would pass.
+    #[tokio::test]
+    async fn an_azp_naming_another_client_is_refused() {
+        let mut claims = minimal_claims();
+        claims["azp"] = json!("another-app");
+        let encoded = encode_jwt(&claims);
+
+        let error = oidc_verifier()
+            .verify_token(&encoded)
+            .await
+            .expect_err("a token issued to another client must not authenticate here");
+        assert!(
+            matches!(error, JwtVerifierError::AuthorizedPartyMismatch),
+            "{error:?}"
+        );
     }
 
     /// The invariant the mode gate preserves: a `LoreClaims` verifier must

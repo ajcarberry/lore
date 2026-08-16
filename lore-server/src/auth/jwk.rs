@@ -560,9 +560,9 @@ impl InstrumentProvider for JwkServiceImpl {
 /// read it, so OIDC mode admits only the asymmetric families. This is an
 /// allowlist rather than a denial of the HMAC variants so a signing algorithm
 /// added to `jsonwebtoken` in a later release is refused until it is reviewed
-/// and added here, not admitted by default.
-#[allow(dead_code)] // Consumed by the verifier wiring in a following phase.
-fn oidc_permits_algorithm(algorithm: jsonwebtoken::Algorithm) -> bool {
+/// and added here, not admitted by default. Enforced in
+/// `JwtVerifier::verify_token_internal`, where every key path converges.
+pub(crate) fn oidc_permits_algorithm(algorithm: jsonwebtoken::Algorithm) -> bool {
     use jsonwebtoken::Algorithm as Alg;
     matches!(
         algorithm,
@@ -576,50 +576,6 @@ fn oidc_permits_algorithm(algorithm: jsonwebtoken::Algorithm) -> bool {
             | Alg::ES384
             | Alg::EdDSA
     )
-}
-
-/// Wraps a [`JWKService`] to additionally refuse symmetric signing algorithms,
-/// for `[server.auth.oidc]` verifiers only.
-pub(crate) struct OidcJwkService {
-    inner: Arc<dyn JWKService>,
-}
-
-impl OidcJwkService {
-    /// Wrap `inner`, refusing any key it serves under a symmetric algorithm.
-    #[allow(dead_code)] // Consumed by the verifier wiring in a following phase.
-    pub(crate) fn new(inner: Arc<dyn JWKService>) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait]
-impl JWKService for OidcJwkService {
-    async fn get_key(
-        &self,
-        kid: &str,
-    ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
-        let (key, algorithm) = self.inner.get_key(kid).await?;
-        if oidc_permits_algorithm(algorithm) {
-            Ok((key, algorithm))
-        } else {
-            warn!(%kid, ?algorithm, "OIDC mode refuses a symmetric signing algorithm");
-            Err(JWKServiceError::NotFound)
-        }
-    }
-
-    fn get_cached_key(&self, kid: &str) -> Option<(DecodingKey, jsonwebtoken::Algorithm)> {
-        self.inner
-            .get_cached_key(kid)
-            .filter(|(_, algorithm)| oidc_permits_algorithm(*algorithm))
-    }
-
-    async fn refresh_key(
-        &self,
-        kid: &str,
-    ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError> {
-        let refreshed = self.inner.refresh_key(kid).await?;
-        Ok(refreshed.filter(|(_, algorithm)| oidc_permits_algorithm(*algorithm)))
-    }
 }
 
 #[cfg(test)]
@@ -1467,86 +1423,8 @@ mod tests {
         );
     }
 
-    mod oidc_jwk_service {
+    mod oidc_algorithms {
         use super::*;
-
-        fn hmac_key() -> (DecodingKey, jsonwebtoken::Algorithm) {
-            (
-                DecodingKey::from_secret(b"shared-secret"),
-                jsonwebtoken::Algorithm::HS256,
-            )
-        }
-
-        fn rsa_key() -> (DecodingKey, jsonwebtoken::Algorithm) {
-            (
-                DecodingKey::from_rsa_components(RSA_N, RSA_E).expect("rsa decoding key"),
-                jsonwebtoken::Algorithm::RS256,
-            )
-        }
-
-        struct StaticJwkService {
-            key: (DecodingKey, jsonwebtoken::Algorithm),
-        }
-
-        #[async_trait]
-        impl JWKService for StaticJwkService {
-            async fn get_key(
-                &self,
-                _kid: &str,
-            ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
-                Ok((self.key.0.clone(), self.key.1))
-            }
-
-            fn get_cached_key(&self, _kid: &str) -> Option<(DecodingKey, jsonwebtoken::Algorithm)> {
-                Some((self.key.0.clone(), self.key.1))
-            }
-
-            async fn refresh_key(
-                &self,
-                _kid: &str,
-            ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>
-            {
-                Ok(Some((self.key.0.clone(), self.key.1)))
-            }
-        }
-
-        #[tokio::test]
-        async fn refuses_a_symmetric_key_from_get_key() {
-            let inner = Arc::new(StaticJwkService { key: hmac_key() });
-            let service = OidcJwkService::new(inner);
-
-            assert!(matches!(
-                service.get_key("kid").await,
-                Err(JWKServiceError::NotFound)
-            ));
-        }
-
-        #[test]
-        fn refuses_a_symmetric_key_from_the_cache() {
-            let inner = Arc::new(StaticJwkService { key: hmac_key() });
-            let service = OidcJwkService::new(inner);
-
-            assert!(service.get_cached_key("kid").is_none());
-        }
-
-        #[tokio::test]
-        async fn refuses_a_symmetric_key_on_refresh() {
-            let inner = Arc::new(StaticJwkService { key: hmac_key() });
-            let service = OidcJwkService::new(inner);
-
-            assert!(service.refresh_key("kid").await.unwrap().is_none());
-        }
-
-        #[tokio::test]
-        async fn passes_through_an_asymmetric_key() {
-            let inner = Arc::new(StaticJwkService { key: rsa_key() });
-            let service = OidcJwkService::new(inner);
-
-            let (_, algorithm) = service.get_key("kid").await.expect("rsa key is permitted");
-            assert_eq!(algorithm, jsonwebtoken::Algorithm::RS256);
-            assert!(service.get_cached_key("kid").is_some());
-            assert!(service.refresh_key("kid").await.unwrap().is_some());
-        }
 
         #[test]
         fn oidc_permits_algorithm_allows_only_asymmetric_families() {

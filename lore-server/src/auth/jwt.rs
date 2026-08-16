@@ -17,6 +17,7 @@ use tracing::warn;
 
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
+use crate::auth::jwk::oidc_permits_algorithm;
 use crate::auth::oidc_claims::OidcTokenClaims;
 
 #[serde_as]
@@ -89,12 +90,16 @@ pub enum JwtVerifierError {
     ValidationFailed(#[from] jsonwebtoken::errors::Error),
     #[error("JWT authorization failed")]
     NotAuthorized,
+    #[error("OIDC mode refuses symmetric signing algorithms")]
+    SymmetricAlgorithmRefused,
+    #[error("JWT names several audiences and azp does not name this client")]
+    AuthorizedPartyMismatch,
 }
 
 /// Which claim shape `verify_token_internal` decodes, and with it whether a
 /// verified token is granted the all-repositories wildcard.
 ///
-/// By the constructors' convention only [`JwtVerifier::oidc`], built from a
+/// The field is private, so only [`JwtVerifier::oidc`], built from a
 /// configured `[server.auth.oidc]` block, produces `Oidc`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum JwtVerifierMode {
@@ -113,7 +118,7 @@ pub struct JwtVerifier {
     pub jwk_service: Arc<dyn JWKService>,
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<Vec<String>>,
-    pub mode: JwtVerifierMode,
+    mode: JwtVerifierMode,
 }
 
 impl JwtVerifier {
@@ -133,15 +138,23 @@ impl JwtVerifier {
 
     /// `[server.auth.oidc]`'s authn-only mode, accepting an ID token whose
     /// `jwt_audience` is the client id.
+    ///
+    /// Both pins are mandatory here where they are optional in [`new`]: an
+    /// OIDC verifier with no issuer would silently skip the `iss` check
+    /// (`jsonwebtoken` validates the issuer only when one is set), and one
+    /// with no audience refuses everything. Neither is a configuration
+    /// `[server.auth.oidc]` can produce, so the signature forbids them.
+    ///
+    /// [`new`]: JwtVerifier::new
     pub fn oidc(
         jwk_service: Arc<dyn JWKService>,
-        jwt_issuer: Option<String>,
-        jwt_audience: Option<Vec<String>>,
+        jwt_issuer: String,
+        jwt_audience: Vec<String>,
     ) -> Self {
         Self {
             jwk_service,
-            jwt_issuer,
-            jwt_audience,
+            jwt_issuer: Some(jwt_issuer),
+            jwt_audience: Some(jwt_audience),
             mode: JwtVerifierMode::Oidc,
         }
     }
@@ -254,9 +267,21 @@ impl JwtVerifier {
         // OIDC mode reads every token as the provider-issued shape: which claims a
         // provider happens to include must never decide what a token authorizes.
         if self.mode == JwtVerifierMode::Oidc {
-            return decode::<OidcTokenClaims>(token, key, &validation)
-                .map_err(decode_failure)
-                .map(|token_data| token_data.claims.into());
+            // The symmetric refusal lives here, where the fresh, cached, and
+            // refreshed key paths all converge, so no wiring can build an OIDC
+            // verifier without it.
+            if !oidc_permits_algorithm(*alg) {
+                warn!(?alg, "OIDC mode refuses a symmetric signing algorithm");
+                return Err(JwtVerifierError::SymmetricAlgorithmRefused);
+            }
+            let token_data =
+                decode::<OidcTokenClaims>(token, key, &validation).map_err(decode_failure)?;
+            let permitted = self.jwt_audience.as_deref().unwrap_or_default();
+            if !token_data.claims.authorized_party_permitted(permitted) {
+                warn!("OIDC token names several audiences and azp does not name this client");
+                return Err(JwtVerifierError::AuthorizedPartyMismatch);
+            }
+            return Ok(token_data.claims.into());
         }
 
         if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {

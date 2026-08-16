@@ -851,18 +851,39 @@ async fn post_token_request(
 
     if !status.is_success() {
         let error = serde_json::from_str::<TokenError>(&body).unwrap_or_default();
+        let description = error
+            .error_description
+            .as_deref()
+            .unwrap_or("no description");
+        // RFC 6749 §5.2's verdict on the grant itself -- a spent code, a revoked
+        // or already-rotated refresh token. The routine death of a session must
+        // be typed as "log in again", not as a transport-shaped failure.
+        if error.error.as_deref() == Some("invalid_grant") {
+            lore_debug!("Token endpoint refused the grant: {description}");
+            return Err(ProtocolError::from(NotAuthenticated));
+        }
         return Err(ProtocolError::internal(format!(
-            "token endpoint answered {status}: {} ({})",
+            "token endpoint answered {status}: {} ({description})",
             error.error.as_deref().unwrap_or("no error code"),
-            error
-                .error_description
-                .as_deref()
-                .unwrap_or("no description")
         )));
     }
 
     serde_json::from_str(&body)
         .map_err(|e| ProtocolError::internal(format!("token endpoint response is not usable: {e}")))
+}
+
+/// The post-discovery half of the refresh grant, split from
+/// `refresh_authentication` the way `complete_pkce` is split from its poll, so
+/// the grant form and response handling are testable against a local endpoint.
+async fn refresh_with(
+    token_endpoint: &str,
+    parts: &AuthUrlParts,
+    refresh_token: &str,
+) -> Result<AuthenticationToken, ProtocolError> {
+    let form = refresh_form(parts, refresh_token);
+    let tokens = post_token_request(token_endpoint, &form).await?;
+    // OpenID Connect Core §12.2 makes `nonce` optional on a refreshed ID token.
+    authentication_token(tokens, None, parts)
 }
 
 /// A login this process started and is polling for.
@@ -1280,12 +1301,7 @@ impl Authentication for OidcAuthentication {
     ) -> Result<AuthenticationToken, ProtocolError> {
         let parts = parse_auth_url(auth_url)?;
         let discovery = self.discover(&parts).await?;
-
-        let form = refresh_form(&parts, refresh_token);
-
-        let tokens = post_token_request(&discovery.token_endpoint, &form).await?;
-        // OpenID Connect Core §12.2 makes `nonce` optional on a refreshed ID token.
-        authentication_token(tokens, None, &parts)
+        refresh_with(&discovery.token_endpoint, &parts, refresh_token).await
     }
 
     async fn exchange_for_repository(
@@ -1805,6 +1821,13 @@ mod tests {
 
     /// Answers one HTTP request on a loopback port with a canned body.
     async fn one_shot_provider(body: impl Into<String>) -> String {
+        one_shot_provider_with_status("200 OK", body).await
+    }
+
+    async fn one_shot_provider_with_status(
+        status: &'static str,
+        body: impl Into<String>,
+    ) -> String {
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt;
 
@@ -1844,7 +1867,7 @@ mod tests {
             }
 
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
@@ -1852,6 +1875,50 @@ mod tests {
         });
 
         format!("http://127.0.0.1:{port}/device")
+    }
+
+    /// The refresh grant round trip against a local token endpoint: the new
+    /// credential comes back with the rotated refresh token and the issuer as
+    /// its recipient.
+    #[tokio::test]
+    async fn a_refresh_returns_the_new_credential_and_rotated_token() {
+        let id_token = unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#);
+        let endpoint = one_shot_provider(format!(
+            r#"{{"id_token":"{id_token}","refresh_token":"rotated"}}"#
+        ))
+        .await;
+
+        let token = refresh_with(&endpoint, &parts(), "spent")
+            .await
+            .expect("the refresh grant should complete");
+
+        assert_eq!(token.user_id, "user-1");
+        assert_eq!(token.refresh_token.as_deref(), Some("rotated"));
+        assert_eq!(
+            token.recipients,
+            TokenRecipients::Explicit(vec!["id.example.com".to_string()])
+        );
+    }
+
+    /// RFC 6749 §5.2's `invalid_grant` is the routine death of a session — a
+    /// revoked or already-spent refresh token — and has to be typed "log in
+    /// again", not reported as a transport-shaped failure.
+    #[tokio::test]
+    async fn a_refused_refresh_grant_reports_not_authenticated() {
+        let endpoint = one_shot_provider_with_status(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","error_description":"revoked"}"#,
+        )
+        .await;
+
+        let error = refresh_with(&endpoint, &parts(), "revoked-token")
+            .await
+            .expect_err("a refused grant is not a credential");
+
+        assert!(
+            matches!(error, ProtocolError::NotAuthenticated(_)),
+            "a dead session must say log in again, got: {error:?}"
+        );
     }
 
     /// RFC 8628's `device_code` is a bearer credential and the session handle is logged, so

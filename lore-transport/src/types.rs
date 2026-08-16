@@ -200,6 +200,54 @@ pub struct AuthSession {
     pub session_code: String,
     /// URL the user should visit to authenticate.
     pub login_url: String,
+    /// Device-grant user code, for display beside the URL: the user compares it
+    /// with the one the provider shows (RFC 8628 §3.3.1). `None` for flows
+    /// without one.
+    pub user_code: Option<String>,
+}
+
+/// How the domains a token may be sent to are determined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenRecipients {
+    /// The token's own claims name where it may go; the recipient is verified
+    /// against them and rejected if absent.
+    SelfDescribing,
+    /// These domains are authoritative; the recipient is added if absent.
+    Explicit(Vec<String>),
+}
+
+impl TokenRecipients {
+    /// The domains `token` may be sent to, always admitting `recipient_domain`.
+    ///
+    /// `SelfDescribing` derives the set from the token's own claims (read without
+    /// signature verification -- something else has verified or will verify the
+    /// token), refusing a recipient the claims do not name; the returned set is
+    /// the claims' own and need not list the recipient verbatim. `Explicit` is
+    /// authoritative; the recipient is added if absent. Enforcement happens where
+    /// a stored token is loaded, by filtering on the set this returns.
+    pub fn domains_for(
+        &self,
+        token: &str,
+        recipient_domain: &str,
+    ) -> Result<Vec<String>, lore_credential::JwtUsageError> {
+        use lore_credential::JwtUsageError;
+        match self {
+            Self::SelfDescribing => {
+                let decoded = lore_credential::insecure_decode_token(token).map_err(|err| {
+                    JwtUsageError::internal(format!("Could not decode token: {err}"))
+                })?;
+                lore_credential::verify_jwt_usage_for_remote(&decoded.claims, recipient_domain)?;
+                Ok(decoded.claims.acceptable_root_domains())
+            }
+            Self::Explicit(domains) => {
+                let mut domains = domains.clone();
+                if !domains.iter().any(|domain| domain == recipient_domain) {
+                    domains.push(recipient_domain.to_string());
+                }
+                Ok(domains)
+            }
+        }
+    }
 }
 
 /// Authentication token with user identity metadata.
@@ -218,8 +266,8 @@ pub struct AuthenticationToken {
     pub user_name: String,
     /// Expiry as milliseconds since UNIX epoch.
     pub expires_ms: u64,
-    /// Root domains this token is valid for.
-    pub acceptable_root_domains: Vec<String>,
+    /// How the domains this token may be sent to are determined.
+    pub recipients: TokenRecipients,
     /// One-time-use refresh token for obtaining a new authentication token
     /// without re-authenticating. `None` if the auth backend does not support
     /// refresh. Consumed on use -- the next refresh returns a new one.
@@ -237,8 +285,8 @@ pub struct AuthorizationToken {
     pub token: String,
     /// Expiry as milliseconds since UNIX epoch.
     pub expires_ms: u64,
-    /// Root domains this token is valid for.
-    pub acceptable_root_domains: Vec<String>,
+    /// How the domains this token may be sent to are determined.
+    pub recipients: TokenRecipients,
 }
 
 /// Resolved user identity information.
@@ -248,6 +296,19 @@ pub struct ResolvedUser {
     pub user_id: String,
     /// Human-readable display name.
     pub user_name: String,
+}
+
+/// A JWT with the given claims and a signature nothing checks.
+#[cfg(test)]
+pub(crate) fn unsigned_jwt(claims: &str) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    format!(
+        "{}.{}.{}",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+        URL_SAFE_NO_PAD.encode(claims),
+        URL_SAFE_NO_PAD.encode("not-a-signature"),
+    )
 }
 
 #[cfg(test)]
@@ -318,5 +379,57 @@ mod tests {
         assert_eq!(env.revision_url(FALLBACK), FALLBACK);
         assert_eq!(env.repository_url(FALLBACK), FALLBACK);
         assert_eq!(env.notification_url(FALLBACK), FALLBACK);
+    }
+
+    #[test]
+    fn self_describing_recipients_keep_jwt_derived_domains() {
+        let jwt = crate::types::unsigned_jwt(
+            r#"{"iss":"auth.example.com","sub":"user-1","exp":9999999999,"aud":["repo.example.com"]}"#,
+        );
+
+        let domains = TokenRecipients::SelfDescribing
+            .domains_for(&jwt, "repo.example.com")
+            .unwrap();
+
+        assert_eq!(
+            domains,
+            vec![
+                "auth.example.com".to_string(),
+                "repo.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_recipients_beat_the_jwt_derived_set() {
+        // An OIDC token's `aud` is a client id and `iss` a URL; only the backend's
+        // explicit set can admit the remote.
+        let jwt = crate::types::unsigned_jwt(
+            r#"{"iss":"https://id.example.com","sub":"user-1","exp":9999999999,"aud":["lore-cli"]}"#,
+        );
+        let recipients = TokenRecipients::Explicit(vec!["id.example.com".to_string()]);
+
+        let domains = recipients.domains_for(&jwt, "repo.example.com").unwrap();
+
+        assert!(domains.contains(&"id.example.com".to_string()));
+        assert!(domains.contains(&"repo.example.com".to_string()));
+    }
+
+    #[test]
+    fn explicit_recipients_already_naming_the_remote_are_not_duplicated() {
+        let jwt = crate::types::unsigned_jwt(
+            r#"{"iss":"https://id.example.com","sub":"user-1","exp":9999999999,"aud":["lore-cli"]}"#,
+        );
+        let recipients = TokenRecipients::Explicit(vec![
+            "id.example.com".to_string(),
+            "repo.example.com".to_string(),
+        ]);
+
+        let domains = recipients.domains_for(&jwt, "repo.example.com").unwrap();
+
+        assert_eq!(
+            domains,
+            vec!["id.example.com".to_string(), "repo.example.com".to_string()]
+        );
     }
 }

@@ -140,7 +140,9 @@ mod oidc_client_tests {
                 );
 
                 // The token may go back to its issuer, and the orchestration layer adds the
-                // remote.
+                // remote. For this loopback issuer the recipient is the whole URL
+                // (an IP host has no domain to extract); against a real
+                // `oidc+https` issuer it is the bare host.
                 assert_eq!(
                     token.recipients,
                     TokenRecipients::Explicit(vec![format!("{}/", fixture.issuer())]),
@@ -150,12 +152,14 @@ mod oidc_client_tests {
             .await;
     }
 
-    /// An authorization response belonging to another session must not be exchanged: the
-    /// `state` check refuses it before the code is used (RFC 9700).
+    /// An authorization response belonging to another session must not be exchanged, and
+    /// must not end the login either: the listener answers 404 and keeps waiting (a forged
+    /// callback cannot close it ahead of the real redirect), and the genuine redirect that
+    /// follows still completes the login (RFC 9700; RFC 8252 §8.3).
     ///
     /// Requires the compose stack (see above).
     #[tokio::test]
-    async fn pkce_refuses_a_response_with_the_wrong_state() {
+    async fn pkce_ignores_a_response_with_the_wrong_state() {
         LORE_CONTEXT
             .scope(setup_execution("test".to_string()), async move {
                 let (fixture, user, auth_url) =
@@ -185,28 +189,47 @@ mod oidc_client_tests {
                     })
                     .collect();
                 tampered.query_pairs_mut().clear().extend_pairs(&query);
-                deliver(tampered.as_str())
+                let status = reqwest::Client::new()
+                    .get(tampered.as_str())
+                    .send()
                     .await
-                    .expect("The listener should still answer the request");
+                    .expect("The listener should still answer the request")
+                    .status();
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::NOT_FOUND,
+                    "A response carrying another session's state must not be treated as this \
+                     login's"
+                );
 
-                // The client's contract is an error on a state mismatch.
-                let mut refused = false;
+                // The forged response neither completed nor killed the login.
+                assert!(
+                    auth.poll_auth_session(&auth_url, "client-state", &session.session_code, "")
+                        .await
+                        .expect("A forged response must not fail the login")
+                        .is_none(),
+                    "A response carrying another session's state was exchanged"
+                );
+
+                // The genuine redirect still lands, so a local forger cannot
+                // deny the login either.
+                deliver(&redirect)
+                    .await
+                    .expect("The listener should accept the genuine redirect");
+                let mut completed = None;
                 for _ in 0..POLL_ATTEMPTS {
-                    match auth
+                    if let Some(token) = auth
                         .poll_auth_session(&auth_url, "client-state", &session.session_code, "")
                         .await
+                        .expect("The genuine redirect should complete the login")
                     {
-                        Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
-                        Ok(Some(_)) => {
-                            panic!("A response carrying another session's state was exchanged")
-                        }
-                        Err(_) => {
-                            refused = true;
-                            break;
-                        }
+                        completed = Some(token);
+                        break;
                     }
+                    tokio::time::sleep(POLL_INTERVAL).await;
                 }
-                assert!(refused, "The state mismatch was never refused");
+                let token = completed.expect("The login never completed after the real redirect");
+                assert_eq!(token.user_id, user.id, "user_id should be the subject");
             })
             .await;
     }
@@ -235,12 +258,12 @@ mod oidc_client_tests {
                     "Verification URI {} is not on the issuer",
                     session.login_url
                 );
-                let user_code = reqwest::Url::parse(&session.login_url)
-                    .expect("The verification URI should be a URL")
-                    .query_pairs()
-                    .find(|(key, _)| key == "code" || key == "user_code")
-                    .map(|(_, value)| value.into_owned())
-                    .expect("The verification URI carries no user code");
+                // RFC 8628 §3.3.1: the session surfaces the code for display,
+                // which is also what a person would approve with.
+                let user_code = session
+                    .user_code
+                    .clone()
+                    .expect("A device session must surface its user code");
 
                 // RFC 8628 §3.5's `authorization_pending` is reported by the trait as
                 // `None`, not a failure.

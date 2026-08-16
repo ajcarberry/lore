@@ -369,6 +369,20 @@ impl OidcFixture {
             })
         };
 
+        // Dial the authorization URL the client actually built, as a browser
+        // would, so the provider sees the real request — response_type,
+        // code_challenge_method and all — before the consent POST below stands
+        // in for the human. A client emitting a request the provider refuses
+        // must fail here, not be papered over by the hand-built consent.
+        let response = self.client.get(authorization_url).send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "authorization endpoint answered {} for {authorization_url}",
+                response.status()
+            )
+            .into());
+        }
+
         let redirect_uri = parameter("redirect_uri")?;
         let state = parameter("state")?;
         let session_cookie = self.login(user).await?;

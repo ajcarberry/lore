@@ -231,6 +231,47 @@ so delete takes that second path and runs *narrower* than the grant — the safe
 than a designed one, since letting any verified identity delete any repository is wider than this
 proposal argues for anywhere else. **Unresolved Questions** asks which it should settle into.
 
+### Elevated permissions from provider groups
+
+Four operations run narrower than the all-repositories grant, each keying on a permission string
+the wildcard resource does not carry: obliterate (`obliterate`), locking as another user
+(`migrate`), releasing another user's lock (`owner`/`admin`), and repository delete's
+creator-ownership fallback. Without an assignment path, the first three are unreachable for every
+OIDC identity — not restricted but inaccessible, with no break-glass short of unsecuring the
+server. The assignment path is the operator's provider groups:
+
+```toml
+[server.auth.oidc]
+groups_claim = "groups"
+
+[server.auth.oidc.permission_groups]
+"lore-admins" = ["obliterate", "migrate"]
+```
+
+Members of a mapped group get the union of the listed permissions on the wildcard resource, on top
+of the ordinary grant. Everything about the mapping fails closed: a token without the claim, a
+wrong-shaped claim, or membership in no mapped group grants nothing; a permission name outside the
+enumerated set (`obliterate`, `migrate`, `owner`, `admin`) fails start-up validation, because a typo
+that silently grants nothing is how an operator discovers the mapping at the worst time; and the two
+fields are validated together, each requiring the other.
+
+The claim is read from the **verified ID token only** — the userinfo endpoint is deliberately not
+consulted, because a per-request fetch would end the design's statelessness and a cached one needs a
+caching design of its own (the per-repository follow-up LEP owns that trade, which every surveyed
+implementation eventually confronted: providers routinely omit group claims from ID tokens unless
+configured to include them). The operator's provider must therefore be configured to put the claim
+in the ID token, and the client has to request whatever scope makes that happen: the server
+advertises it on the auth URL (`oidc+https://…?client_id=lore&scope=groups`), derived from
+`groups_scope` and falling back to the claim name, so only a deployment that maps groups ever
+requests a scope the provider may not define, and the operator controls its spelling. The scope
+rides the existing advertisement mechanism; an older client ignores the parameter and its users
+simply carry no elevated permissions.
+
+This narrows one sentence in **Security Considerations**: with a mapping configured, the named
+claim steers the *enumerated elevated permissions* — an operator opt-in with a bounded blast
+radius, not a general claim policy. A deployment that maps no groups reads no claim beyond the
+required set, exactly as before.
+
 ### The enforcement points (Goal 4)
 
 Every plug point that admits a request already holds a verifier, and this proposal adds and moves
@@ -499,7 +540,9 @@ the phase that documents it; flows not yet landed report `NotSupported`.
 **The trust model changes in one specific way: the operator's provider becomes a trust boundary.** An
 identity the provider admits is an identity Lore admits. That is the point of the feature, and a
 smaller change than it sounds — the server trusts the provider to *authenticate* and nothing more,
-reading no groups and no roles, and it cannot be steered by any claim the provider chooses to add.
+reading no roles and, unless the operator maps `permission_groups`, no groups — absent that
+opt-in, it cannot be steered by any claim the provider chooses to add, and with it, a provider
+claim steers only the enumerated elevated permissions the operator mapped.
 
 **Clock leeway is stated, not inherited:** verification allows 60 seconds on `exp`, written down as
 an explicit decision rather than left to the JWT library's default — a provider-issued token crosses
@@ -768,6 +811,16 @@ produces an error naming the scheme and listing the ones the client knows.
   self-hosted users, where an indefinite wait is indistinguishable from a hung login.
 
 ## Future work
+
+**Repository-level access from provider groups.** `permission_groups` is deliberately shaped to
+grow into the per-repository follow-up LEP: today a group maps to server-wide permission strings on
+the wildcard resource; the natural extension maps a group to resource-scoped grants — repository
+ids or patterns with per-resource permission lists — which is the same `ResourcePermission` shape
+the authorization model already evaluates, populated from configuration instead of a Lore-minted
+token. The follow-up LEP owns three questions this proposal defers: reading groups from the
+userinfo endpoint with a cache (for providers that will not put them in the ID token), nested claim
+paths (`realm_access.roles`), and whether resource-scoped grants replace or refine
+`authorize_all_repositories`.
 
 **Binding tokens to one deployment ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) /
 [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068)).** The design is an opt-in `resource` setting

@@ -19,7 +19,6 @@ pub mod storage;
 pub mod storage_service;
 pub mod thinclient;
 
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -323,22 +322,15 @@ pub fn has_required_permission(
         })
 }
 
+/// Every permission the token grants for `repository`: the union across the
+/// resources that match it, the wildcard among them. Parsing the resource id
+/// into a `RepositoryId` cannot serve this — `urc-*` is not a repository id,
+/// so a parse-and-compare silently loses the wildcard's permissions.
 pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Vec<String> {
-    let user_resources = resources_from_token(get_authorization(extensions).ok());
-    for resource in user_resources {
-        let resource_repository = resource
-            .resource_id
-            .strip_prefix("urc-")
-            .unwrap_or_default();
-        let resource_repository: RepositoryId = Context::from_str(resource_repository)
-            .unwrap_or_default()
-            .into();
-        if resource_repository == repository {
-            return resource.permission;
-        }
-    }
-
-    Vec::new()
+    get_matching_permissions(extensions, repository)
+        .into_iter()
+        .flat_map(|resource| resource.permission)
+        .collect()
 }
 
 pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> {
@@ -484,6 +476,8 @@ impl<T> FilterSlowDownExt<T, MetadataError> for Result<T, MetadataError> {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]
@@ -524,6 +518,30 @@ mod tests {
             get_matching_permissions(&extensions, test_unrelated_repository_context);
         assert_eq!(matched_resources, vec![test_resource_permission]);
         assert_eq!(no_matched_resources, vec![]);
+    }
+
+    /// The wildcard's permissions reach the permission-string checks: OIDC
+    /// group mapping grants `obliterate`/`migrate` on `urc-*`, and
+    /// `can_obliterate`/`is_owner_or_admin` consume `user_permissions` — a
+    /// parse-the-resource-id comparison silently loses them.
+    #[test]
+    fn user_permissions_sees_the_wildcard_resource() {
+        let mut extensions = Extensions::new();
+        let token = AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id: "urc-*".to_string(),
+                permission: vec!["obliterate".to_string(), "migrate".to_string()],
+            }]),
+            ..AuthorizationToken::default()
+        };
+        extensions.insert(token);
+
+        let repository: RepositoryId = Context::from_str("0194b726b34e72b0b45550b88a967076")
+            .unwrap()
+            .into();
+        assert!(can_obliterate(&extensions, repository));
+        assert!(can_admin_lock(&extensions, repository));
+        assert!(!is_owner_or_admin(&extensions, repository));
     }
 
     #[test]

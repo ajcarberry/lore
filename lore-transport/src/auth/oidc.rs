@@ -84,6 +84,20 @@ struct AuthUrlParts {
     /// comparable without normalizing either.
     issuer_domain: String,
     client_id: String,
+    /// Extra scope the server advertised (a group-mapping deployment asks for
+    /// the provider's groups scope this way), appended to [`SCOPES`].
+    extra_scope: Option<String>,
+}
+
+impl AuthUrlParts {
+    /// The scope parameter for every grant: the standard set, plus whatever
+    /// the server advertised.
+    fn scopes(&self) -> String {
+        match &self.extra_scope {
+            Some(extra) => format!("{SCOPES} {extra}"),
+            None => SCOPES.to_string(),
+        }
+    }
 }
 
 /// Splits an advertised auth URL into the issuer and its parameters.
@@ -132,9 +146,11 @@ fn parse_auth_url(auth_url: &str) -> Result<AuthUrlParts, ProtocolError> {
     }
 
     let mut client_id = None;
+    let mut extra_scope = None;
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "client_id" => client_id = Some(value.into_owned()),
+            "scope" => extra_scope = Some(value.into_owned()).filter(|s| !s.is_empty()),
             _ => lore_debug!("Ignoring unknown OIDC auth URL parameter '{key}'"),
         }
     }
@@ -149,6 +165,7 @@ fn parse_auth_url(auth_url: &str) -> Result<AuthUrlParts, ProtocolError> {
         issuer,
         issuer_domain: lore_credential::domain_from_url_or_url(&issuer_url),
         client_id,
+        extra_scope,
     })
 }
 
@@ -274,7 +291,7 @@ fn authorization_url(
             .append_pair("response_type", "code")
             .append_pair("client_id", &parts.client_id)
             .append_pair("redirect_uri", redirect_uri)
-            .append_pair("scope", SCOPES)
+            .append_pair("scope", &parts.scopes())
             .append_pair("state", state)
             .append_pair("nonce", nonce)
             .append_pair("code_challenge", challenge)
@@ -401,7 +418,7 @@ type GrantForm = Vec<(&'static str, String)>;
 fn device_authorization_form(parts: &AuthUrlParts) -> GrantForm {
     vec![
         ("client_id", parts.client_id.clone()),
-        ("scope", SCOPES.to_string()),
+        ("scope", parts.scopes()),
     ]
 }
 
@@ -1371,6 +1388,7 @@ mod tests {
             issuer: "https://id.example.com".to_string(),
             issuer_domain: "id.example.com".to_string(),
             client_id: "lore".to_string(),
+            extra_scope: None,
         }
     }
 
@@ -1414,6 +1432,7 @@ mod tests {
                 issuer: "https://id.example.com".to_string(),
                 issuer_domain: "id.example.com".to_string(),
                 client_id: "lore".to_string(),
+                extra_scope: None,
             }
         );
     }
@@ -1583,6 +1602,38 @@ mod tests {
         let discovery =
             parse_discovery(body, "https://id.example.com").expect("discovery should parse");
         assert_eq!(discovery.device_authorization_endpoint, None);
+    }
+
+    /// A server with group mapping advertises the provider's groups scope on
+    /// the auth URL; both grant requests carry it appended to the standard set.
+    #[test]
+    fn an_advertised_scope_reaches_both_grant_requests() {
+        let parsed = parse_auth_url("oidc+https://id.example.com?client_id=lore&scope=groups")
+            .expect("auth URL with a scope should parse");
+        assert_eq!(parsed.extra_scope.as_deref(), Some("groups"));
+        assert_eq!(parsed.scopes(), format!("{SCOPES} groups"));
+
+        let url = authorization_url(
+            &discovery(),
+            &parsed,
+            "http://127.0.0.1:49152/callback",
+            "the-state",
+            "the-nonce",
+            "the-challenge",
+        )
+        .expect("authorization URL should build");
+        let url = Url::parse(&url).expect("authorization URL should be a URL");
+        let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            query.get("scope").map(String::as_str),
+            Some(format!("{SCOPES} groups").as_str())
+        );
+
+        let form = device_authorization_form(&parsed);
+        assert!(
+            form.contains(&("scope", format!("{SCOPES} groups"))),
+            "the device grant asks for the same scopes: {form:?}"
+        );
     }
 
     #[test]

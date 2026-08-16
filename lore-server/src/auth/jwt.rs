@@ -18,6 +18,7 @@ use tracing::warn;
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
 use crate::auth::jwk::oidc_permits_algorithm;
+use crate::auth::oidc_claims::GroupPermissions;
 use crate::auth::oidc_claims::OidcTokenClaims;
 
 #[serde_as]
@@ -119,6 +120,8 @@ pub struct JwtVerifier {
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<Vec<String>>,
     mode: JwtVerifierMode,
+    /// `[server.auth.oidc.permission_groups]`; read only in OIDC mode.
+    group_permissions: Option<GroupPermissions>,
 }
 
 impl JwtVerifier {
@@ -133,6 +136,7 @@ impl JwtVerifier {
             jwt_issuer,
             jwt_audience,
             mode: JwtVerifierMode::LoreClaims,
+            group_permissions: None,
         }
     }
 
@@ -156,7 +160,16 @@ impl JwtVerifier {
             jwt_issuer: Some(jwt_issuer),
             jwt_audience: Some(jwt_audience),
             mode: JwtVerifierMode::Oidc,
+            group_permissions: None,
         }
+    }
+
+    /// Grant extra permissions to members of named provider groups
+    /// (`[server.auth.oidc.permission_groups]`). Read only in OIDC mode: the
+    /// Lore claim shapes carry their own permissions.
+    pub(crate) fn with_group_permissions(mut self, group_permissions: GroupPermissions) -> Self {
+        self.group_permissions = Some(group_permissions);
+        self
     }
 
     /// Which mode the constructor selected. Read-only: the field is private so
@@ -298,7 +311,9 @@ impl JwtVerifier {
                 warn!("OIDC token names several audiences and azp does not name this client");
                 return Err(JwtVerifierError::AuthorizedPartyMismatch);
             }
-            return Ok(token_data.claims.into());
+            return Ok(token_data
+                .claims
+                .into_authorization_token(self.group_permissions.as_ref()));
         }
 
         if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {

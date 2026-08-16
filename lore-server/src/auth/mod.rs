@@ -5,4 +5,4 @@ pub mod jwk;
 pub mod jwt;
 pub mod jwt_axum_middleware;
 pub mod jwt_interceptor;
-mod oidc_claims;
+pub(crate) mod oidc_claims;

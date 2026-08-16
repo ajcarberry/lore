@@ -82,6 +82,33 @@ A Lore Server with no authentication serves anyone who can reach the port: every
 
     This prints the identity your provider's token carries. `lore auth logout` and `lore auth clear` remove stored tokens.
 
+## Grant elevated permissions (optional)
+
+A few operations require more than the all-repositories grant: obliterating history, locking as
+another user, and releasing another user's lock. Map your provider's groups to them:
+
+```toml
+[server.auth.oidc]
+# ...
+groups_claim = "groups"
+
+[server.auth.oidc.permission_groups]
+"lore-admins" = ["obliterate", "migrate"]
+```
+
+> [!WARNING]
+> The mapped group names are a security boundary. The server trusts the provider's group
+> assignment, so a mapped name must be one only your provider's administrators can hand out:
+> disable self-service group creation or reserve the mapped names, and point `groups_claim` at a
+> claim your provider derives from directory membership, never from a user-editable attribute.
+
+Configure your provider to include the group claim in the ID token (in PocketID, enable **User
+Groups** as a claim for the client); the server asks logins to request the matching scope
+automatically. Members of a mapped group get the listed permissions; everyone else keeps the
+ordinary grant. If your provider names the scope differently from the claim, set `groups_scope`.
+The grantable permissions are listed in the
+[config reference](../reference/lore-server-config.md#authentication).
+
 ## Result
 
 Every repository operation on the server — gRPC, HTTP, and QUIC alike — now requires a valid, unexpired token from your configured issuer. The `/health_check` endpoint stays open, and a client that hasn't logged in gets a clean authentication failure.

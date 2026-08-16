@@ -457,7 +457,7 @@ struct LoopbackRedirect {
 }
 
 /// Binds a loopback listener, per RFC 8252 §7.3's redirection for a native application.
-async fn bind_loopback_redirect() -> Result<LoopbackRedirect, ProtocolError> {
+async fn bind_loopback_redirect(expected_state: String) -> Result<LoopbackRedirect, ProtocolError> {
     let (port_sender, port_receiver) = oneshot::channel();
     let (target_sender, target_receiver) = oneshot::channel();
 
@@ -484,7 +484,7 @@ async fn bind_loopback_redirect() -> Result<LoopbackRedirect, ProtocolError> {
             }
         }
 
-        let _ = target_sender.send(accept_authorization_response(listener).await);
+        let _ = target_sender.send(accept_authorization_response(listener, &expected_state).await);
     });
 
     let port = port_receiver
@@ -501,35 +501,86 @@ async fn bind_loopback_redirect() -> Result<LoopbackRedirect, ProtocolError> {
     })
 }
 
-/// Accepts connections until one carries an authorization response, answering each with a
-/// page the user sees in the browser.
-async fn accept_authorization_response(listener: TcpListener) -> Result<String, String> {
+/// How long one accepted connection may take to deliver its request line. The listener is
+/// serial, so a connection that dials and then sends nothing must not park the login
+/// behind it.
+const READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the browser is left looking at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RedirectPage {
+    Done,
+    Failed,
+    NotFound,
+}
+
+/// Accepts connections until one carries an authorization response **belonging to this
+/// login**, answering each with a page the user sees in the browser.
+///
+/// A connection is not the login: browsers open speculative preconnect sockets, endpoint
+/// agents probe fresh listening ports, and any local process can dial — so connection-level
+/// noise (a silent peer, a read error, a request that is not the redirect) is dropped and
+/// the wait continues. The `state` comparison is what keeps a forged
+/// `/callback?code=…&state=…` from a port-scanning local process from closing the listener
+/// ahead of the real redirect; the poll repeats it before the code is used.
+async fn accept_authorization_response(
+    listener: TcpListener,
+    expected_state: &str,
+) -> Result<String, String> {
     loop {
         let (mut stream, _) = listener
             .accept()
             .await
             .map_err(|e| format!("loopback listener failed: {e}"))?;
 
-        let target = read_request_target(&mut stream).await?;
-        // A browser also asks for a favicon, so only a request carrying an authorization
-        // response ends the wait.
-        let is_response = callback_outcome(&target)
-            .is_ok_and(|outcome| outcome.code.is_some() || outcome.error.is_some());
+        let target = match tokio::time::timeout(
+            READ_REQUEST_TIMEOUT,
+            read_request_target(&mut stream),
+        )
+        .await
+        {
+            Ok(Ok(target)) => target,
+            Ok(Err(e)) => {
+                lore_debug!("Ignoring a loopback connection: {e}");
+                continue;
+            }
+            Err(_) => {
+                lore_debug!("Ignoring a loopback connection that sent no request in time");
+                continue;
+            }
+        };
 
-        respond(&mut stream, is_response).await;
-        if is_response {
+        let outcome = callback_outcome(&target).unwrap_or_default();
+        let belongs_here = outcome.state.as_deref() == Some(expected_state)
+            && (outcome.code.is_some() || outcome.error.is_some());
+        let page = if !belongs_here {
+            RedirectPage::NotFound
+        } else if outcome.error.is_some() {
+            RedirectPage::Failed
+        } else {
+            RedirectPage::Done
+        };
+
+        respond(&mut stream, page).await;
+        if belongs_here {
             return Ok(target);
         }
     }
 }
 
 /// Answers the browser, so the user is left looking at a page rather than a failed request.
-async fn respond(stream: &mut TcpStream, is_response: bool) {
-    const DONE: &str = "Signed in to Lore. You can close this tab and return to the terminal.";
-    let (status, body) = if is_response {
-        ("200 OK", DONE)
-    } else {
-        ("404 Not Found", "Not found.")
+async fn respond(stream: &mut TcpStream, page: RedirectPage) {
+    let (status, body) = match page {
+        RedirectPage::Done => (
+            "200 OK",
+            "Signed in to Lore. You can close this tab and return to the terminal.",
+        ),
+        // The terminal carries the provider's error; this page must not claim success.
+        RedirectPage::Failed => (
+            "200 OK",
+            "Sign-in was not completed. You can close this tab; the terminal has the details.",
+        ),
+        RedirectPage::NotFound => ("404 Not Found", "Not found."),
     };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
@@ -730,12 +781,14 @@ impl OidcAuthentication {
         parts: AuthUrlParts,
         discovery: Discovery,
     ) -> Result<AuthSession, ProtocolError> {
-        let redirect = bind_loopback_redirect().await?;
-        let redirect_uri = format!("http://127.0.0.1:{}{CALLBACK_PATH}", redirect.port);
-
         let verifier = random_token();
         let state = random_token();
         let nonce = random_token();
+
+        // The listener admits only a response carrying this login's `state`, so
+        // it is generated first and handed to the bind.
+        let redirect = bind_loopback_redirect(state.clone()).await?;
+        let redirect_uri = format!("http://127.0.0.1:{}{CALLBACK_PATH}", redirect.port);
         let login_url = authorization_url(
             &discovery,
             &parts,
@@ -1459,6 +1512,49 @@ mod tests {
             error.to_string().contains("nonce"),
             "the refusal has to be the nonce check, got: {error}"
         );
+    }
+
+    /// A stray connection (a browser preconnect, a port scan) and a forged
+    /// callback carrying a guessed state must not end the wait: only this
+    /// login's redirect closes the listener.
+    #[tokio::test]
+    async fn the_listener_outlives_stray_connections_and_forged_callbacks() {
+        use tokio::io::AsyncWriteExt;
+
+        let redirect = bind_loopback_redirect("the-state".to_string())
+            .await
+            .expect("bind the loopback listener");
+        let address = format!("127.0.0.1:{}", redirect.port);
+
+        // A connection that says nothing, then a forged response.
+        drop(
+            tokio::net::TcpStream::connect(&address)
+                .await
+                .expect("stray connect"),
+        );
+        let mut forged = tokio::net::TcpStream::connect(&address)
+            .await
+            .expect("forged connect");
+        forged
+            .write_all(b"GET /callback?code=x&state=guessed HTTP/1.1\r\n\r\n")
+            .await
+            .expect("send the forged callback");
+        drop(forged);
+
+        let mut real = tokio::net::TcpStream::connect(&address)
+            .await
+            .expect("real connect");
+        real.write_all(b"GET /callback?code=the-code&state=the-state HTTP/1.1\r\n\r\n")
+            .await
+            .expect("send the real redirect");
+
+        let target = redirect
+            .target
+            .await
+            .expect("the listener must survive to deliver the real redirect")
+            .expect("the redirect target");
+        assert!(target.contains("state=the-state"), "{target}");
+        assert!(target.contains("code=the-code"), "{target}");
     }
 
     #[test]

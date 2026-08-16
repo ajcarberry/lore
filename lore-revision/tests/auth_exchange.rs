@@ -583,6 +583,46 @@ mod tests {
         );
     }
 
+    /// `OpenID` Connect Core §12.2: a refreshed credential naming a different
+    /// subject is discarded rather than stored under the old identity — a
+    /// provider bug or compromised token endpoint must not rebind a stored
+    /// credential to someone else.
+    #[tokio::test]
+    async fn a_refresh_naming_a_different_subject_is_discarded() {
+        let scheme = "test-refresh-subject-swap";
+        let auth_url = format!("{scheme}://id.example.com");
+        let identity = "user-2";
+        let _auth_dir = isolated_credential_store();
+        let backend = Arc::new(
+            TestAuthentication::oidc_shaped("id.example.com")
+                // `refreshing_to` answers as `user-1`, a different subject.
+                .refreshing_to(&unsigned_jwt("user-1"), Some("refresh-two")),
+        );
+        authentication::add(scheme, backend.clone()).unwrap();
+
+        store_expired_login(&auth_url, identity, Some("refresh-one")).await;
+
+        lore_transport::auth::exchange::exchange(
+            &auth_url,
+            identity,
+            RepositoryId::default(),
+            "repo-a.example.com".to_string(),
+        )
+        .await
+        .expect("best-effort refresh: the operation proceeds on the expired token");
+
+        assert_eq!(
+            backend.exchanged_with(),
+            Some(expired_jwt(identity)),
+            "The swapped-subject credential must not be used"
+        );
+        assert_eq!(
+            stored_authn_token(&auth_url, identity, "repo-a.example.com").await,
+            Some(expired_jwt(identity)),
+            "The swapped-subject credential must not be stored under the old identity"
+        );
+    }
+
     /// An identity whose login can be kept alive is no longer skipped.
     #[tokio::test]
     async fn identity_resolution_refreshes_rather_than_skipping() {

@@ -29,6 +29,17 @@ pub(super) fn tokens_for_auth_service_and_recipient(
 
 type RefreshKey = (String, String);
 
+/// How close to expiry a token is treated as already expired, covering the
+/// exchange round trip it is about to make (bounded by the request timeout)
+/// and client/provider clock skew. Without it a token with seconds left skips
+/// the refresh and then fails the very operation the refresh exists to save.
+const EXPIRY_LEEWAY_MS: u64 = 30_000;
+
+/// Whether `expires_ms` is inside the leeway of expiring.
+fn needs_refresh(expires_ms: u64) -> bool {
+    is_expired(expires_ms.saturating_sub(EXPIRY_LEEWAY_MS))
+}
+
 struct RefreshedToken {
     token: String,
     expires_ms: u64,
@@ -63,7 +74,7 @@ pub(super) async fn unexpired_authn_token(
     identity: &str,
     recipient_domain: &str,
 ) -> String {
-    if !is_expired(stored.expires) {
+    if !needs_refresh(stored.expires) {
         return stored.token;
     }
     lore_debug!("Authentication token for {identity} has expired, trying the refresh grant");
@@ -77,13 +88,23 @@ pub(super) async fn unexpired_authn_token(
 /// Best-effort: `None` when no refresh token is stored or the provider
 /// refuses, leaving the caller with the token it already had. One attempt,
 /// no retry loop.
+///
+/// The caller must already have passed the recipient guard for
+/// `(auth_domain, recipient_domain)`: the store re-read filters on it, but the
+/// recorded last result and the grant itself are keyed on identity alone.
 pub(super) async fn refreshed_authn_token(
     auth_url: &str,
     auth_domain: &str,
     identity: &str,
     recipient_domain: &str,
 ) -> Option<String> {
-    let key = (auth_url.to_string(), identity.to_string());
+    // Normalized exactly as the token store normalizes its own key, so two
+    // spellings of one auth URL cannot fly two refreshes and double-spend a
+    // single-use refresh token.
+    let key = (
+        auth_url.trim_end_matches('/').to_string(),
+        identity.to_string(),
+    );
 
     // One refresh per key at a time: the grant spends a single-use token, so
     // two callers racing on the same expiry would spend it twice. Unrelated
@@ -99,7 +120,7 @@ pub(super) async fn refreshed_authn_token(
     {
         let state = refresh_state().lock().await;
         if let Some(last) = state.last_result.get(&key)
-            && !is_expired(last.expires_ms)
+            && !needs_refresh(last.expires_ms)
         {
             lore_debug!("Authentication token for {identity} was already refreshed");
             return Some(last.token.clone());
@@ -114,7 +135,7 @@ pub(super) async fn refreshed_authn_token(
         ),
     )
     .await
-        && !is_expired(info.expires)
+        && !needs_refresh(info.expires)
     {
         lore_debug!("Authentication token for {identity} was refreshed while waiting");
         return Some(info.token);
@@ -140,6 +161,14 @@ pub(super) async fn refreshed_authn_token(
         return None;
     }
 
+    // OpenID Connect Core §12.2: the refreshed credential must belong to the
+    // subject that logged in. A provider bug or compromised token endpoint
+    // must not silently rebind the stored identity to someone else.
+    if refreshed.user_id != identity {
+        lore_warn!("The refreshed token names a different subject than {identity}; discarding it");
+        return None;
+    }
+
     // Record before storing: if the store write fails, the next caller reuses
     // this result instead of spending a refresh token that is already gone.
     {
@@ -161,7 +190,9 @@ pub(super) async fn refreshed_authn_token(
     )
     .await
     {
-        // Stored, so the record — a bearer token — need not outlive this call.
+        // Stored, so the record — a bearer token — is dropped; only a failed
+        // store write keeps it, to spare the next caller an already-spent
+        // refresh token.
         Ok(()) => {
             refresh_state().lock().await.last_result.remove(&key);
         }

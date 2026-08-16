@@ -259,6 +259,10 @@ pub(crate) fn http_client() -> Result<&'static reqwest::Client, JWKServiceError>
         .user_agent(user_agent())
         .connect_timeout(JWKS_CONNECT_TIMEOUT)
         .timeout(JWKS_REQUEST_TIMEOUT)
+        // Key material and the documents that locate it must come from the
+        // origin they were requested from: a redirect could otherwise carry
+        // either across origins or down to plaintext.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| {
             warn!("Failed to construct HTTP client: {e:?}");

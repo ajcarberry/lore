@@ -37,6 +37,30 @@ pub(crate) enum DiscoveryError {
         "discovery document issuer {actual:?} does not match the configured issuer {expected:?}"
     )]
     IssuerMismatch { expected: String, actual: String },
+    #[error("discovery document jwks_uri {0:?} must be https, or http to a loopback host")]
+    JwksUriRefused(String),
+}
+
+/// Whether a `jwks_uri` may be fetched: https, or http only to a loopback host.
+/// The document is remote input, and the keys it points at are the trust root,
+/// so a hostile document must not be able to route the key fetch to a plaintext
+/// endpoint or a non-HTTP scheme (the JWKS fetcher honors `file://` for the
+/// operator's explicit escape hatch, which a provider must not reach).
+fn jwks_uri_permitted(jwks_uri: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(jwks_uri) else {
+        return false;
+    };
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
 }
 
 /// The discovery document URL for an issuer (Discovery §4). The `.well-known`
@@ -60,8 +84,11 @@ fn discovery_fetch_error(error: JWKServiceError) -> DiscoveryError {
 /// Fetch and validate the discovery document for `issuer`.
 ///
 /// The document's own `issuer` member must equal the configured issuer byte for
-/// byte (Discovery §4.3), so a redirect or a compromised well-known path cannot
-/// point the server at somebody else's key set.
+/// byte (Discovery §4.3), which refuses a *different provider's* genuine
+/// document. A forged response echoes the configured issuer, so the pin is
+/// paired with two checks on what a forger could smuggle: the shared client
+/// follows no redirects, and the returned `jwks_uri` is held to
+/// https-or-loopback before it becomes the key endpoint.
 pub(crate) async fn fetch_discovery_document(
     issuer: &str,
 ) -> Result<DiscoveryDocument, DiscoveryError> {
@@ -87,13 +114,22 @@ pub(crate) async fn fetch_discovery_document(
         return Err(DiscoveryError::HttpStatus(status.as_u16()));
     }
 
-    let document: DiscoveryDocument = serde_json::from_str(&body)?;
+    let document: DiscoveryDocument = serde_json::from_str(&body).inspect_err(|e| {
+        warn!(
+            "could not parse the discovery document from {url}: {e}, response: {}",
+            body_excerpt(&body)
+        );
+    })?;
 
     if document.issuer != issuer {
         return Err(DiscoveryError::IssuerMismatch {
             expected: issuer.to_string(),
             actual: document.issuer,
         });
+    }
+
+    if !jwks_uri_permitted(&document.jwks_uri) {
+        return Err(DiscoveryError::JwksUriRefused(document.jwks_uri));
     }
 
     Ok(document)
@@ -163,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn fetches_and_returns_jwks_uri_when_issuer_matches() {
         let (_address, issuer) = spawn_discovery_server(
-            |issuer| json!({ "issuer": issuer, "jwks_uri": "http://issuer.invalid/jwks.json" }),
+            |issuer| json!({ "issuer": issuer, "jwks_uri": "https://issuer.invalid/jwks.json" }),
         )
         .await;
 
@@ -171,7 +207,55 @@ mod tests {
             .await
             .expect("discovery succeeds");
 
-        assert_eq!(document.jwks_uri, "http://issuer.invalid/jwks.json");
+        assert_eq!(document.jwks_uri, "https://issuer.invalid/jwks.json");
+    }
+
+    #[tokio::test]
+    async fn a_loopback_http_jwks_uri_is_accepted() {
+        let (_address, issuer) = spawn_discovery_server(
+            |issuer| json!({ "issuer": issuer, "jwks_uri": "http://127.0.0.1:9/jwks.json" }),
+        )
+        .await;
+
+        let document = fetch_discovery_document(&issuer)
+            .await
+            .expect("a loopback http jwks_uri is a dev fixture, not a downgrade");
+
+        assert_eq!(document.jwks_uri, "http://127.0.0.1:9/jwks.json");
+    }
+
+    #[tokio::test]
+    async fn a_file_scheme_jwks_uri_is_refused() {
+        let (_address, issuer) = spawn_discovery_server(
+            |issuer| json!({ "issuer": issuer, "jwks_uri": "file:///etc/passwd" }),
+        )
+        .await;
+
+        let error = fetch_discovery_document(&issuer)
+            .await
+            .expect_err("a document must not route the key fetch to a local file");
+
+        assert!(
+            matches!(error, DiscoveryError::JwksUriRefused(_)),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plaintext_non_loopback_jwks_uri_is_refused() {
+        let (_address, issuer) = spawn_discovery_server(
+            |issuer| json!({ "issuer": issuer, "jwks_uri": "http://issuer.invalid/jwks.json" }),
+        )
+        .await;
+
+        let error = fetch_discovery_document(&issuer)
+            .await
+            .expect_err("keys must not be fetched over plaintext off the host");
+
+        assert!(
+            matches!(error, DiscoveryError::JwksUriRefused(_)),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

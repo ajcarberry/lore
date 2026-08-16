@@ -209,7 +209,9 @@ fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigErro
 
 /// Whether a host is this machine. `localhost` counts: it resolves to a loopback
 /// address. Deliberately duplicates the rule `lore-transport` applies to an
-/// `oidc+http` auth URL; the crates share no home for it.
+/// `oidc+http` auth URL: this copy governs a config-file issuer and that one a
+/// remote-supplied auth URL, and coupling nine lines across the crate boundary
+/// buys less than it costs.
 fn is_loopback_host(host: Option<Host<&str>>) -> bool {
     match host {
         Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
@@ -261,6 +263,14 @@ fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> 
              in the clear, and anyone on the path could choose them",
             oidc.issuer
         )));
+    }
+
+    if oidc.client_id.is_empty() {
+        return Err(config::ConfigError::Message(
+            "server.auth.oidc.client_id must not be empty: it is the audience every \
+             token is checked against and the client id every login is started with"
+                .to_string(),
+        ));
     }
 
     if !oidc.authorize_all_repositories {
@@ -700,9 +710,10 @@ mod tests {
             assert!(validate_oidc_config(&settings_with_oidc("")).is_ok());
         }
 
-        /// `authorize_all_repositories` has no default: a block that omits it, or
-        /// sets it `false`, must refuse to start rather than verify every token
-        /// and then deny every request.
+        /// `authorize_all_repositories` must be written down: the serde default
+        /// fills `false` for an omitted flag, and validation refuses `false`, so
+        /// a block that does not acknowledge the grant refuses to start rather
+        /// than verify every token and then deny every request.
         #[test]
         fn an_unacknowledged_grant_fails_validation() {
             for flag_line in ["", "authorize_all_repositories = false"] {
@@ -720,6 +731,23 @@ mod tests {
                     "{error}"
                 );
             }
+        }
+
+        /// An empty client id would build a verifier with audience `[""]` and an
+        /// advertised login URL naming no client — a startup misconfiguration
+        /// that must not surface as a per-user login failure.
+        #[test]
+        fn an_empty_client_id_fails_validation() {
+            let settings = settings_with_oidc(
+                r#"
+                [server.auth.oidc]
+                issuer = "https://id.example.com"
+                client_id = ""
+                authorize_all_repositories = true
+                "#,
+            );
+            let error = validate_oidc_config(&settings).expect_err("must fail closed");
+            assert!(error.to_string().contains("client_id"), "{error}");
         }
     }
 

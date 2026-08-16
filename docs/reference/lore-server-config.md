@@ -203,7 +203,7 @@ endpoint = "https://accounts.example.com/.well-known/jwks.json"
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `issuer` | none (required) | The provider's issuer identifier, exactly as it publishes it — the same string it puts in the `iss` claim. It must carry no query or fragment. |
+| `issuer` | none (required) | The provider's issuer identifier, exactly as it publishes it — the same string it puts in the `iss` claim. It must carry no query or fragment, and it must be `https`, or `http` only for a loopback host: discovery and the signing keys are fetched from it, so a plaintext issuer off the host fails startup validation. |
 | `client_id` | none (required) | The public client id registered for Lore with the provider. |
 | `authorize_all_repositories` | none (required) | A configured block that omits this, or sets it to `false`, fails startup validation: a verified token authorizes every repository on the server, and per-repository authorization from provider claims is not implemented, so an operator has to say explicitly that the coarse grant is what they want. |
 

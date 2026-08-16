@@ -117,8 +117,10 @@ authorize_all_repositories = true
 it puts in the `iss` claim — and `client_id` is the public client registered for Lore. Both are
 required when the block is present.
 
-`authorize_all_repositories` has **no default**: a block that omits it, or sets it `false`, fails
-start-up validation with a message saying per-repository authorization is not implemented. This
+`authorize_all_repositories` must be written down explicitly: a block that omits it (the serde
+default fills in `false`) or sets it `false` fails start-up validation with a message saying
+per-repository authorization is not implemented — so no configuration starts without the operator
+having acknowledged the grant. This
 proposal offers one authorization mode and it is a coarse one, so an operator has to write down that
 they want it. Both defaults would be wrong — `true` grants every repository to every authenticated
 identity on the strength of an omission, and `false` starts a server that verifies every token and
@@ -138,9 +140,13 @@ reads exactly two members: `issuer`, which must equal the configured issuer byte
 `jwks_uri`, which becomes the endpoint the existing key-set service already fetches, caches,
 throttles, and rotates keys under. Nothing else. The endpoints a login flow uses are the client's
 business, and the client fetches the same document for itself, so the server never relays a
-provider's endpoints and cannot serve them stale. The issuer equality check is what makes fetching a
-discovery URL safe: without it, a redirect or a compromised well-known path could point the server at
-somebody else's key set, and the server would verify forged tokens against it.
+provider's endpoints and cannot serve them stale. Three checks together make fetching a discovery
+URL safe, and each defends against a different substitution: the issuer equality check refuses a
+*different provider's genuine* document (the mix-up case — it cannot refuse a forged response,
+whose author simply echoes the configured issuer); the fetch follows no redirects, so the document
+must come from the issuer's own origin; and the returned `jwks_uri` is held to the same
+https-or-loopback rule as the issuer, so even a hostile document cannot point the key fetch at a
+plaintext endpoint or a local file.
 
 This is the whole answer to PR #22's coupling objection. The server holds one provider-specific
 string and it is configuration — no per-provider code path, no per-provider claim policy, no release
@@ -165,9 +171,12 @@ two claim structs, both demanding the Lore-specific `env`, `name`, and `preferre
 correctly signed token naming the right audience is refused at deserialization before authorization
 is reached. A third and final decode reads only what
 [RFC 7519](https://www.rfc-editor.org/rfc/rfc7519) and Core guarantee — `iss`, `sub`, `aud`, `exp`,
-`iat` — treats `name`, `preferred_username`, and `email` as optional, and falls back to `sub` for
+`iat` — treats `name` and `preferred_username` as optional, and falls back to `sub` for
 display. It tests `aud` for membership rather than equality, because Core §2 defines it as an array
-and providers differ over collapsing a single-element one to a bare string. This is additive rather
+and providers differ over collapsing a single-element one to a bare string; when `aud` names more
+than one audience, Core §3.1.3.7 steps 4–5 apply, and a token whose `azp` is absent or names a
+different client is refused — without that check, a provider configured to put Lore's client id in
+another application's audience would make that application's tokens open every repository here. This is additive rather
 than a widening for two reasons: the new decode runs only once both existing decodes have failed,
 which today is an outright rejection, and it is gated on the OIDC block, so a `ucs-auth` deployment
 accepts exactly what it accepts today.
@@ -295,7 +304,12 @@ complete when that flow's redirect goes to a loopback listener on *this* host. S
 two ceremonies is the one trait change: `start_auth_session` gains a `LoginFlow` argument, whose
 value comes from the existing `--no-browser` flag, and `ucs-auth` ignores it.
 
-**Staying logged in** is the refresh grant, requested with the `offline_access` scope.
+**Staying logged in** is the refresh grant, requested with the `offline_access` scope. The
+authorization request deliberately omits `prompt=consent`, which Core §11 names as the condition for
+offline access absent other provider policy: sending it would put a consent screen in front of every
+login, and the providers this targets issue refresh tokens to a public client without it. A provider
+that instead silently drops the scope leaves a session lasting one token lifetime — the assumption
+recorded under **Risks and Assumptions**.
 `AuthenticationToken.refresh_token` and the credential store's refresh-token slot already exist and
 already treat refresh tokens as separately stored and rotated, so this fills in an implementation
 rather than extending a mechanism. A refreshed response need not carry an ID token (Core §12.2), so
@@ -504,8 +518,8 @@ is checked before the code is used and `nonce` after, so neither a cross-session
 replayed token is accepted. The [OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700) is
 the shape of all of this. The device flow's surface is the user rather than the protocol — its
 premise, approving on one device something initiated on another, is the premise a phishing message
-needs too — and RFC 8628 §5.1 and §5.2's mitigations are limited to printing the user code for
-comparison and honoring `interval` and `slow_down`. It stays opt-in behind `--no-browser`.
+needs too — and RFC 8628 §3.3.1 and §5.4's mitigations are limited to displaying the user code for
+comparison and honoring `interval` and `slow_down` (§3.5). It stays opt-in behind `--no-browser`.
 
 **Refresh tokens are the longest-lived secret this design stores**, and they go where Lore's tokens
 already go: the existing credential store, encrypted, with the OS keyring holding the key, and
@@ -558,9 +572,10 @@ clear` already remove stored tokens, and refresh tokens go with them.
   is therefore verifiable by the existing verifier — *invalidated if:* a provider encrypts ID tokens
   by default, or issues them with an `aud` the server cannot pin.
 - **Assumption:** providers grant `offline_access`, or issue refresh tokens by default, to a public
-  native client — *invalidated if:* a deployment's provider refuses, leaving a session that lasts one
-  ID-token lifetime and a user who re-runs `lore login`, which the CLI has to say clearly rather than
-  failing opaquely.
+  native client without `prompt=consent` (which this design omits to keep a consent screen out of
+  every login; Core §11) — *invalidated if:* a deployment's provider refuses, leaving a session that
+  lasts one ID-token lifetime and a user who re-runs `lore login`, which the CLI has to say clearly
+  rather than failing opaquely.
 - **Assumption:** an all-repositories grant is useful to real self-hosted operators, most of whom run
   one team's repositories on one server — *invalidated if:* early feedback says the coarse grant is
   unusable, which makes the per-repository follow-up a prerequisite rather than a successor.

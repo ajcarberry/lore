@@ -16,7 +16,7 @@ A Lore Server with no authentication serves anyone who can reach the port: every
 
     - **Public client** enabled, with no client secret.
     - **PKCE** enabled.
-    - A callback address of `http://127.0.0.1:*/callback`, where the browser login's loopback listener receives the redirect. PocketID accepts a wildcard port; other providers may need a fixed port or a range.
+    - A callback address of `http://127.0.0.1:*/callback`, where the browser login's loopback listener receives the redirect. Use the IP literal, not `localhost`, and allow **any port**: the CLI listens on a kernel-assigned port (RFC 8252 §7.3), so a fixed-port registration will not match. PocketID accepts the wildcard-port form; a provider that requires exact redirect-URI matches needs its loopback handling consulted.
 
     Set the ID-token lifetime in minutes, not hours. Lore presents that token and holds no revocation list, so a verified token works until it expires — a short lifetime bounds how long a revoked user keeps access. Clients refresh without prompting, so it costs users nothing.
 

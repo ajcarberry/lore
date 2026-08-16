@@ -557,6 +557,22 @@ key, never from the token header — the existing pin, tested against a forgery 
 public modulus as an HMAC secret — and OIDC mode refuses symmetric algorithms outright, closing the
 case of a provider publishing a symmetric secret in its own key set.
 
+None of these pins is configurable off, and the audience pin is paired with the `azp` rule for
+multi-audience tokens — worth stating as a posture, because the two deployed systems closest to
+this model shipped weaker: Argo CD accepted tokens minted for unrelated applications for four years
+([CVE-2023-22482](https://github.com/argoproj/argo-cd/security/advisories/GHSA-q9hr-j4rf-8fjc),
+CVSS 9.0), and Grafana's provider-JWT mode left issuer and audience as opt-in configuration that
+[silently failed open](https://github.com/grafana/grafana/issues/58231).
+
+**Identity is `sub`, and only `sub`.** The subject identifier is the one claim `OpenID` Connect
+guarantees stable and unique per issuer (Core §5.7); email and username claims are mutable,
+reusable, and in some providers attacker-influenced — Grafana keyed identity on the email claim and
+it was a CVSS 9.4 account takeover
+([CVE-2023-3128](https://github.com/grafana/bugbounty/security/advisories/GHSA-gxh2-6vvc-rrgp)).
+Here `sub` keys the credential store, the creator record, lock ownership, and the log span;
+`name`/`preferred_username` are display-only fallbacks that never enter a comparison. A future
+contributor "improving" display handling must not change that.
+
 **The all-repositories grant is the sharpest edge here, and it is stated plainly.** Every identity
 the provider admits can read and write every repository on the server: no per-repository distinction,
 no read-only identity, no administrative separation. Because the wildcard reaches every consumer, a
@@ -770,7 +786,43 @@ produces an error naming the scheme and listing the ones the client knows.
   ([authentication reference](https://kubernetes.io/docs/reference/access-authn-authz/authentication/)),
   and pushes the flows out to the client — the same split, at a much larger scale, and the strongest
   evidence that direct verification does not couple a server to providers. Worth avoiding: the group
-  and username claim mapping bolted on top, and the configuration surface that grew around it.
+  and username claim mapping bolted on top, and the configuration surface that grew around it. Two
+  of its migrations are adopted here directly: audiences as a list, because
+  [KEP-3331](https://github.com/kubernetes/enhancements/blob/master/keps/sig-auth/3331-structured-authentication-configuration/README.md)
+  spent five releases escaping a scalar audience that made client-id rotation a flag day, and
+  asynchronous authenticator initialization, because coupling the API server's startup to the
+  provider's availability proved wrong in operation. Kubernetes does not validate `azp`; this
+  proposal does.
+- **Argo CD — the cautionary tale for this exact model.** Argo CD also accepts the provider's ID
+  token as its bearer credential, and shipped without audience validation:
+  [CVE-2023-22482](https://github.com/argoproj/argo-cd/security/advisories/GHSA-q9hr-j4rf-8fjc)
+  (CVSS 9.0) meant a token minted for *any other application* at the same provider was accepted.
+  The mandatory audience pin, the `azp` rule, and the refusal to make either configurable-off are
+  this proposal's answer. Two smaller contrasts: Argo CD's loopback listener hardcodes a port the
+  operator must pre-register, where RFC 8252 §7.3's kernel-assigned port needs no registration
+  beyond the loopback address; and lacking a device grant, its headless fallback is a locally-minted
+  API key whose default lifetime is *never* — the credential shape this proposal's device grant
+  exists to avoid.
+- **Grafana's `auth.jwt`.** The closest precedent for provider-JWT-as-bearer-credential — and its
+  issuer and audience checks are opt-in configuration, which
+  [failed open](https://github.com/grafana/grafana/issues/58231) when a config key was misspelled
+  in the defaults. Pins that cannot be turned off, and validation that refuses unknown
+  configuration, are the lesson taken.
+- **MinIO — the exchange model.** MinIO never lets the provider's token touch the data path: one
+  STS exchange mints temporary native credentials
+  ([AssumeRoleWithWebIdentity](https://github.com/minio/minio/blob/master/docs/sts/web-identity.md)).
+  That is the principled alternative to this proposal's ID-token-as-bearer compromise, at the cost
+  of a minting endpoint and its key discipline — the same trade rejected with the broker. Adopted
+  from it instead: reactive key-set refresh on verification failure rather than polling, which this
+  tree already did.
+- **Gitea and Forgejo.** OIDC there is a login source minting a session, never an API credential —
+  the model a web application wants and a stateless multi-protocol server does not. Their issue
+  history is the strongest argument for two choices here: issuer strings are compared byte for byte
+  and never normalized (trailing-slash "fixes" broke real providers on both forks), and claim
+  mapping is the dominant source of operational pain (admin lockouts from claim-processing order,
+  scope settings silently overriding each other), which is why this proposal reads no claims beyond
+  the required set unless an operator maps `permission_groups` — and why that mapping enumerates
+  its permissions and fails closed.
 - **`gh`, and the device grant as the headless default.** GitHub's CLI logs in with the device
   authorization grant, printing a code to enter on another device
   ([gh auth login](https://cli.github.com/manual/gh_auth_login)) — the closest analogue to

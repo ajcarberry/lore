@@ -62,7 +62,6 @@ class PocketIdClient:
         path: str,
         body=None,
         headers: dict | None = None,
-        form: bool = False,
         admin: bool = False,
     ) -> tuple[int, dict, dict]:
         request_headers = dict(headers or {})
@@ -71,12 +70,8 @@ class PocketIdClient:
 
         data = None
         if body is not None:
-            if form:
-                data = urllib.parse.urlencode(body).encode()
-                request_headers["Content-Type"] = "application/x-www-form-urlencoded"
-            else:
-                data = json.dumps(body).encode()
-                request_headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode()
+            request_headers["Content-Type"] = "application/json"
 
         request = urllib.request.Request(
             self.base_url + path, data=data, headers=request_headers, method=method
@@ -230,12 +225,18 @@ def pocket_id():
     """A ready PocketID with the shared OIDC client registered.
 
     Skips rather than fails when the container is not up, so the rest of the suite
-    still runs on a machine without the compose stack.
+    still runs on a machine without the compose stack — unless
+    ``LORE_TEST_REQUIRE_POCKET_ID`` is set (CI sets it), in which case an
+    unreachable provider is a failure: a skip is green, and green must mean the
+    OIDC smoke tests actually ran.
     """
     client = PocketIdClient()
+    required = os.environ.get("LORE_TEST_REQUIRE_POCKET_ID")
     try:
-        client.wait_until_ready(retries=5)
+        client.wait_until_ready(retries=30 if required else 5)
     except PocketIdError as e:
+        if required:
+            raise
         pytest.skip(str(e))
 
     client.ensure_client()

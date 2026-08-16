@@ -1,6 +1,6 @@
-# Secure a Lore server with OpenID Connect
+# Secure a Lore Server with OpenID Connect
 
-A Lore server with no authentication serves anyone who can reach the port: every identity is anonymous, and every repository is readable and writable. Point the server at an OpenID Connect provider to replace that with the directory you already run, so only your provider's users get in. Any conformant provider works; the examples use [PocketID](https://github.com/pocket-id/pocket-id), which is self-hosted and quick to stand up alongside Lore.
+A Lore Server with no authentication serves anyone who can reach the port: every identity is anonymous, and every repository is readable and writable. Point the server at an OpenID Connect provider to replace that with the directory you already run, so only your provider's users get in. Any conformant provider works; the examples use [PocketID](https://github.com/pocket-id/pocket-id), which is self-hosted and quick to stand up alongside Lore.
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ A Lore server with no authentication serves anyone who can reach the port: every
     `issuer` must match the value your provider publishes in its tokens' `iss` claim, byte for byte. The server checks it against the provider's discovery document at startup and refuses to start on a mismatch (unless an explicit `[server.auth.jwk].endpoint` skips the discovery fetch).
 
     > [!IMPORTANT]
-    > `authorize_all_repositories = true` is the entire authorization model this mode offers: any identity your provider admits can read and write **every** repository on the server — no per-repository distinction, no read-only identity, no administrative separation. Run one server per trust boundary. The setting has no default, so omitting it fails startup rather than deciding for you.
+    > `authorize_all_repositories = true` is the entire authorization model this mode offers: any identity your provider admits can read and write **every** repository on the server — no per-repository distinction, no read-only identity, no administrative separation. Run one server per trust boundary. The setting must be written down: omitting it (or setting it `false`) fails startup rather than deciding for you.
 
     > [!NOTE]
     > A token's `aud` claim names the client id, which identifies the application rather than the server. Two deployments that share an issuer and a client id share a credential-store bucket and accept each other's tokens — logging in to one evicts the other's token. Register a distinct client id per deployment.
@@ -87,7 +87,7 @@ A Lore server with no authentication serves anyone who can reach the port: every
 Every repository operation on the server — gRPC, HTTP, and QUIC alike — now requires a valid, unexpired token from your configured issuer. The `/health_check` endpoint stays open, and a client that hasn't logged in gets a clean authentication failure.
 
 > [!NOTE]
-> Your provider owns identity resolution, and this integration reads no directory beyond what a token carries. You can only look up your own identity: passing a user id to `lore auth info` against an OIDC-secured server reports that the provider exposes no such lookup.
+> Your provider owns identity resolution, and this integration reads no directory beyond what a token carries. You can only look up your own identity: passing a user id to `lore auth info` reads the local credential store only, and an id that is not logged in on this machine is echoed back rather than resolved.
 
 ## See also
 

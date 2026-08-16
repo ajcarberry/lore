@@ -575,13 +575,11 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
 
         // The advertised copy exists only here: internal consumers keep reading
         // `self.0.environment`, whose `auth_url` never carries an `oidc+…` scheme.
-        let mut advertised = self.0.environment;
-        if let Some(auth_url) = self.0.advertised_auth_url {
-            let endpoint = advertised.endpoint.get_or_insert_with(Default::default);
-            if endpoint.auth_url.as_deref().unwrap_or_default().is_empty() {
-                endpoint.auth_url = Some(auth_url);
-            }
-        }
+        // A clone rather than a move, so a service added below this point still
+        // reads the internal value by default instead of reaching for the one
+        // variable a move would leave in scope.
+        let advertised =
+            advertised_environment(&self.0.environment, self.0.advertised_auth_url.clone());
         let environment_svc = LoreEnvironmentService::new(advertised.clone());
         let environment_v1_svc = LoreEnvironmentV1Service::new(advertised);
         let lock_svc = match self.0.lock_store {
@@ -818,4 +816,69 @@ pub async fn serve_maintenance(
     lore_spawn_net!(async move { router.serve_with_shutdown(addr, signal).await }).await??;
 
     Ok(())
+}
+
+/// The environment `EnvironmentGet` serves: the internal one, plus the derived
+/// OIDC login URL when the operator left `auth_url` empty. Only the returned
+/// copy carries it — the input stays what internal consumers dial.
+fn advertised_environment(
+    environment: &EnvironmentConfig,
+    advertised_auth_url: Option<String>,
+) -> EnvironmentConfig {
+    let mut advertised = environment.clone();
+    if let Some(auth_url) = advertised_auth_url {
+        let endpoint = advertised.endpoint.get_or_insert_with(Default::default);
+        if endpoint.auth_url.as_deref().unwrap_or_default().is_empty() {
+            endpoint.auth_url = Some(auth_url);
+        }
+    }
+    advertised
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The boundary the OIDC design leans on: the derived login URL reaches the
+    /// advertised copy and only the advertised copy, so every internal
+    /// `auth_url` consumer keeps a dial target of `None`.
+    #[test]
+    fn derived_auth_url_reaches_only_the_advertised_copy() {
+        let environment = EnvironmentConfig::default();
+
+        let advertised = advertised_environment(
+            &environment,
+            Some("oidc+https://id.example.com?client_id=lore".to_string()),
+        );
+
+        assert_eq!(
+            advertised.endpoint.expect("endpoint is filled in").auth_url,
+            Some("oidc+https://id.example.com?client_id=lore".to_string())
+        );
+        assert!(
+            environment.endpoint.is_none(),
+            "the internal environment must stay exactly as configured"
+        );
+    }
+
+    #[test]
+    fn an_explicitly_configured_auth_url_wins_over_the_derived_one() {
+        let environment = EnvironmentConfig {
+            endpoint: Some(lore_transport::Endpoint {
+                auth_url: Some("https://auth.example.com".to_string()),
+                ..Default::default()
+            }),
+            config: None,
+        };
+
+        let advertised = advertised_environment(
+            &environment,
+            Some("oidc+https://id.example.com?client_id=lore".to_string()),
+        );
+
+        assert_eq!(
+            advertised.endpoint.expect("endpoint kept").auth_url,
+            Some("https://auth.example.com".to_string())
+        );
+    }
 }

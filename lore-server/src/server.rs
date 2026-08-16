@@ -63,12 +63,9 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::auth::discovery;
-use crate::auth::jwk::JWKService;
 use crate::auth::jwk::JWKServiceSettings;
 use crate::auth::jwk::JwkServiceImpl;
-use crate::auth::jwk::OidcJwkService;
 use crate::auth::jwt::JwtVerifier;
-use crate::auth::jwt::JwtVerifierMode;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -436,7 +433,7 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
         return Ok(None);
     };
 
-    let (jwt_issuer, jwt_audience, jwk_settings, mode) = if let Some(oidc) = auth.oidc.as_ref() {
+    if let Some(oidc) = auth.oidc.as_ref() {
         let jwk_settings = match auth.jwk.clone() {
             Some(jwk) => jwk,
             None => JWKServiceSettings {
@@ -445,47 +442,41 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
                     .jwks_uri,
             },
         };
-        let jwt_issuer = auth.jwt_issuer.clone().or(Some(oidc.issuer.clone()));
+        let jwt_issuer = auth
+            .jwt_issuer
+            .clone()
+            .unwrap_or_else(|| oidc.issuer.clone());
 
         // The server pins the client id and reads an ID token. An explicit
         // `jwt_audience` still wins.
         let jwt_audience = auth
             .jwt_audience
             .clone()
-            .or_else(|| Some(vec![oidc.client_id.clone()]));
+            .unwrap_or_else(|| vec![oidc.client_id.clone()]);
 
-        (
+        let jwk_service = JwkServiceImpl::new(jwk_settings);
+        jwk_service
+            .fetch_new_keys(None /* fetch all keys */)
+            .await?;
+        return Ok(Some(JwtVerifier::oidc(
+            Arc::new(jwk_service),
             jwt_issuer,
             jwt_audience,
-            jwk_settings,
-            JwtVerifierMode::Oidc,
-        )
-    } else {
-        let Some(jwk) = auth.jwk.as_ref() else {
-            return Ok(None);
-        };
-        (
-            auth.jwt_issuer.clone(),
-            auth.jwt_audience.clone(),
-            jwk.clone(),
-            JwtVerifierMode::LoreClaims,
-        )
-    };
+        )));
+    }
 
-    let jwk_service = JwkServiceImpl::new(jwk_settings);
+    let Some(jwk) = auth.jwk.as_ref() else {
+        return Ok(None);
+    };
+    let jwk_service = JwkServiceImpl::new(jwk.clone());
     jwk_service
         .fetch_new_keys(None /* fetch all keys */)
         .await?;
-
-    let jwk_service: Arc<dyn JWKService> = match mode {
-        JwtVerifierMode::Oidc => Arc::new(OidcJwkService::new(Arc::new(jwk_service))),
-        JwtVerifierMode::LoreClaims => Arc::new(jwk_service),
-    };
-
-    Ok(Some(match mode {
-        JwtVerifierMode::Oidc => JwtVerifier::oidc(jwk_service, jwt_issuer, jwt_audience),
-        JwtVerifierMode::LoreClaims => JwtVerifier::new(jwk_service, jwt_issuer, jwt_audience),
-    }))
+    Ok(Some(JwtVerifier::new(
+        Arc::new(jwk_service),
+        auth.jwt_issuer.clone(),
+        auth.jwt_audience.clone(),
+    )))
 }
 
 /// Derive `auth_url` from `[server.auth.oidc]` when the operator left
@@ -566,21 +557,13 @@ async fn launch_grpc_server(
     // Applied only in the `EnvironmentGet` response (never to `environment`, which is
     // what internal consumers read — the `ReBAC` dial target for repository
     // create/delete): a derived `oidc+https://…` string is not a service any of them
-    // can dial. `None` unless `[server.auth.oidc]` is set and the operator left
-    // `environment.endpoint.auth_url` empty.
+    // can dial. The builder owns the only-if-empty rule, so an explicitly
+    // configured `auth_url` still wins there.
     let advertised_auth_url = settings
         .server
         .auth
         .as_ref()
         .and_then(|auth| auth.oidc.as_ref())
-        .filter(|_| {
-            environment
-                .endpoint
-                .as_ref()
-                .and_then(|endpoint| endpoint.auth_url.as_deref())
-                .unwrap_or_default()
-                .is_empty()
-        })
         .map(derive_oidc_auth_url);
 
     GrpcServerBuilder::new()
@@ -2341,7 +2324,7 @@ mod tests {
             assert_eq!(verifier.jwt_issuer, Some("the-issuer".to_string()));
             assert_eq!(verifier.jwt_audience, Some(vec!["lore".to_string()]));
             assert_eq!(
-                verifier.mode,
+                verifier.mode(),
                 crate::auth::jwt::JwtVerifierMode::LoreClaims,
                 "a jwk-only verifier must not gain the OIDC decode / wildcard grant"
             );
@@ -2373,7 +2356,7 @@ mod tests {
 
             assert_eq!(verifier.jwt_issuer, Some("http://127.0.0.1:1".to_string()));
             assert_eq!(verifier.jwt_audience, Some(vec!["lore-client".to_string()]));
-            assert_eq!(verifier.mode, crate::auth::jwt::JwtVerifierMode::Oidc);
+            assert_eq!(verifier.mode(), crate::auth::jwt::JwtVerifierMode::Oidc);
         }
 
         #[tokio::test]
@@ -2400,7 +2383,7 @@ mod tests {
             assert_eq!(verifier.jwt_issuer, Some(issuer));
             assert_eq!(verifier.jwt_audience, Some(vec!["lore-client".to_string()]));
             assert_eq!(
-                verifier.mode,
+                verifier.mode(),
                 crate::auth::jwt::JwtVerifierMode::Oidc,
                 "a [server.auth.oidc] block accepts ID tokens"
             );
@@ -2408,8 +2391,9 @@ mod tests {
 
         /// A provider that publishes an `oct` key in its own key set publishes a
         /// signing key: anyone who can read the key set can mint a token with it.
-        /// OIDC mode owes that refusal to the `OidcJwkService` wrap this path applies,
-        /// and the RSA key sets the other build tests use cannot tell the two apart.
+        /// The refusal lives inside the verifier, so this pins that a verifier
+        /// built through the real wiring path carries it; the RSA key sets the
+        /// other build tests use cannot tell the two apart.
         #[tokio::test]
         async fn an_oidc_verifier_refuses_a_token_signed_with_a_published_symmetric_key() {
             let (_address, issuer) = spawn_discovery_and_jwks_server(&json!({
@@ -2458,8 +2442,8 @@ mod tests {
                 .await
                 .expect_err("a symmetric key from the provider's key set is not an identity");
             assert!(
-                matches!(error, JwtVerifierError::KeyNotFound(_)),
-                "the key has to be withheld rather than the claims refused, got: {error:?}"
+                matches!(error, JwtVerifierError::SymmetricAlgorithmRefused),
+                "the algorithm has to be refused before any claim is read, got: {error:?}"
             );
         }
 

@@ -158,6 +158,12 @@ impl JwtVerifier {
             mode: JwtVerifierMode::Oidc,
         }
     }
+
+    /// Which mode the constructor selected. Read-only: the field is private so
+    /// the constructors stay the only way to select a mode.
+    pub fn mode(&self) -> JwtVerifierMode {
+        self.mode
+    }
 }
 
 /// Whether a verification failure could be the signing key's fault rather than the

@@ -338,14 +338,11 @@ impl OidcFixture {
 
     /// Fetch the issuer's discovery document.
     pub async fn discovery(&self) -> Result<Value, Box<dyn Error + 'static>> {
-        Ok(serde_json::from_str(
-            &self
-                .client
-                .get(self.url("/.well-known/openid-configuration"))
-                .send()
-                .await?
-                .text()
-                .await?,
-        )?)
+        let response = self
+            .client
+            .get(self.url("/.well-known/openid-configuration"))
+            .send()
+            .await?;
+        Self::json_or_error("/.well-known/openid-configuration", response).await
     }
 }

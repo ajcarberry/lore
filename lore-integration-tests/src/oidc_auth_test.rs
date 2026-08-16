@@ -58,6 +58,17 @@ mod oidc_auth_common {
         fixture: &oidc_common::OidcFixture,
         audience: &str,
     ) -> Result<JwtVerifier, Box<dyn Error>> {
+        let issuer = fixture.issuer().to_string();
+        oidc_jwt_verifier_expecting_issuer(fixture, audience, &issuer).await
+    }
+
+    /// Same, but pinned to `issuer` rather than the fixture's — how the issuer
+    /// check is exercised against a token whose signature and audience pass.
+    pub async fn oidc_jwt_verifier_expecting_issuer(
+        fixture: &oidc_common::OidcFixture,
+        audience: &str,
+        issuer: &str,
+    ) -> Result<JwtVerifier, Box<dyn Error>> {
         let discovery = fixture.discovery().await?;
         let jwks_uri = discovery["jwks_uri"]
             .as_str()
@@ -68,17 +79,18 @@ mod oidc_auth_common {
             endpoint: jwks_uri,
         }));
 
-        // Authn-only mode — this matrix's premise — over a bare `JwkServiceImpl`; production
-        // additionally wraps the key service in `OidcJwkService` via `build_jwt_verifier`.
+        // The symmetric-algorithm refusal lives inside the verifier itself, so
+        // this bare `JwkServiceImpl` carries the same gates production's
+        // `build_jwt_verifier` path does.
         Ok(JwtVerifier::oidc(
             jwk_service,
-            Some(fixture.issuer().to_string()),
-            Some(vec![audience.to_string()]),
+            issuer.to_string(),
+            vec![audience.to_string()],
         ))
     }
 
-    /// A self-signed forgery naming an unknown kid and issuer, standing in for a token
-    /// from another provider.
+    /// A locally-signed forgery naming a kid `PocketID` never issued. Verification dies
+    /// at key lookup, so the claims are irrelevant — only the unknown kid matters.
     pub fn forged_token_with_unknown_kid() -> String {
         use jsonwebtoken::Algorithm;
         use jsonwebtoken::EncodingKey;
@@ -87,22 +99,28 @@ mod oidc_auth_common {
 
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some("attacker-controlled-kid-not-in-pocketid-jwks".to_string());
-        let claims = serde_json::json!({
-            "sub": "attacker",
-            "iss": "https://not-pocket-id.example.invalid",
-            "aud": oidc_common::TEST_CLIENT_ID,
-            "iat": 1,
-            "exp": 9_999_999_999u64,
-            "env": "test",
-            "name": "test",
-            "preferred_username": "test",
-        });
+        let claims = serde_json::json!({ "sub": "attacker" });
         encode(
             &header,
             &claims,
             &EncodingKey::from_secret(b"attacker-controlled-secret"),
         )
         .expect("encode forged token")
+    }
+
+    /// The same token with one bit of its signature changed: real kid, real issuer,
+    /// real claims, wrong signature. The one shape only the signature check refuses.
+    pub fn tamper_signature(token: &str) -> String {
+        let (head, signature) = token.rsplit_once('.').expect("a JWT has three parts");
+        let mut bytes: Vec<u8> = signature.bytes().collect();
+        // A middle character, so the change lands in real signature bits rather
+        // than the base64 tail's padding bits, which decoders may ignore.
+        let middle = bytes.len() / 2;
+        bytes[middle] = if bytes[middle] == b'A' { b'B' } else { b'A' };
+        format!(
+            "{head}.{}",
+            String::from_utf8(bytes).expect("still base64url")
+        )
     }
 }
 
@@ -212,7 +230,7 @@ mod oidc_auth_tests {
     }
 
     #[tokio::test]
-    async fn http_forged_issuer_token_is_rejected() -> TestResult {
+    async fn http_token_signed_by_unknown_key_is_rejected() -> TestResult {
         let fixture = oidc_common::setup().await?;
         let verifier = oidc_jwt_verifier(&fixture, oidc_common::TEST_CLIENT_ID).await?;
         let (base_url, _shutdown) = start_http_server(Some(verifier)).await;
@@ -221,7 +239,7 @@ mod oidc_auth_tests {
         let response = reqwest::Client::new()
             .put(put_content_url(&base_url))
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {forged}"))
-            .body("forged issuer")
+            .body("unknown signing key")
             .send()
             .await?;
 
@@ -229,6 +247,70 @@ mod oidc_auth_tests {
             response.status(),
             reqwest::StatusCode::FORBIDDEN,
             "a token naming a key PocketID never issued must be refused"
+        );
+        Ok(())
+    }
+
+    /// The one shape only the signature check refuses: a genuine `PocketID` token —
+    /// real kid, real issuer, real audience, unexpired — with one changed
+    /// signature bit. Every other rejection test dies earlier (key lookup,
+    /// audience, issuer), so without this nothing proves the signature is
+    /// actually verified.
+    #[tokio::test]
+    async fn http_tampered_signature_token_is_rejected() -> TestResult {
+        let fixture = oidc_common::setup().await?;
+        let verifier = oidc_jwt_verifier(&fixture, oidc_common::TEST_CLIENT_ID).await?;
+        let (base_url, _shutdown) = start_http_server(Some(verifier)).await;
+
+        let user = fixture.create_user("httptampered").await?;
+        let tokens = fixture.issue_token(&user).await?;
+        let tampered = super::oidc_auth_common::tamper_signature(&tokens.id_token);
+
+        let response = reqwest::Client::new()
+            .put(put_content_url(&base_url))
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {tampered}"))
+            .body("tampered signature")
+            .send()
+            .await?;
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "a genuine token with a tampered signature must be refused"
+        );
+        Ok(())
+    }
+
+    /// A real, correctly-signed token against a verifier pinned to a different
+    /// issuer: the `iss` check itself, which no other rejection test reaches.
+    #[tokio::test]
+    async fn http_issuer_mismatch_token_is_rejected() -> TestResult {
+        let fixture = oidc_common::setup().await?;
+        let verifier = super::oidc_auth_common::oidc_jwt_verifier_expecting_issuer(
+            &fixture,
+            oidc_common::TEST_CLIENT_ID,
+            "https://a-different-issuer.example.invalid",
+        )
+        .await?;
+        let (base_url, _shutdown) = start_http_server(Some(verifier)).await;
+
+        let user = fixture.create_user("httpissuermismatch").await?;
+        let tokens = fixture.issue_token(&user).await?;
+
+        let response = reqwest::Client::new()
+            .put(put_content_url(&base_url))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", tokens.id_token),
+            )
+            .body("issuer mismatch")
+            .send()
+            .await?;
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "a token from an issuer other than the pinned one must be refused"
         );
         Ok(())
     }

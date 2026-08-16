@@ -166,6 +166,9 @@ impl JwtVerifier {
     }
 }
 
+/// Clock leeway applied to `exp`/`nbf` during verification, in seconds.
+const CLOCK_LEEWAY_SECONDS: u64 = 60;
+
 /// Whether a verification failure could be the signing key's fault rather than the
 /// token's — the only failures worth re-fetching keys for. Every other failure repeats
 /// against any key, so it must not become a way to ask for network work.
@@ -267,6 +270,11 @@ impl JwtVerifier {
         }
 
         validation.validate_exp = true;
+        // Stated rather than inherited: 60 seconds of clock leeway on `exp`
+        // and `nbf`, jsonwebtoken's default, kept as an explicit decision. A
+        // provider-issued token crosses two clocks the operator does not
+        // control, and no surveyed deployment defends a tighter tolerance.
+        validation.leeway = CLOCK_LEEWAY_SECONDS;
 
         debug!("Decoding JWT token");
 

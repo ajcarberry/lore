@@ -423,8 +423,10 @@ implementation**. Goal 6 → **Keeping the token-recipient guard**. Goal 7 → *
 
 ## Non-Functional Considerations
 
-- **Concurrency** — No new shared mutable state on the server. Discovery runs once at start-up, and
-  key fetches go through the existing key-set service, whose refresh mutex already collapses
+- **Concurrency** — No new shared mutable state on the server beyond the once-resolved discovery
+  handle. Discovery is attempted at start-up and, if the provider is unreachable then, resolved on
+  first use — throttled the way key fetches are, because an unauthenticated caller can drive
+  attempts. Key fetches go through the existing key-set service, whose refresh mutex already collapses
   concurrent misses into one outbound request and whose minimum refresh interval already bounds
   fetches however many unknown key ids arrive — both tested, and both load-bearing here, because an
   unauthenticated caller can present arbitrary key ids. Verification is a pure function of the token
@@ -449,9 +451,12 @@ implementation**. Goal 6 → **Keeping the token-recipient guard**. Goal 7 → *
   runtime the [runtime-split LEP](2026-07-24-tokio-runtime-split-and-async-io.md) established. This
   proposal adds no blocking call and does not worsen the known `block_in_place` in the gRPC
   interceptor, because the all-repositories path takes the identical cached-then-fallback route the
-  resource-claim path takes. The cost is one extra round trip at start-up, before the listeners open;
-  steady-state latency is unchanged, verification on a warm cache being a signature check and claim
-  comparisons with no I/O.
+  resource-claim path takes. The cost is one extra round trip attempted at start-up — the
+  server starts either way, with verification failing closed until discovery succeeds, so its
+  availability is never coupled to the provider's at boot (a self-hosted deployment restarting Lore
+  and its provider together would otherwise deadlock on boot order; Kubernetes resolves its OIDC
+  authenticator asynchronously for the same reason). Steady-state latency is unchanged,
+  verification on a warm cache being a signature check and claim comparisons with no I/O.
 
 ## Migration Plan
 
@@ -495,6 +500,10 @@ the phase that documents it; flows not yet landed report `NotSupported`.
 identity the provider admits is an identity Lore admits. That is the point of the feature, and a
 smaller change than it sounds — the server trusts the provider to *authenticate* and nothing more,
 reading no groups and no roles, and it cannot be steered by any claim the provider chooses to add.
+
+**Clock leeway is stated, not inherited:** verification allows 60 seconds on `exp`, written down as
+an explicit decision rather than left to the JWT library's default — a provider-issued token crosses
+two clocks the operator does not control, and no surveyed deployment defends a tighter tolerance.
 
 **Pinning is what keeps trusting one provider from meaning trusting any provider.** Four pins, each
 on a value the operator configured or the provider published: the discovery document's `issuer` must
@@ -594,9 +603,11 @@ clear` already remove stored tokens, and refresh tokens go with them.
 **Risks**
 
 - **Risk:** a server restarts while the provider is unreachable and comes up with no keys, refusing
-  every request — *mitigation:* the explicit `[server.auth.jwk].endpoint` accepts a `file://` key set
-  (issue #32, PR #44), and within a running process the existing cache means a provider outage does
-  not immediately break verification.
+  every request — *mitigation:* the server starts regardless and resolves discovery on first use, so
+  the outage window is the provider's own rather than a boot-order deadlock; the explicit
+  `[server.auth.jwk].endpoint` accepts a `file://` key set (issue #32, PR #44) as the fully offline
+  escape hatch, and within a running process the existing cache means a provider outage does not
+  immediately break verification.
 - **Risk:** a consumer of `auth_url` other than the client registry is missed, and an `oidc+https`
   URL reaches code expecting an authorization service, failing repository operations against a live
   provider — *materialized during implementation:* the design assumed one such consumer and there are
@@ -746,8 +757,6 @@ produces an error naming the scheme and listing the ones the client knows.
   start, so the per-repository follow-up extends a setting instead of replacing one?
 - Should a single server be able to trust more than one issuer, and if so, does anything here need to
   change now to keep that from being a breaking addition later?
-- Is `jsonwebtoken`'s 60-second default clock leeway the right tolerance for provider-issued tokens,
-  or should the OIDC path set it explicitly?
 - Should `login::with_token` accept a provider-issued token? Its recipient domains come from the
   token's own claims, which for an ID token are a client id and an issuer URL, so the recipient guard
   refuses it and an OIDC deployment has no non-interactive credential path — which is what issue #59

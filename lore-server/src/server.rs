@@ -63,7 +63,7 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::auth::discovery;
-use crate::auth::jwk::JWKServiceSettings;
+use crate::auth::jwk::JWKService;
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
 use crate::grpc::GrpcInternalServerBuilder;
@@ -434,14 +434,6 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
     };
 
     if let Some(oidc) = auth.oidc.as_ref() {
-        let jwk_settings = match auth.jwk.clone() {
-            Some(jwk) => jwk,
-            None => JWKServiceSettings {
-                endpoint: discovery::fetch_discovery_document(&oidc.issuer)
-                    .await?
-                    .jwks_uri,
-            },
-        };
         let jwt_issuer = auth
             .jwt_issuer
             .clone()
@@ -455,12 +447,32 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
             .clone()
             .unwrap_or_else(|| oidc.verification_audiences());
 
-        let jwk_service = JwkServiceImpl::new(jwk_settings);
-        jwk_service
-            .fetch_new_keys(None /* fetch all keys */)
-            .await?;
+        // A provider that is down right now must not prevent startup: a
+        // self-hosted deployment restarting Lore and its provider together
+        // would otherwise deadlock on boot order. Discovery resolves on first
+        // use, and until it succeeds verification fails closed.
+        let jwk_service: Arc<dyn JWKService> = if let Some(jwk) = auth.jwk.clone() {
+            let service = JwkServiceImpl::new(jwk);
+            if let Err(error) = service.fetch_new_keys(None /* fetch all keys */).await {
+                warn!(
+                    "starting without provider keys; verification fails until the key-set \
+                     endpoint is reachable: {error}"
+                );
+            }
+            Arc::new(service)
+        } else {
+            let service = Arc::new(discovery::DiscoveringJwkService::new(oidc.issuer.clone()));
+            if let Err(error) = service.warm().await {
+                warn!(
+                    "starting without provider keys; verification fails until discovery \
+                     for {} succeeds: {error}",
+                    oidc.issuer
+                );
+            }
+            service
+        };
         return Ok(Some(JwtVerifier::oidc(
-            Arc::new(jwk_service),
+            jwk_service,
             jwt_issuer,
             jwt_audience,
         )));
@@ -2331,6 +2343,41 @@ mod tests {
                 crate::auth::jwt::JwtVerifierMode::LoreClaims,
                 "a jwk-only verifier must not gain the OIDC decode / wildcard grant"
             );
+        }
+
+        /// A provider that is down at start-up delays verification, not the
+        /// server: the verifier builds, fails closed, and resolves discovery
+        /// once the provider answers.
+        #[tokio::test]
+        async fn an_unreachable_provider_does_not_prevent_startup() {
+            // Bind and drop, so the port refuses connections quickly.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("reserve a port");
+            let address = listener.local_addr().expect("port address");
+            drop(listener);
+
+            let auth = AuthSettings {
+                jwk: None,
+                jwt_audience: None,
+                jwt_issuer: None,
+                oidc: Some(OidcSettings {
+                    issuer: format!("http://{address}"),
+                    client_id: "lore".to_string(),
+                    audiences: None,
+                    authorize_all_repositories: true,
+                }),
+            };
+
+            let verifier = build_jwt_verifier(Some(&auth))
+                .await
+                .expect("an unreachable provider must not fail startup")
+                .expect("the verifier is still built");
+
+            verifier
+                .verify_token("not-even-a-jwt")
+                .await
+                .expect_err("verification fails closed until discovery succeeds");
         }
 
         /// `jwks_uri` is the only member the discovery document supplies, so an

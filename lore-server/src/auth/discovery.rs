@@ -1,16 +1,29 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! `OpenID` Connect Discovery §4: fetching a provider's
-//! `.well-known/openid-configuration` document at server start-up so
-//! `[server.auth.oidc]` needs only an issuer and a client id.
+//! `.well-known/openid-configuration` document so `[server.auth.oidc]` needs
+//! only an issuer and a client id.
 //!
 //! The server reads two members: `issuer`, checked against the configured
-//! issuer, and `jwks_uri`, which becomes the `JWKService` endpoint.
+//! issuer, and `jwks_uri`, which becomes the `JWKService` endpoint —
+//! resolved through [`DiscoveringJwkService`] on first use, so a provider
+//! that is down when the server starts delays verification instead of
+//! preventing startup.
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
+
+use async_trait::async_trait;
+use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::auth::jwk::JWKService;
 use crate::auth::jwk::JWKServiceError;
+use crate::auth::jwk::JWKServiceSettings;
+use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwk::body_excerpt;
 use crate::auth::jwk::http_client;
 use crate::auth::jwk::read_capped_body;
@@ -134,6 +147,103 @@ pub(crate) async fn fetch_discovery_document(
     Ok(document)
 }
 
+/// Shortest interval between discovery attempts after a failure. Verification
+/// requests arrive from unauthenticated callers, so a down provider must not
+/// turn every bad token into an outbound discovery fetch.
+const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A `JWKService` that resolves the provider's `jwks_uri` through discovery on
+/// first use rather than at construction.
+///
+/// The server's availability must not be coupled to the provider's at start-up
+/// — a self-hosted deployment restarting Lore and its provider together is a
+/// boot-order deadlock otherwise. Until discovery succeeds, every lookup fails
+/// and verification therefore fails closed; once it succeeds, the resolved
+/// service is permanent and this wrapper is a pointer indirection.
+pub(crate) struct DiscoveringJwkService {
+    issuer: String,
+    resolved: OnceLock<Arc<JwkServiceImpl>>,
+    /// Serializes resolution attempts and records when the last one failed.
+    attempt: tokio::sync::Mutex<Option<Instant>>,
+    retry_interval: Duration,
+}
+
+impl DiscoveringJwkService {
+    pub(crate) fn new(issuer: String) -> Self {
+        Self {
+            issuer,
+            resolved: OnceLock::new(),
+            attempt: tokio::sync::Mutex::new(None),
+            retry_interval: DISCOVERY_RETRY_INTERVAL,
+        }
+    }
+
+    /// The resolved key service, running discovery if no attempt has succeeded
+    /// yet. Failed attempts are throttled to [`DISCOVERY_RETRY_INTERVAL`].
+    async fn resolve(&self) -> Result<Arc<JwkServiceImpl>, JWKServiceError> {
+        if let Some(inner) = self.resolved.get() {
+            return Ok(inner.clone());
+        }
+
+        let mut attempt = self.attempt.lock().await;
+        // A concurrent caller may have resolved while this one waited.
+        if let Some(inner) = self.resolved.get() {
+            return Ok(inner.clone());
+        }
+        if let Some(last_failure) = *attempt
+            && last_failure.elapsed() < self.retry_interval
+        {
+            return Err(JWKServiceError::InternalError);
+        }
+
+        match fetch_discovery_document(&self.issuer).await {
+            Ok(document) => {
+                let service = Arc::new(JwkServiceImpl::new(JWKServiceSettings {
+                    endpoint: document.jwks_uri,
+                }));
+                *attempt = None;
+                Ok(self.resolved.get_or_init(|| service).clone())
+            }
+            Err(error) => {
+                warn!(
+                    "OIDC discovery for {} has not succeeded yet; token verification fails \
+                     until the provider is reachable: {error}",
+                    self.issuer
+                );
+                *attempt = Some(Instant::now());
+                Err(JWKServiceError::InternalError)
+            }
+        }
+    }
+
+    /// Startup warm-up: resolve discovery and prefetch the key set. Failure is
+    /// the caller's to log — the server starts either way.
+    pub(crate) async fn warm(&self) -> Result<(), JWKServiceError> {
+        self.resolve().await?.fetch_new_keys(None).await
+    }
+}
+
+#[async_trait]
+impl JWKService for DiscoveringJwkService {
+    async fn get_key(
+        &self,
+        kid: &str,
+    ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
+        self.resolve().await?.get_key(kid).await
+    }
+
+    fn get_cached_key(&self, kid: &str) -> Option<(DecodingKey, jsonwebtoken::Algorithm)> {
+        self.resolved.get()?.get_cached_key(kid)
+    }
+
+    async fn refresh_key(
+        &self,
+        kid: &str,
+    ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError> {
+        self.resolve().await?.refresh_key(kid).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -237,6 +347,103 @@ mod tests {
         assert!(
             matches!(error, DiscoveryError::JwksUriRefused(_)),
             "{error:?}"
+        );
+    }
+
+    /// A discovery + JWKS provider in one app: `jwks_uri` points back at the
+    /// same listener, serving one Ed25519 signing key (RFC 8037's test vector).
+    async fn spawn_provider() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let address = listener.local_addr().expect("test provider address");
+        let issuer = format!("http://{address}");
+
+        let discovery = json!({
+            "issuer": issuer.clone(),
+            "jwks_uri": format!("{issuer}/jwks"),
+        });
+        let jwks = json!({
+            "keys": [{
+                "kty": "OKP", "crv": "Ed25519", "use": "sig", "kid": "k1",
+                "alg": "EdDSA",
+                "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+            }]
+        });
+
+        let app = Router::new()
+            .route("/.well-known/openid-configuration", get(discovery_handler))
+            .with_state(discovery)
+            .route("/jwks", get(discovery_handler).with_state(jwks));
+
+        lore_base::lore_spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test provider");
+        });
+
+        issuer
+    }
+
+    /// The startup path may fail; verification then resolves discovery on
+    /// first use, with no warm-up having happened.
+    #[tokio::test]
+    async fn discovery_resolves_on_first_use() {
+        let issuer = spawn_provider().await;
+        let service = DiscoveringJwkService::new(issuer);
+
+        let (_key, algorithm) = service
+            .get_key("k1")
+            .await
+            .expect("the key resolves through on-demand discovery");
+        assert_eq!(algorithm, jsonwebtoken::Algorithm::EdDSA);
+        assert!(
+            service.get_cached_key("k1").is_some(),
+            "once resolved, the cache serves the synchronous path"
+        );
+    }
+
+    /// Failed discovery is throttled: unauthenticated callers can present
+    /// arbitrary tokens, and each must not become an outbound discovery fetch.
+    #[tokio::test]
+    async fn failed_discovery_is_throttled() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = requests.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing provider");
+        let address = listener.local_addr().expect("failing provider address");
+        let app = Router::new().route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let counting = counting.clone();
+                async move {
+                    counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down")
+                }
+            }),
+        );
+        lore_base::lore_spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve failing provider");
+        });
+
+        let service = DiscoveringJwkService::new(format!("http://{address}"));
+        assert!(
+            service.get_key("k1").await.is_err(),
+            "a down provider cannot serve keys"
+        );
+        assert!(
+            service.get_key("k1").await.is_err(),
+            "still failing, and throttled"
+        );
+
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second failure within the retry interval must not fetch"
         );
     }
 

@@ -86,7 +86,6 @@ pub fn insecure_decode_token_as<T: serde::de::DeserializeOwned>(
     validation.validate_aud = false;
     validation.validate_exp = false;
     validation.validate_nbf = false;
-    validation.required_spec_claims.clear();
     jsonwebtoken::decode::<T>(token, &key, &validation)
 }
 

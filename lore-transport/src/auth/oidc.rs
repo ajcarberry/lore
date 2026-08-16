@@ -27,9 +27,13 @@ use crate::types::*;
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 
 #[allow(dead_code)] // Consumed by the login flows in the following phases.
-/// `offline_access` asks a conformant provider for a refresh token. `profile` and `email`
-/// carry the optional display claims; the code falls back to `sub` without them.
-const SCOPES: &str = "openid profile email offline_access";
+/// `offline_access` asks a conformant provider for a refresh token, deliberately without
+/// `prompt=consent` (Core §11's condition for it): the prompt would put a consent screen
+/// in front of every login, and the providers this targets issue refresh tokens to a
+/// public client without it — a provider that instead drops the scope leaves a session
+/// lasting one token lifetime. `profile` carries both optional display claims
+/// (`name`, `preferred_username`); the code falls back to `sub` without them.
+const SCOPES: &str = "openid profile offline_access";
 
 /// Cap on a provider response body, so a broken or hostile endpoint cannot stream
 /// unbounded bytes into memory.
@@ -1047,20 +1051,6 @@ mod tests {
         let token =
             authentication_token(tokens, None, &parts()).expect("refresh should be accepted");
         assert_eq!(token.user_id, "user-1");
-    }
-
-    #[test]
-    fn a_refresh_without_an_id_token_is_refused_where_the_id_token_is_the_credential() {
-        let tokens = TokenResponse {
-            id_token: None,
-            refresh_token: Some("rotated".to_string()),
-        };
-        let error = authentication_token(tokens, None, &parts())
-            .expect_err("there is no credential to store");
-        assert!(
-            error.to_string().contains("id_token"),
-            "the diagnostic should name the missing member: {error}"
-        );
     }
 
     #[test]

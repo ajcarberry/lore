@@ -10,6 +10,7 @@ How-To guides are directions. Each one walks through a specific problem or towar
 
 - [Install the Lore CLI](install-lore-cli.md) — get the `lore` binary onto your PATH and ready to use.
 - [Deploy a local Lore Server](deploy-local-lore-server.md) — stand up a single-host Lore Server you can push to and clone from.
+- [Secure a Lore Server with OpenID Connect](secure-a-lore-server-with-oidc.md) — require login from an identity provider instead of running open.
 
 ## Suggested starting points
 

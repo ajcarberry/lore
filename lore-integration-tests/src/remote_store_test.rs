@@ -2,23 +2,17 @@
 // SPDX-License-Identifier: MIT
 #[cfg(all(test, feature = "integration_tests"))]
 mod remote_store_tests {
-    use std::collections::HashMap;
     use std::error::Error;
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
-    use lore_revision::environment::EnvironmentConfig;
     use lore_revision::fragment;
     use lore_revision::lore::RepositoryId;
     use lore_revision::store::remote::RemoteImmutableStore;
     use lore_revision::store::remote::RemoteMutableStore;
-    use lore_server::grpc::server::FeatureSettings;
-    use lore_server::grpc::server::GrpcServerBuilder;
-    use lore_server::hooks::HookDispatcher;
     use lore_server::quic::quinn::QuinnConfigBuilder;
     use lore_server::quic::quinn::QuinnServer;
     use lore_server::quic::tests::TestHandlerFactory;
@@ -32,6 +26,7 @@ mod remote_store_tests {
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use rand::random;
 
+    use crate::common::grpc_common::serve_grpc_server;
     use crate::setup_execution;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -59,7 +54,6 @@ mod remote_store_tests {
     /// QUIC one adds a storage endpoint on the same address.
     async fn start_backend(
         listener: std::net::TcpListener,
-        addr: SocketAddr,
     ) -> (
         Arc<dyn ImmutableStore>,
         Arc<dyn MutableStore>,
@@ -90,71 +84,20 @@ mod remote_store_tests {
         .await
         .unwrap();
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let signal = async {
-            shutdown_rx.await.ok();
-        };
-
-        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
-            Arc::new(lore_server::notification::local::NotificationSender::default());
-        let hook_dispatcher = Arc::new(HookDispatcher::empty());
-
-        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
-        let served_immutable = backend_immutable.clone();
-        let served_mutable = backend_mutable.clone();
-        // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
-                .with_immutable_store(served_immutable.clone(), served_immutable)
-                .with_mutable_store(served_mutable)
-                .with_lock_store(None)
-                .with_notification(notification_sender, None)
-                .with_hook_dispatcher(hook_dispatcher)
-                .with_tls_config(None, None, None)
-                .unwrap()
-                .with_admin_endpoints(HashMap::new(), vec![])
-                .with_http2_config(
-                    None,
-                    None,
-                    Duration::from_secs(30),
-                    None,
-                    Default::default(),
-                    None,
-                )
-                .with_jwt_verifier(None)
-                .unwrap()
-                .serve_with_listener(listener, signal)
-                .await;
-            let _ = stopped_tx.send(match outcome {
-                Ok(()) => "stopped before the test finished".to_string(),
-                Err(error) => format!("failed: {error}"),
-            });
-        });
-
-        // A server that never starts must say so. Falling through to a client that can never be
-        // answered is what turns a startup failure into a test that hangs with nothing on stderr.
-        let mut ready = false;
-        for _ in 0..50 {
-            if let Ok(reason) = stopped_rx.try_recv() {
-                panic!("test server on {addr} {reason}");
-            }
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(ready, "test server on {addr} never accepted a connection");
+        let shutdown_tx = serve_grpc_server(
+            listener,
+            backend_immutable.clone(),
+            backend_mutable.clone(),
+            None,
+        )
+        .await;
 
         (backend_immutable, backend_mutable, shutdown_tx)
     }
 
     async fn start_test_server() -> TestServer {
         let (listener, addr) = bind_shared_port();
-        let (_immutable, _mutable, shutdown_tx) = start_backend(listener, addr).await;
+        let (_immutable, _mutable, shutdown_tx) = start_backend(listener).await;
 
         let url = format!("grpc://127.0.0.1:{}", addr.port());
         TestServer {
@@ -180,7 +123,7 @@ mod remote_store_tests {
     /// separately and has no such coupling, so the contract battery runs here until that is fixed.
     async fn start_test_quic_server() -> QuicTestServer {
         let (listener, addr) = bind_shared_port();
-        let (backend_immutable, backend_mutable, shutdown_tx) = start_backend(listener, addr).await;
+        let (backend_immutable, backend_mutable, shutdown_tx) = start_backend(listener).await;
 
         let (cert_file, pkey_file, _ca) =
             lore_server::quic::tests::server_certs().expect("test certificate paths");

@@ -103,51 +103,56 @@ const JWKS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// this: an unauthenticated caller can cycle key ids and never repeat one.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Cap on the JWKS document this server will hold in memory. Generous beside any real key
-/// set — even a large provider publishes single-digit kilobytes — so the only documents it
-/// refuses are ones no identity provider would send. [`JWKS_REQUEST_TIMEOUT`] bounds how
-/// long a fetch may run, which is not the same as bounding what it delivers.
-const JWKS_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Cap on a provider document (JWKS or discovery) this server will hold in memory.
+/// Generous beside either — even a large provider publishes single-digit kilobytes — so
+/// the only documents it refuses are ones no identity provider would send.
+/// [`JWKS_REQUEST_TIMEOUT`] bounds how long a fetch may run, which is not the same as
+/// bounding what it delivers.
+pub(crate) const PROVIDER_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// How much of a rejected response body reaches the log. The body is whatever the endpoint
 /// chose to send, so it is neither trustworthy nor necessarily small.
 const LOGGED_BODY_LIMIT: usize = 512;
 
 /// The head of a response body, for diagnostics.
-fn body_excerpt(body: &str) -> String {
+pub(crate) fn body_excerpt(body: &str) -> String {
     match body.char_indices().nth(LOGGED_BODY_LIMIT) {
         Some((end, _)) => format!("{}… ({} bytes total)", &body[..end], body.len()),
         None => body.to_string(),
     }
 }
 
-/// Read a response body, refusing anything past [`JWKS_MAX_RESPONSE_BYTES`].
+/// Read a response body, refusing anything past [`PROVIDER_MAX_RESPONSE_BYTES`].
 ///
 /// `Content-Length` is consulted first when the endpoint offers one, but it is a claim
 /// rather than a fact — it can be absent, understated, or the response chunked — so the
 /// accumulating read is what actually enforces the cap.
-async fn read_capped_body(response: &mut reqwest::Response) -> Result<String, JWKServiceError> {
+pub(crate) async fn read_capped_body(
+    response: &mut reqwest::Response,
+) -> Result<String, JWKServiceError> {
     if let Some(declared) = response.content_length()
-        && declared > JWKS_MAX_RESPONSE_BYTES as u64
+        && declared > PROVIDER_MAX_RESPONSE_BYTES as u64
     {
-        warn!("JWKS response declares {declared} bytes, over the {JWKS_MAX_RESPONSE_BYTES} cap");
+        warn!(
+            "Provider response declares {declared} bytes, over the {PROVIDER_MAX_RESPONSE_BYTES} cap"
+        );
         return Err(JWKServiceError::ResponseTooLarge);
     }
 
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| {
-        warn!("failed to read JWKS response body: {e:?}");
+        warn!("failed to read provider response body: {e:?}");
         JWKServiceError::InternalError
     })? {
-        if body.len() + chunk.len() > JWKS_MAX_RESPONSE_BYTES {
-            warn!("JWKS response exceeded the {JWKS_MAX_RESPONSE_BYTES} byte cap");
+        if body.len() + chunk.len() > PROVIDER_MAX_RESPONSE_BYTES {
+            warn!("Provider response exceeded the {PROVIDER_MAX_RESPONSE_BYTES} byte cap");
             return Err(JWKServiceError::ResponseTooLarge);
         }
         body.extend_from_slice(&chunk);
     }
 
     String::from_utf8(body).map_err(|e| {
-        warn!("JWKS response was not valid UTF-8: {e}");
+        warn!("Provider response was not valid UTF-8: {e}");
         JWKServiceError::InternalError
     })
 }
@@ -242,7 +247,7 @@ fn key_is_usable_with(key: &DecodingKey, algorithm: jsonwebtoken::Algorithm) -> 
 
 /// One pooled client for every fetch. Building it per request meant a fresh TLS
 /// handshake each time and no connection reuse.
-fn http_client() -> Result<&'static reqwest::Client, JWKServiceError> {
+pub(crate) fn http_client() -> Result<&'static reqwest::Client, JWKServiceError> {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     if let Some(client) = CLIENT.get() {
         return Ok(client);
@@ -254,6 +259,10 @@ fn http_client() -> Result<&'static reqwest::Client, JWKServiceError> {
         .user_agent(user_agent())
         .connect_timeout(JWKS_CONNECT_TIMEOUT)
         .timeout(JWKS_REQUEST_TIMEOUT)
+        // Key material and the documents that locate it must come from the
+        // origin they were requested from: a redirect could otherwise carry
+        // either across origins or down to plaintext.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| {
             warn!("Failed to construct HTTP client: {e:?}");
@@ -369,9 +378,9 @@ impl JwkServiceImpl {
                     JWKServiceError::InternalError
                 })?
                 .len();
-            if size > JWKS_MAX_RESPONSE_BYTES as u64 {
+            if size > PROVIDER_MAX_RESPONSE_BYTES as u64 {
                 warn!(
-                    "JWKS file at {} is {size} bytes, over the {JWKS_MAX_RESPONSE_BYTES} cap",
+                    "JWKS file at {} is {size} bytes, over the {PROVIDER_MAX_RESPONSE_BYTES} cap",
                     path.display()
                 );
                 return Err(JWKServiceError::ResponseTooLarge);
@@ -543,6 +552,30 @@ impl InstrumentProvider for JwkServiceImpl {
     fn namespace(&self) -> &'static str {
         "urc.auth.jwk_service"
     }
+}
+
+/// Whether OIDC mode may verify a token signed with `algorithm`.
+///
+/// A symmetric secret published in a key set is a signing key for anyone who can
+/// read it, so OIDC mode admits only the asymmetric families. This is an
+/// allowlist rather than a denial of the HMAC variants so a signing algorithm
+/// added to `jsonwebtoken` in a later release is refused until it is reviewed
+/// and added here, not admitted by default. Enforced in
+/// `JwtVerifier::verify_token_internal`, where every key path converges.
+pub(crate) fn oidc_permits_algorithm(algorithm: jsonwebtoken::Algorithm) -> bool {
+    use jsonwebtoken::Algorithm as Alg;
+    matches!(
+        algorithm,
+        Alg::RS256
+            | Alg::RS384
+            | Alg::RS512
+            | Alg::PS256
+            | Alg::PS384
+            | Alg::PS512
+            | Alg::ES256
+            | Alg::ES384
+            | Alg::EdDSA
+    )
 }
 
 #[cfg(test)]
@@ -1267,7 +1300,7 @@ mod tests {
             "an_oversized_jwks_file_is_refused",
             &format!(
                 r#"{{"keys":[],"padding":"{}"}}"#,
-                "x".repeat(JWKS_MAX_RESPONSE_BYTES)
+                "x".repeat(PROVIDER_MAX_RESPONSE_BYTES)
             ),
         );
 
@@ -1353,7 +1386,7 @@ mod tests {
     /// header and the accumulating read has to do it. This is the case that matters: an
     /// endpoint that means harm simply omits `Content-Length` or understates it.
     async fn chunked_oversized_handler() -> axum::response::Response {
-        let chunks = (0..(JWKS_MAX_RESPONSE_BYTES / 1024) + 2)
+        let chunks = (0..(PROVIDER_MAX_RESPONSE_BYTES / 1024) + 2)
             .map(|_| Ok::<_, std::io::Error>(vec![b'x'; 1024]));
 
         axum::response::Response::new(axum::body::Body::from_stream(futures::stream::iter(chunks)))
@@ -1390,6 +1423,33 @@ mod tests {
         );
     }
 
+    mod oidc_algorithms {
+        use super::*;
+
+        #[test]
+        fn oidc_permits_algorithm_allows_only_asymmetric_families() {
+            use jsonwebtoken::Algorithm;
+
+            for algorithm in [
+                Algorithm::RS256,
+                Algorithm::RS384,
+                Algorithm::RS512,
+                Algorithm::PS256,
+                Algorithm::PS384,
+                Algorithm::PS512,
+                Algorithm::ES256,
+                Algorithm::ES384,
+                Algorithm::EdDSA,
+            ] {
+                assert!(oidc_permits_algorithm(algorithm), "{algorithm:?}");
+            }
+
+            for algorithm in [Algorithm::HS256, Algorithm::HS384, Algorithm::HS512] {
+                assert!(!oidc_permits_algorithm(algorithm), "{algorithm:?}");
+            }
+        }
+    }
+
     /// An oversized HTTP response is refused, and the cached keys are not disturbed by it.
     #[tokio::test]
     async fn an_oversized_jwks_response_is_refused() {
@@ -1398,7 +1458,7 @@ mod tests {
             requests: requests.clone(),
             body: Arc::new(format!(
                 r#"{{"keys":[],"padding":"{}"}}"#,
-                "x".repeat(JWKS_MAX_RESPONSE_BYTES)
+                "x".repeat(PROVIDER_MAX_RESPONSE_BYTES)
             )),
             delay: Duration::ZERO,
         })

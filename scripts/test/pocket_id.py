@@ -175,6 +175,37 @@ class PocketIdClient:
         logger.info("Provisioned PocketID user %s (%s)", username, user["id"])
         return user
 
+    def ensure_group(self, name: str) -> str:
+        """Provision a user group, returning its id. Idempotent: a duplicate-name
+        400 means another worker already created it, so look it up instead."""
+        try:
+            _, _, group = self._request(
+                "POST",
+                "/api/user-groups",
+                {"name": name, "friendlyName": name},
+                admin=True,
+            )
+            return group["id"]
+        except PocketIdError:
+            _, _, listing = self._request("GET", "/api/user-groups", admin=True)
+            for group in listing.get("data", []):
+                if group["name"] == name:
+                    return group["id"]
+            raise
+
+    def add_user_to_group(self, user: dict, group_id: str) -> None:
+        """Add `user` to the group, keeping existing members: the PUT replaces
+        the whole member list, so read-merge-write."""
+        _, _, group = self._request("GET", f"/api/user-groups/{group_id}", admin=True)
+        member_ids = {member["id"] for member in group.get("users", [])}
+        member_ids.add(user["id"])
+        self._request(
+            "PUT",
+            f"/api/user-groups/{group_id}/users",
+            {"userIds": sorted(member_ids)},
+            admin=True,
+        )
+
     def login(self, user: dict) -> str:
         """Log `user` in without a passkey and return the session cookie header value.
 

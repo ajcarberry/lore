@@ -27,12 +27,14 @@ dependent test fails cleanly rather than hanging -- it is not a product bug
 Keychain access already granted to the built binary, passes normally).
 """
 
+import dataclasses
 import json
 import logging
 import os
 import subprocess
 import threading
 import urllib.parse
+import urllib.request
 
 import pytest
 from error_types import LoreException, NotAuthenticatedError
@@ -53,14 +55,36 @@ logger = logging.getLogger(__name__)
 # interval of approval without waiting that ceiling out on a hang.
 DEVICE_LOGIN_TIMEOUT = 60
 
+# The provider group the OIDC test server maps to elevated permissions in its
+# `local.toml` (see `oidc_lore_server`).
+ADMIN_GROUP = "lore-smoke-admins"
 
-def _oidc_repo(new_lore_repo, remote_url) -> Lore:
+
+@dataclasses.dataclass(frozen=True)
+class OidcServer:
+    """The OIDC-secured test server: its `lore://` remote plus the HTTP port,
+    for the one test that checks the unauthenticated health endpoint."""
+
+    remote_url: str
+    http_port: int
+
+    def __str__(self) -> str:  # keeps `_oidc_repo(...)`-style call sites simple
+        return self.remote_url
+
+
+def _oidc_repo(new_lore_repo, remote_url, isolated_store: bool = False) -> Lore:
     """A repo pointed at the OIDC server, with the credential store kept in the
     test's own directory: the key encrypting the token file defaults to the OS
     keyring, which on macOS blocks a CLI login behind a GUI prompt no test can
-    answer."""
-    repo: Lore = new_lore_repo(create_repo=False, remote_url=remote_url)
+    answer.
+
+    `isolated_store` gives the repo its own credential store rather than the
+    module-shared one -- how a test embodies a *second user*, whose login must
+    not be visible to the first user's repos."""
+    repo: Lore = new_lore_repo(create_repo=False, remote_url=str(remote_url))
     repo.environment_vars.setdefault("LORE_AUTH_STORE", "fallback")
+    if isolated_store:
+        repo.environment_vars["LORE_AUTH_PATH"] = os.path.join(repo.path, ".auth-store")
     return repo
 
 
@@ -84,11 +108,25 @@ def oidc_lore_server(request, tmp_path_factory, pocket_id, lore_server_executabl
     server_env["LORE__SERVER__AUTH__OIDC__CLIENT_ID"] = pocket_id.ensure_client()
     server_env["LORE__SERVER__AUTH__OIDC__AUTHORIZE_ALL_REPOSITORIES"] = "true"
 
+    # The permission mapping is a TOML table, which the LORE__ env overrides
+    # cannot express (scalars only), so it rides the `local.toml` layer.
+    local_toml = server_root / "lore-server" / "config" / "local.toml"
+    local_toml.write_text(
+        "[server.auth.oidc]\n"
+        'groups_claim = "groups"\n'
+        "\n"
+        "[server.auth.oidc.permission_groups]\n"
+        f'"{ADMIN_GROUP}" = ["obliterate", "migrate"]\n'
+    )
+
     server_proc, server_log_path, server_log_fd = launch_lore_server(
         server_root, server_env, lore_server_executable_path
     )
 
-    yield f"lore://127.0.0.1:{ports['quic']}/"
+    yield OidcServer(
+        remote_url=f"lore://127.0.0.1:{ports['quic']}/",
+        http_port=ports["http"],
+    )
 
     _kill_server_by_pid(server_proc.pid, server_log_path, label="OIDC test server")
     server_log_fd.close()
@@ -257,3 +295,214 @@ class TestOidcAuth:
         # server has to stop answering for the repository afterwards.
         with pytest.raises(LoreException):
             repo.repository_info()
+
+
+@pytest.fixture(scope="module")
+def pocket_id_admin(pocket_id):
+    """A user in the admin group the OIDC test server maps to
+    `obliterate` and `migrate` (see the `local.toml` in `oidc_lore_server`)."""
+    user = pocket_id.create_user("loreadmin")
+    pocket_id.add_user_to_group(user, pocket_id.ensure_group(ADMIN_GROUP))
+    return user
+
+
+def _logged_in_repo(new_lore_repo, server, pocket_id, user, isolated_store=False):
+    """A repo whose credential store holds `user`'s login."""
+    repo = _oidc_repo(new_lore_repo, server, isolated_store=isolated_store)
+    _, returncode = _login_no_browser(repo, pocket_id, user)
+    assert returncode == 0, f"login as {user['username']} failed"
+    return repo
+
+
+def _clone_repository_as(user_repo: Lore, source: Lore) -> Lore:
+    """Clone `source`'s repository as `user_repo`'s user, keeping that user's
+    credential store: how a *second user* obtains a working copy of a
+    repository somebody else created."""
+    user_repo.remote_path = source.remote_path
+    cloned = user_repo.clone()
+    # `clone()` does not carry environment overrides onto the new instance,
+    # and the credential store is exactly what must not be shared here.
+    cloned.environment_vars = dict(user_repo.environment_vars)
+    return cloned
+
+
+def _commit_file(repo: Lore, name: str, content: str) -> str:
+    """Write, stage, and commit one file; returns its path within the repo."""
+    file_path = os.path.join(repo.path, name)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    repo.stage(name)
+    repo.commit(f"add {name}")
+    repo.push()
+    return name
+
+
+@pytest.mark.smoke
+class TestOidcAuthorizationBoundaries:
+    """The operations that run *narrower* than the all-repositories grant.
+
+    `authorize_all_repositories = true` deliberately lets every authenticated
+    identity read and write every repository, so most owner/non-owner
+    distinctions do not exist. These tests pin the ones that do: repository
+    delete (creator only), obliterate and admin locking (mapped groups only),
+    and releasing another user's lock (owner only)."""
+
+    def test_non_creator_cannot_delete_repository(
+        self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
+    ):
+        creator = _logged_in_repo(
+            new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
+        )
+        creator.repository_create()
+
+        other_user = pocket_id.create_user("loreother")
+        other = _logged_in_repo(
+            new_lore_repo, oidc_lore_server, pocket_id, other_user, isolated_store=True
+        )
+        other.repository_create()
+
+        with pytest.raises(LoreException):
+            other.repository_delete(creator.name)
+
+        # The refusal must have left the repository standing.
+        creator.repository_info()
+        creator.repository_delete()
+
+    def test_obliterate_is_denied_without_a_mapped_group(
+        self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
+    ):
+        """The all-repositories wildcard carries no `obliterate` permission, so
+        even a repository's own creator cannot rewrite history without a
+        mapped group."""
+        repo = _logged_in_repo(new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user)
+        repo.repository_create()
+        name = _commit_file(repo, "history.txt", "do not rewrite me")
+
+        with pytest.raises(LoreException):
+            repo.file_obliterate(path=name)
+
+    def test_admin_group_member_can_obliterate(
+        self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_admin
+    ):
+        """Membership in the mapped provider group grants `obliterate` end to
+        end: PocketID puts the group in the ID token (via the scope the server
+        advertises), and the server maps it to the permission the admin
+        service checks."""
+        repo = _logged_in_repo(
+            new_lore_repo, oidc_lore_server, pocket_id, pocket_id_admin
+        )
+        repo.repository_create()
+        name = _commit_file(repo, "regrettable.txt", "rewrite me")
+
+        repo.file_obliterate(path=name)  # must not raise
+
+    def test_lock_held_by_another_user_cannot_be_released(
+        self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
+    ):
+        """Lock ownership is enforced between OIDC identities: without the
+        `owner`/`admin` permission, releasing somebody else's lock is refused."""
+        creator = _logged_in_repo(
+            new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
+        )
+        creator.repository_create()
+        name = _commit_file(creator, "locked.txt", "mine")
+        creator.lock_acquire(paths=[name])
+
+        other_user = pocket_id.create_user("lorelock")
+        other_base = _logged_in_repo(
+            new_lore_repo, oidc_lore_server, pocket_id, other_user, isolated_store=True
+        )
+        other = _clone_repository_as(other_base, creator)
+
+        with pytest.raises(LoreException):
+            other.lock_release(paths=[name])
+
+        # The lock survives the refused release, and its owner can release it.
+        creator.lock_release(paths=[name])
+
+
+@pytest.mark.smoke
+class TestOidcUserJourney:
+    """The full workflow a real user runs, end to end against the secured
+    server: create, commit, push, and a second user pulling the result. This
+    is the only place the QUIC storage path runs under OIDC."""
+
+    def test_full_workflow_two_users(
+        self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
+    ):
+        first = _logged_in_repo(
+            new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
+        )
+        first.repository_create()
+        _commit_file(first, "hello.txt", "from the first user")
+
+        # A second identity clones the repository -- under the coarse grant,
+        # every authenticated identity may -- and sees the content.
+        second_user = pocket_id.create_user("lorepeer")
+        second_base = _logged_in_repo(
+            new_lore_repo, oidc_lore_server, pocket_id, second_user, isolated_store=True
+        )
+        second = _clone_repository_as(second_base, first)
+        cloned_file = os.path.join(second.path, "hello.txt")
+        with open(cloned_file, encoding="utf-8") as f:
+            assert f.read() == "from the first user"
+
+        # And writes back, which the first user can sync.
+        _commit_file(second, "reply.txt", "from the second user")
+        first.sync()
+        replied = os.path.join(first.path, "reply.txt")
+        with open(replied, encoding="utf-8") as f:
+            assert f.read() == "from the second user"
+
+    def test_repository_creator_is_the_login_identity(
+        self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
+    ):
+        """The server records the authenticated `sub` as the repository's
+        creator -- the value the delete check compares against."""
+        repo = _logged_in_repo(new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user)
+        repo.repository_create()
+
+        info = repo.repository_info()
+        assert pocket_id_user["id"] in info, (
+            f"repository info does not attribute the creator to the login "
+            f"identity: {info}"
+        )
+
+
+@pytest.mark.smoke
+class TestOidcSessionLifecycle:
+    def test_relogin_replaces_the_credential(
+        self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
+    ):
+        """A second login over an existing credential works cleanly -- the
+        stored bucket is replaced, not corrupted."""
+        repo = _logged_in_repo(new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user)
+        repo.repository_create()
+
+        _, returncode = _login_no_browser(repo, pocket_id, pocket_id_user)
+        assert returncode == 0
+
+        repo.repository_info()  # the replacing credential works
+
+    def test_auth_clear_removes_the_credential(
+        self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
+    ):
+        """`auth clear` wipes the store: operations fail afterwards and no
+        stored refresh token resurrects the session."""
+        repo = _logged_in_repo(new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user)
+        repo.repository_create()
+
+        repo.run(urc_args=["auth", "clear"])
+
+        with pytest.raises(NotAuthenticatedError):
+            repo.repository_info()
+
+
+@pytest.mark.smoke
+class TestOidcFailureModes:
+    def test_health_check_stays_open_when_secured(self, oidc_lore_server):
+        """The one endpoint the how-to promises stays unauthenticated."""
+        response = urllib.request.urlopen(
+            f"http://127.0.0.1:{oidc_lore_server.http_port}/health_check", timeout=10
+        )
+        assert response.status == 200

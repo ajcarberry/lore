@@ -57,7 +57,6 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Poll interval to use when a device authorization response omits `interval`
@@ -425,6 +424,15 @@ fn device_token_form(parts: &AuthUrlParts, device_code: &str) -> GrantForm {
             "urn:ietf:params:oauth:grant-type:device_code".to_string(),
         ),
         ("device_code", device_code.to_string()),
+        ("client_id", parts.client_id.clone()),
+    ]
+}
+
+/// The refresh grant (RFC 6749 §6).
+fn refresh_form(parts: &AuthUrlParts, refresh_token: &str) -> GrantForm {
+    vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
         ("client_id", parts.client_id.clone()),
     ]
 }
@@ -843,18 +851,39 @@ async fn post_token_request(
 
     if !status.is_success() {
         let error = serde_json::from_str::<TokenError>(&body).unwrap_or_default();
+        let description = error
+            .error_description
+            .as_deref()
+            .unwrap_or("no description");
+        // RFC 6749 §5.2's verdict on the grant itself -- a spent code, a revoked
+        // or already-rotated refresh token. The routine death of a session must
+        // be typed as "log in again", not as a transport-shaped failure.
+        if error.error.as_deref() == Some("invalid_grant") {
+            lore_debug!("Token endpoint refused the grant: {description}");
+            return Err(ProtocolError::from(NotAuthenticated));
+        }
         return Err(ProtocolError::internal(format!(
-            "token endpoint answered {status}: {} ({})",
+            "token endpoint answered {status}: {} ({description})",
             error.error.as_deref().unwrap_or("no error code"),
-            error
-                .error_description
-                .as_deref()
-                .unwrap_or("no description")
         )));
     }
 
     serde_json::from_str(&body)
         .map_err(|e| ProtocolError::internal(format!("token endpoint response is not usable: {e}")))
+}
+
+/// The post-discovery half of the refresh grant, split from
+/// `refresh_authentication` the way `complete_pkce` is split from its poll, so
+/// the grant form and response handling are testable against a local endpoint.
+async fn refresh_with(
+    token_endpoint: &str,
+    parts: &AuthUrlParts,
+    refresh_token: &str,
+) -> Result<AuthenticationToken, ProtocolError> {
+    let form = refresh_form(parts, refresh_token);
+    let tokens = post_token_request(token_endpoint, &form).await?;
+    // OpenID Connect Core §12.2 makes `nonce` optional on a refreshed ID token.
+    authentication_token(tokens, None, parts)
 }
 
 /// A login this process started and is polling for.
@@ -1177,6 +1206,22 @@ impl OidcAuthentication {
             }
         }
     }
+
+    /// Returns the authentication token as its own authorization token.
+    ///
+    /// There is nothing to exchange it with and nothing to mint: the server authorizes a
+    /// verified token for every repository, from its own configuration. Both credential
+    /// shapes carry `sub` and `exp`, which is all this reads.
+    fn passthrough(auth_url: &str, authn_token: &str) -> Result<AuthorizationToken, ProtocolError> {
+        let parts = parse_auth_url(auth_url)?;
+        let claims = id_token_claims(authn_token)?;
+
+        Ok(AuthorizationToken {
+            token: authn_token.to_string(),
+            expires_ms: claims.exp.saturating_mul(1000),
+            recipients: TokenRecipients::Explicit(vec![parts.issuer_domain]),
+        })
+    }
 }
 
 #[async_trait]
@@ -1246,40 +1291,37 @@ impl Authentication for OidcAuthentication {
         }))
     }
 
-    /// The refresh grant lands in a following phase.
+    /// The refresh grant (RFC 6749 §6). A rotated refresh token comes back on the returned
+    /// token.
     async fn refresh_authentication(
         &self,
-        _auth_url: &str,
-        _refresh_token: &str,
+        auth_url: &str,
+        refresh_token: &str,
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
-        Err(ProtocolError::from(NotSupported {
-            operation: "refresh_authentication".to_string(),
-        }))
+        let parts = parse_auth_url(auth_url)?;
+        let discovery = self.discover(&parts).await?;
+        refresh_with(&discovery.token_endpoint, &parts, refresh_token).await
     }
 
     async fn exchange_for_repository(
         &self,
-        _auth_url: &str,
-        _authn_token: &str,
+        auth_url: &str,
+        authn_token: &str,
         _repository: RepositoryId,
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
-        Err(ProtocolError::from(NotSupported {
-            operation: "exchange_for_repository".to_string(),
-        }))
+        Self::passthrough(auth_url, authn_token)
     }
 
     async fn exchange_for_custom_resource(
         &self,
-        _auth_url: &str,
-        _authn_token: &str,
+        auth_url: &str,
+        authn_token: &str,
         _resource_id: &str,
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
-        Err(ProtocolError::from(NotSupported {
-            operation: "exchange_for_custom_resource".to_string(),
-        }))
+        Self::passthrough(auth_url, authn_token)
     }
 
     /// The provider owns identity resolution and this design reads no directory.
@@ -1779,6 +1821,13 @@ mod tests {
 
     /// Answers one HTTP request on a loopback port with a canned body.
     async fn one_shot_provider(body: impl Into<String>) -> String {
+        one_shot_provider_with_status("200 OK", body).await
+    }
+
+    async fn one_shot_provider_with_status(
+        status: &'static str,
+        body: impl Into<String>,
+    ) -> String {
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt;
 
@@ -1818,7 +1867,7 @@ mod tests {
             }
 
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
@@ -1826,6 +1875,50 @@ mod tests {
         });
 
         format!("http://127.0.0.1:{port}/device")
+    }
+
+    /// The refresh grant round trip against a local token endpoint: the new
+    /// credential comes back with the rotated refresh token and the issuer as
+    /// its recipient.
+    #[tokio::test]
+    async fn a_refresh_returns_the_new_credential_and_rotated_token() {
+        let id_token = unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#);
+        let endpoint = one_shot_provider(format!(
+            r#"{{"id_token":"{id_token}","refresh_token":"rotated"}}"#
+        ))
+        .await;
+
+        let token = refresh_with(&endpoint, &parts(), "spent")
+            .await
+            .expect("the refresh grant should complete");
+
+        assert_eq!(token.user_id, "user-1");
+        assert_eq!(token.refresh_token.as_deref(), Some("rotated"));
+        assert_eq!(
+            token.recipients,
+            TokenRecipients::Explicit(vec!["id.example.com".to_string()])
+        );
+    }
+
+    /// RFC 6749 §5.2's `invalid_grant` is the routine death of a session — a
+    /// revoked or already-spent refresh token — and has to be typed "log in
+    /// again", not reported as a transport-shaped failure.
+    #[tokio::test]
+    async fn a_refused_refresh_grant_reports_not_authenticated() {
+        let endpoint = one_shot_provider_with_status(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","error_description":"revoked"}"#,
+        )
+        .await;
+
+        let error = refresh_with(&endpoint, &parts(), "revoked-token")
+            .await
+            .expect_err("a refused grant is not a credential");
+
+        assert!(
+            matches!(error, ProtocolError::NotAuthenticated(_)),
+            "a dead session must say log in again, got: {error:?}"
+        );
     }
 
     /// RFC 8628's `device_code` is a bearer credential and the session handle is logged, so
@@ -2065,6 +2158,72 @@ mod tests {
             "slow_down must lengthen the interval"
         );
         assert!(schedule.due(start + Duration::from_secs(10)));
+    }
+
+    #[tokio::test]
+    async fn exchange_for_repository_returns_the_authentication_token() {
+        let auth = OidcAuthentication::default();
+        let id_token = unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#);
+
+        let authz = auth
+            .exchange_for_repository(
+                "oidc+https://id.example.com?client_id=lore",
+                &id_token,
+                RepositoryId::default(),
+                "",
+            )
+            .await
+            .expect("the passthrough should succeed");
+
+        assert_eq!(authz.token, id_token);
+        assert_eq!(authz.expires_ms, 1_000_000);
+        assert_eq!(
+            authz.recipients,
+            TokenRecipients::Explicit(vec!["id.example.com".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_for_custom_resource_returns_the_authentication_token() {
+        let auth = OidcAuthentication::default();
+        let id_token = unsigned_jwt(r#"{"sub":"user-1","exp":1000}"#);
+
+        let authz = auth
+            .exchange_for_custom_resource(
+                "oidc+https://id.example.com?client_id=lore",
+                &id_token,
+                "urc-something",
+                "",
+            )
+            .await
+            .expect("the passthrough should succeed");
+
+        assert_eq!(authz.token, id_token);
+    }
+
+    #[tokio::test]
+    async fn identity_resolution_and_token_exchange_report_not_supported() {
+        let auth = OidcAuthentication::default();
+        let auth_url = "oidc+https://id.example.com?client_id=lore";
+
+        assert!(
+            auth.exchange_external_token(auth_url, "token", "type", "")
+                .await
+                .expect_err("no external token exchange exists")
+                .is_not_supported()
+        );
+        assert!(
+            auth.get_user_info(auth_url, "token", RepositoryId::default(), &[], "")
+                .await
+                .expect_err("the provider owns identity resolution")
+                .is_not_supported()
+        );
+        assert!(
+            auth.get_user_id(auth_url, "token", RepositoryId::default(), "ada", "")
+                .await
+                .expect_err("the provider owns identity resolution")
+                .is_not_supported()
+        );
     }
 
     #[test]

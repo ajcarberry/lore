@@ -19,6 +19,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::auth::LoreAuthUrlEventData;
+use crate::auth::LoreAuthUserCodeEventData;
 use crate::errors::Disconnected;
 use crate::errors::Maintenance;
 use crate::errors::NoRemote;
@@ -308,6 +309,14 @@ pub async fn interactive(
             url: session.login_url.into(),
         })
         .send();
+        // The device grant's phishing mitigation (RFC 8628 §3.3.1): the user
+        // compares this code with the one the provider's page shows.
+        if let Some(user_code) = session.user_code {
+            event::LoreEvent::AuthUserCode(LoreAuthUserCodeEventData {
+                user_code: user_code.into(),
+            })
+            .send();
+        }
     }
 
     // 3. Poll until complete or timeout

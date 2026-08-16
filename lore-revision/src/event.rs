@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::auth::LoreAuthUrlEventData;
+use crate::auth::LoreAuthUserCodeEventData;
 use crate::auth::userinfo::LoreAuthIdentityEventData;
 use crate::auth::userinfo::LoreAuthUserInfoEventData;
 use crate::auth::userinfo::LoreAuthUserTokenEventData;
@@ -1141,6 +1142,9 @@ pub enum LoreEvent {
     RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData),
     /// A metadata-clear entry completed.
     RevisionTreeMetadataClearComplete(LoreRevisionTreeMetadataClearCompleteEventData),
+    /// A device-grant user code for the user to compare (RFC 8628 §3.3.1).
+    /// Appended last so every existing discriminant keeps its value.
+    AuthUserCode(LoreAuthUserCodeEventData),
 }
 
 impl LoreEvent {

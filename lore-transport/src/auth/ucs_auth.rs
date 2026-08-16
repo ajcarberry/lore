@@ -104,6 +104,7 @@ impl Authentication for UcsAuthentication {
 
         let inner = res.into_inner();
         Ok(AuthSession {
+            user_code: None,
             session_code: inner.session_code,
             login_url: inner.login_url,
         })

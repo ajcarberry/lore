@@ -486,6 +486,10 @@ struct DeviceAuthorization {
     verification_uri_complete: Option<String>,
     #[serde(default)]
     interval: Option<u64>,
+    /// REQUIRED by §3.2, tolerated when absent: the poll then relies on the
+    /// caller's window and the provider's `expired_token`.
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
 /// The URL to put in front of the user.
@@ -550,6 +554,9 @@ fn device_poll_step(status: StatusCode, body: &str) -> Result<DeviceStep, Protoc
         Some(other) => Err(ProtocolError::internal(format!(
             "token endpoint refused the device code: {other} ({description})"
         ))),
+        // A 5xx with no OAuth error code is an intermediary or an outage (a
+        // proxy's 502 page), not a verdict on the grant: one missed poll.
+        None if status.is_server_error() => Ok(DeviceStep::Pending),
         None => Err(ProtocolError::internal(format!(
             "token endpoint answered {status} with no error code"
         ))),
@@ -891,6 +898,9 @@ struct DeviceSession {
     /// handle the caller polls with is a separate, opaque string.
     device_code: String,
     schedule: PollSchedule,
+    /// The device code's advertised lifetime (`expires_in`, §3.2), so an
+    /// expired code is reported as such rather than as a generic timeout.
+    lifetime: Option<Duration>,
     started: Instant,
 }
 
@@ -976,6 +986,7 @@ impl OidcAuthentication {
         Ok(AuthSession {
             session_code,
             login_url,
+            user_code: None,
         })
     }
 
@@ -1021,14 +1032,6 @@ impl OidcAuthentication {
             ProtocolError::internal(format!("device authorization response is not usable: {e}"))
         })?;
 
-        // RFC 8628 §5.2: the user has to be able to compare the code the terminal shows
-        // with the one the provider shows.
-        lore_debug!(
-            "Enter code {} at {} to authorize this login",
-            authorization.user_code,
-            authorization.verification_uri
-        );
-
         let login_url = device_login_url(&authorization);
         // Opaque, as in the PKCE flow: the handle travels out through a layer that logs it,
         // and the device code redeems this login's tokens on its own.
@@ -1042,6 +1045,7 @@ impl OidcAuthentication {
                 token_endpoint,
                 device_code: authorization.device_code,
                 schedule: PollSchedule::new(authorization.interval),
+                lifetime: authorization.expires_in.map(Duration::from_secs),
                 started: Instant::now(),
             }),
         );
@@ -1050,6 +1054,10 @@ impl OidcAuthentication {
         Ok(AuthSession {
             session_code,
             login_url,
+            // RFC 8628 §3.3.1: the caller MUST display the code, so the user
+            // can compare it with the one the provider shows (§5.4's remote-
+            // phishing mitigation).
+            user_code: Some(authorization.user_code),
         })
     }
 
@@ -1115,6 +1123,14 @@ impl OidcAuthentication {
                 ));
             };
             let now = Instant::now();
+            if let Some(lifetime) = session.lifetime
+                && now.duration_since(session.started) > lifetime
+            {
+                sessions.remove(session_code);
+                return Err(ProtocolError::internal(
+                    "the device code expired before the login was approved -- run the login again",
+                ));
+            }
             if !session.schedule.due(now) {
                 return Ok(None);
             }
@@ -1129,7 +1145,16 @@ impl OidcAuthentication {
         let form = device_token_form(&parts, &device_code);
 
         let client = http_client().await?;
-        let (status, body) = send(client.post(&token_endpoint).form(&form)).await?;
+        // A transient failure to reach the provider is one missed poll, not the
+        // end of a ceremony the user may already have approved on another
+        // device: the caller's window bounds how long this can go on.
+        let (status, body) = match send(client.post(&token_endpoint).form(&form)).await {
+            Ok(response) => response,
+            Err(e) => {
+                lore_debug!("Device poll did not reach the provider; will retry: {e}");
+                return Ok(None);
+            }
+        };
 
         match device_poll_step(status, &body) {
             Ok(DeviceStep::Pending) => Ok(None),
@@ -1914,6 +1939,7 @@ mod tests {
                 "https://id.example.com/device?code=WDJB-MJHT".to_string(),
             ),
             interval: Some(5),
+            expires_in: Some(900),
         };
         assert_eq!(
             device_login_url(&authorization),
@@ -1929,6 +1955,7 @@ mod tests {
             verification_uri: "https://id.example.com/device".to_string(),
             verification_uri_complete: None,
             interval: None,
+            expires_in: None,
         };
         let url = device_login_url(&authorization);
         assert!(
@@ -1980,6 +2007,16 @@ mod tests {
     fn device_poll_reports_an_unknown_error() {
         device_poll_step(StatusCode::BAD_REQUEST, r#"{"error":"invalid_client"}"#)
             .expect_err("an unrecognized error must not be mistaken for pending");
+    }
+
+    /// A proxy's 502 page is an outage, not a verdict on the grant: one missed
+    /// poll rather than the end of a ceremony the user may already have
+    /// approved.
+    #[test]
+    fn device_poll_treats_a_bare_server_error_as_pending() {
+        let step = device_poll_step(StatusCode::BAD_GATEWAY, "<html>502 Bad Gateway</html>")
+            .expect("a 5xx without an OAuth error code is transient");
+        assert_eq!(step, DeviceStep::Pending);
     }
 
     #[test]

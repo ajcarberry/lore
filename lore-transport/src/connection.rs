@@ -1077,6 +1077,7 @@ mod tests {
         let session = AuthSession {
             session_code: "sess-123".into(),
             login_url: "https://auth.example.com/login?code=abc".into(),
+            user_code: None,
         };
         assert_eq!(session.session_code, "sess-123");
         assert_eq!(session.login_url, "https://auth.example.com/login?code=abc");

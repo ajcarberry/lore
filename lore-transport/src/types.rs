@@ -200,6 +200,10 @@ pub struct AuthSession {
     pub session_code: String,
     /// URL the user should visit to authenticate.
     pub login_url: String,
+    /// Device-grant user code, for display beside the URL: the user compares it
+    /// with the one the provider shows (RFC 8628 §3.3.1). `None` for flows
+    /// without one.
+    pub user_code: Option<String>,
 }
 
 /// How the domains a token may be sent to are determined.

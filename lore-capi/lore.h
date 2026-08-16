@@ -2908,6 +2908,17 @@ typedef struct lore_revision_tree_metadata_clear_complete_event_data_t {
   enum lore_error_code_t error_code;
 } lore_revision_tree_metadata_clear_complete_event_data_t;
 
+// Event data carrying a device-grant user code for display.
+//
+// RFC 8628 §3.3.1: the code is shown so the user can compare it with the one
+// the provider shows — the remote-phishing mitigation of §5.4. A separate
+// event rather than a field on [`LoreAuthUrlEventData`], whose layout existing
+// consumers already depend on.
+typedef struct lore_auth_user_code_event_data_t {
+  // The code the user compares with the provider's.
+  struct lore_string_t user_code;
+} lore_auth_user_code_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -3368,6 +3379,9 @@ enum lore_event_id_t {
   LORE_EVENT_REVISION_TREE_BATCH_COMPLETE,
   // A metadata-clear entry completed.
   LORE_EVENT_REVISION_TREE_METADATA_CLEAR_COMPLETE,
+  // A device-grant user code for the user to compare (RFC 8628 §3.3.1).
+  // Appended last so every existing discriminant keeps its value.
+  LORE_EVENT_AUTH_USER_CODE,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -3602,6 +3616,7 @@ typedef struct lore_event_t {
     struct lore_compaction_end_event_data_t compaction_end;
     struct lore_revision_tree_batch_complete_event_data_t revision_tree_batch_complete;
     struct lore_revision_tree_metadata_clear_complete_event_data_t revision_tree_metadata_clear_complete;
+    struct lore_auth_user_code_event_data_t auth_user_code;
   };
 } lore_event_t;
 

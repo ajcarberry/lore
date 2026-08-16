@@ -289,6 +289,7 @@ pub struct LoreAuthLoginInteractiveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUrl`](crate::interface::LoreEvent::AuthUrl) | Emitted with the login URL when no_browser mode is requested (instead of opening browser) |
+/// | [`LoreEvent::AuthUserCode`](crate::interface::LoreEvent::AuthUserCode) | Emitted after `AuthUrl` with the device-grant user code, for the user to compare with the one the provider shows (RFC 8628 §3.3.1) |
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted with user id and display name after successful interactive authentication |
 pub async fn login_interactive(
     globals: LoreGlobalArgs,

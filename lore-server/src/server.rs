@@ -447,12 +447,13 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
             .clone()
             .unwrap_or_else(|| oidc.issuer.clone());
 
-        // The server pins the client id and reads an ID token. An explicit
+        // The server pins the configured audiences — `[client_id]` unless
+        // `audiences` widens the set for a client-id rotation. An explicit
         // `jwt_audience` still wins.
         let jwt_audience = auth
             .jwt_audience
             .clone()
-            .unwrap_or_else(|| vec![oidc.client_id.clone()]);
+            .unwrap_or_else(|| oidc.verification_audiences());
 
         let jwk_service = JwkServiceImpl::new(jwk_settings);
         jwk_service
@@ -2223,6 +2224,7 @@ mod tests {
             OidcSettings {
                 issuer: issuer.to_string(),
                 client_id: "lore".to_string(),
+                audiences: None,
                 authorize_all_repositories: true,
             }
         }
@@ -2230,6 +2232,7 @@ mod tests {
         fn oidc_client_id(client_id: &str) -> OidcSettings {
             OidcSettings {
                 client_id: client_id.to_string(),
+                audiences: None,
                 ..oidc("https://id.example.com")
             }
         }
@@ -2345,6 +2348,7 @@ mod tests {
                 oidc: Some(OidcSettings {
                     issuer: "http://127.0.0.1:1".to_string(),
                     client_id: "lore-client".to_string(),
+                    audiences: None,
                     authorize_all_repositories: true,
                 }),
             };
@@ -2366,6 +2370,7 @@ mod tests {
             let oidc = OidcSettings {
                 issuer: issuer.clone(),
                 client_id: "lore-client".to_string(),
+                audiences: None,
                 authorize_all_repositories: true,
             };
             let auth = AuthSettings {
@@ -2407,6 +2412,7 @@ mod tests {
                 oidc: Some(OidcSettings {
                     issuer: issuer.clone(),
                     client_id: "lore-client".to_string(),
+                    audiences: None,
                     authorize_all_repositories: true,
                 }),
             };
@@ -2454,6 +2460,7 @@ mod tests {
             let oidc = OidcSettings {
                 issuer: issuer.clone(),
                 client_id: "lore-client".to_string(),
+                audiences: None,
                 authorize_all_repositories: true,
             };
             let auth = AuthSettings {

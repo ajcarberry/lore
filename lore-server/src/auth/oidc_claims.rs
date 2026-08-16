@@ -373,6 +373,29 @@ mod oidc_decode {
         assert_eq!(token.user_id, "the-subject");
     }
 
+    /// A client-id rotation: the verifier accepts both the old and the new
+    /// audience while logins move over, so the rotation is a configuration
+    /// change rather than a flag day.
+    #[tokio::test]
+    async fn a_token_for_either_rotating_audience_is_accepted() {
+        let verifier = JwtVerifier::oidc(
+            Arc::new(AgreedUponJWKService),
+            "https://id.example.com".to_string(),
+            vec!["lore".to_string(), "lore-new".to_string()],
+        );
+
+        for audience in ["lore", "lore-new"] {
+            let mut claims = minimal_claims();
+            claims["aud"] = json!(audience);
+            let encoded = encode_jwt(&claims);
+
+            verifier
+                .verify_token(&encoded)
+                .await
+                .unwrap_or_else(|e| panic!("audience {audience} must verify: {e:?}"));
+        }
+    }
+
     /// Core §3.1.3.7 step 5: an `azp` naming another client is refused even
     /// when the audience alone would pass.
     #[tokio::test]

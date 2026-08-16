@@ -117,6 +117,13 @@ authorize_all_repositories = true
 it puts in the `iss` claim — and `client_id` is the public client registered for Lore. Both are
 required when the block is present.
 
+An optional `audiences = [...]` widens what a token's `aud` may satisfy (any-of membership),
+defaulting to `[client_id]`. It exists for one operation: rotating the client id — which is also
+this proposal's mitigation for cross-deployment token confusion, so it has to be a routine change.
+With a scalar audience, rotation is a flag day: no moment exists where tokens minted for the old and
+new ids are both acceptable. Listing both during the rotation, then dropping the old id, removes the
+flag day; Kubernetes made the same scalar-to-list migration for the same reason.
+
 `authorize_all_repositories` must be written down explicitly: a block that omits it (the serde
 default fills in `false`) or sets it `false` fails start-up validation with a message saying
 per-repository authorization is not implemented — so no configuration starts without the operator

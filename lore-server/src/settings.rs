@@ -17,6 +17,8 @@ use lore_storage::hash::StringHash;
 use lore_telemetry::TelemetryConfig;
 use lore_telemetry::TraceConfigError;
 use serde::Deserialize;
+use url::Host;
+use url::Url;
 
 use crate::auth::jwk::JWKServiceSettings;
 use crate::grpc::server::FeatureSettings;
@@ -162,6 +164,7 @@ impl Settings {
         let settings: Settings = settings.try_deserialize()?;
         validate_trace_config(&settings)?;
         validate_feature_config(&settings)?;
+        validate_oidc_config(&settings)?;
         let settings_string = format!("{settings:?}");
         let settings_hash = hash::hash_string(&settings_string);
 
@@ -204,6 +207,95 @@ fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigErro
     Ok(())
 }
 
+/// Whether a host is this machine. `localhost` counts: it resolves to a loopback
+/// address. Deliberately duplicates the rule `lore-transport` applies to an
+/// `oidc+http` auth URL: this copy governs a config-file issuer and that one a
+/// remote-supplied auth URL, and coupling nine lines across the crate boundary
+/// buys less than it costs.
+fn is_loopback_host(host: Option<Host<&str>>) -> bool {
+    match host {
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+/// `[server.auth.oidc]` offers one authorization mode: a verified token authorizes
+/// every repository. `authorize_all_repositories` defaults to `false`, so a configured
+/// block that omits it, or sets it to `false`, fails here rather than starting a
+/// server that verifies every token and then refuses every request.
+///
+/// The issuer's own scheme is checked here too: discovery and the key set are fetched
+/// from it, so `http` is accepted only for a loopback host.
+fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> {
+    let Some(oidc) = settings
+        .server
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.oidc.as_ref())
+    else {
+        return Ok(());
+    };
+
+    let issuer = Url::parse(&oidc.issuer).map_err(|e| {
+        config::ConfigError::Message(format!(
+            "server.auth.oidc.issuer '{}' is not a URL: {e}",
+            oidc.issuer
+        ))
+    })?;
+    if issuer.query().is_some() || issuer.fragment().is_some() {
+        return Err(config::ConfigError::Message(format!(
+            "server.auth.oidc.issuer '{}' must carry no query or fragment: an issuer \
+             identifier is a bare URL, and the derived auth_url appends its own query",
+            oidc.issuer
+        )));
+    }
+    let transport_is_protected = match issuer.scheme() {
+        "https" => true,
+        "http" => is_loopback_host(issuer.host()),
+        _ => false,
+    };
+    if !transport_is_protected {
+        return Err(config::ConfigError::Message(format!(
+            "server.auth.oidc.issuer '{}' must be https, or http for a loopback host: \
+             the discovery document and the signing keys would otherwise be fetched \
+             in the clear, and anyone on the path could choose them",
+            oidc.issuer
+        )));
+    }
+
+    if oidc.client_id.is_empty() {
+        return Err(config::ConfigError::Message(
+            "server.auth.oidc.client_id must not be empty: it is the audience every \
+             token is checked against and the client id every login is started with"
+                .to_string(),
+        ));
+    }
+
+    if let Some(audiences) = oidc.audiences.as_ref()
+        && (audiences.is_empty() || audiences.iter().any(String::is_empty))
+    {
+        return Err(config::ConfigError::Message(
+            "server.auth.oidc.audiences must name at least one non-empty audience \
+             when set; omit it to verify against client_id alone"
+                .to_string(),
+        ));
+    }
+
+    if !oidc.authorize_all_repositories {
+        return Err(config::ConfigError::Message(
+            "server.auth.oidc.authorize_all_repositories must be set to true: \
+             per-repository authorization from provider claims is not implemented, \
+             so a configured [server.auth.oidc] block must say explicitly that a \
+             verified token authorizes every repository on the server"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn trace_config_error_to_config(err: TraceConfigError) -> config::ConfigError {
     if let Some(out_of_range) = err.as_out_of_range() {
         return config::ConfigError::Message(format!(
@@ -224,6 +316,39 @@ pub struct AuthSettings {
     pub jwk: Option<JWKServiceSettings>,
     pub jwt_audience: Option<Vec<String>>,
     pub jwt_issuer: Option<String>,
+    pub oidc: Option<OidcSettings>,
+}
+
+/// `[server.auth.oidc]`: direct in-server verification of a standard `OpenID` Connect
+/// provider's tokens. See `docs/proposals/2026-08-13-oidc-authentication.md`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct OidcSettings {
+    /// The provider's issuer identifier, exactly as it publishes it. The server checks
+    /// it against the discovery document's own `issuer` member byte for byte.
+    pub issuer: String,
+    /// The public client id registered for Lore with the provider.
+    pub client_id: String,
+    /// Audiences a token's `aud` may satisfy (any-of membership). Defaults to
+    /// `[client_id]`. Listing more than one is for client-id rotation: the old
+    /// and new ids stay acceptable while logins move to the new `client_id`,
+    /// so the change is not a flag day.
+    #[serde(default)]
+    pub audiences: Option<Vec<String>>,
+    /// Whether a verified token authorizes every repository on the server. Defaults
+    /// to `false`, which fails startup validation, as does omitting it, because no
+    /// other mode is implemented.
+    #[serde(default)]
+    pub authorize_all_repositories: bool,
+}
+
+impl OidcSettings {
+    /// The audiences tokens are verified against: `audiences` when set,
+    /// otherwise the client id.
+    pub fn verification_audiences(&self) -> Vec<String> {
+        self.audiences
+            .clone()
+            .unwrap_or_else(|| vec![self.client_id.clone()])
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -514,6 +639,186 @@ mod tests {
     use crate::plugins::PluginRegistry;
     use crate::store::resolve_plugin_config_with_fallback;
     use crate::topology::TopologyProvider;
+
+    /// The `[server.auth.oidc]` matrix: block absent (fine), the grant flag
+    /// unacknowledged (fails), and the issuer shapes the server will fetch
+    /// discovery and keys over.
+    mod oidc_settings {
+        use super::*;
+
+        /// A minimal configuration around the given `[server.auth.oidc]` block;
+        /// empty for no block at all. Leaked because `Settings` carries
+        /// `#[serde(bound(deserialize = "'de: 'static"))]`, so `toml::from_str`
+        /// demands a `'static` document.
+        fn settings_with_oidc(oidc_block: &str) -> Settings {
+            let config = format!(
+                r#"
+                [server]
+                runtime_shutdown_timeout_seconds = 0
+
+                {oidc_block}
+
+                [immutable_store]
+                mode = "local"
+
+                [immutable_store.local]
+                path = "/tmp/immutable"
+                flush_delay_seconds = 5
+
+                [mutable_store]
+                mode = "local"
+
+                [mutable_store.local]
+                path = "/tmp/mutable"
+                flush_delay_seconds = 5
+                "#
+            );
+            toml::from_str(String::leak(config)).expect("parses")
+        }
+
+        fn settings_with_issuer(issuer: &str) -> Settings {
+            settings_with_oidc(&format!(
+                r#"
+                [server.auth.oidc]
+                issuer = "{issuer}"
+                client_id = "lore"
+                authorize_all_repositories = true
+                "#
+            ))
+        }
+
+        #[test]
+        fn https_issuer_passes_validation() {
+            assert!(validate_oidc_config(&settings_with_issuer("https://id.example.com")).is_ok());
+        }
+
+        /// The loopback provider the integration tests and the `PocketID` fixture run
+        /// against: nothing leaves the machine, so plaintext costs nothing.
+        #[test]
+        fn http_loopback_issuer_passes_validation() {
+            for issuer in [
+                "http://127.0.0.1:1411",
+                "http://localhost:1411",
+                "http://[::1]:1411",
+            ] {
+                assert!(
+                    validate_oidc_config(&settings_with_issuer(issuer)).is_ok(),
+                    "{issuer}"
+                );
+            }
+        }
+
+        /// A plaintext issuer anywhere else means discovery and the key set travel in
+        /// the clear, so whoever is on the path chooses the keys that verify tokens.
+        #[test]
+        fn http_non_loopback_issuer_fails_validation() {
+            let error = validate_oidc_config(&settings_with_issuer("http://id.example.com"))
+                .expect_err("must fail closed");
+            assert!(error.to_string().contains("loopback"), "{error}");
+        }
+
+        /// An issuer identifier is a bare URL, and the derived `auth_url` appends
+        /// its own query.
+        #[test]
+        fn issuer_with_a_query_or_fragment_fails_validation() {
+            for issuer in [
+                "https://id.example.com?tenant=studio",
+                "https://id.example.com#studio",
+            ] {
+                let error = validate_oidc_config(&settings_with_issuer(issuer))
+                    .expect_err("must fail closed");
+                assert!(error.to_string().contains("query or fragment"), "{issuer}");
+            }
+        }
+
+        #[test]
+        fn absent_block_passes_validation() {
+            assert!(validate_oidc_config(&settings_with_oidc("")).is_ok());
+        }
+
+        /// `authorize_all_repositories` must be written down: the serde default
+        /// fills `false` for an omitted flag, and validation refuses `false`, so
+        /// a block that does not acknowledge the grant refuses to start rather
+        /// than verify every token and then deny every request.
+        #[test]
+        fn an_unacknowledged_grant_fails_validation() {
+            for flag_line in ["", "authorize_all_repositories = false"] {
+                let settings = settings_with_oidc(&format!(
+                    r#"
+                    [server.auth.oidc]
+                    issuer = "https://id.example.com"
+                    client_id = "lore"
+                    {flag_line}
+                    "#
+                ));
+                let error = validate_oidc_config(&settings).expect_err("must fail closed");
+                assert!(
+                    error.to_string().contains("authorize_all_repositories"),
+                    "{error}"
+                );
+            }
+        }
+
+        /// `audiences` exists for client-id rotation, so an explicitly empty
+        /// list (accept nothing) and an empty entry (accept the empty
+        /// audience) are both misconfigurations, refused at startup.
+        #[test]
+        fn empty_audiences_fail_validation() {
+            for audiences_line in [r#"audiences = []"#, r#"audiences = ["lore", ""]"#] {
+                let settings = settings_with_oidc(&format!(
+                    r#"
+                    [server.auth.oidc]
+                    issuer = "https://id.example.com"
+                    client_id = "lore"
+                    authorize_all_repositories = true
+                    {audiences_line}
+                    "#
+                ));
+                let error = validate_oidc_config(&settings).expect_err("must fail closed");
+                assert!(error.to_string().contains("audiences"), "{error}");
+            }
+        }
+
+        /// The verification audiences are `[client_id]` unless `audiences`
+        /// widens the set — the shape that makes a client-id rotation a
+        /// config change rather than a flag day.
+        #[test]
+        fn verification_audiences_default_to_the_client_id() {
+            let oidc = OidcSettings {
+                issuer: "https://id.example.com".to_string(),
+                client_id: "lore".to_string(),
+                audiences: None,
+                authorize_all_repositories: true,
+            };
+            assert_eq!(oidc.verification_audiences(), vec!["lore".to_string()]);
+
+            let rotating = OidcSettings {
+                audiences: Some(vec!["lore".to_string(), "lore-new".to_string()]),
+                ..oidc
+            };
+            assert_eq!(
+                rotating.verification_audiences(),
+                vec!["lore".to_string(), "lore-new".to_string()]
+            );
+        }
+
+        /// An empty client id would build a verifier with audience `[""]` and an
+        /// advertised login URL naming no client — a startup misconfiguration
+        /// that must not surface as a per-user login failure.
+        #[test]
+        fn an_empty_client_id_fails_validation() {
+            let settings = settings_with_oidc(
+                r#"
+                [server.auth.oidc]
+                issuer = "https://id.example.com"
+                client_id = ""
+                authorize_all_repositories = true
+                "#,
+            );
+            let error = validate_oidc_config(&settings).expect_err("must fail closed");
+            assert!(error.to_string().contains("client_id"), "{error}");
+        }
+    }
 
     #[test]
     fn test_settings_with_plugin_sections() {

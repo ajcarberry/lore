@@ -14,24 +14,20 @@ mod storage_remote_tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::time::Duration;
 
     use lore::storage::close;
     use lore::storage::open;
     use lore::storage::open::LoreStorageOpenArgs;
     use lore::storage::open::LoreStorageRemoteConfig;
     use lore_base::runtime::LORE_CONTEXT;
-    use lore_revision::environment::EnvironmentConfig;
     use lore_revision::event::LoreEvent;
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
-    use lore_server::grpc::server::FeatureSettings;
-    use lore_server::grpc::server::GrpcServerBuilder;
-    use lore_server::hooks::HookDispatcher;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
+    use crate::common::grpc_common::serve_grpc_server;
     use crate::setup_execution;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -91,63 +87,8 @@ mod storage_remote_tests {
         // serving on it.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let signal = async {
-            shutdown_rx.await.ok();
-        };
-
-        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
-            Arc::new(lore_server::notification::local::NotificationSender::default());
-        let hook_dispatcher = Arc::new(HookDispatcher::empty());
-
-        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
-        // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
-                .with_immutable_store(backend_immutable.clone(), backend_immutable)
-                .with_mutable_store(backend_mutable)
-                .with_lock_store(None)
-                .with_notification(notification_sender, None)
-                .with_hook_dispatcher(hook_dispatcher)
-                .with_tls_config(None, None, None)
-                .unwrap()
-                .with_admin_endpoints(HashMap::new(), vec![])
-                .with_http2_config(
-                    None,
-                    None,
-                    Duration::from_secs(30),
-                    None,
-                    Default::default(),
-                    None,
-                )
-                .with_jwt_verifier(None)
-                .unwrap()
-                .serve_with_listener(listener, signal)
-                .await;
-            let _ = stopped_tx.send(match outcome {
-                Ok(()) => "stopped before the test finished".to_string(),
-                Err(error) => format!("failed: {error}"),
-            });
-        });
-
-        // A server that never starts must say so, rather than leaving a client to wait on a socket
-        // nothing is answering.
-        let mut ready = false;
-        for _ in 0..50 {
-            if let Ok(reason) = stopped_rx.try_recv() {
-                panic!("test server on {addr} {reason}");
-            }
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(ready, "test server on {addr} never accepted a connection");
+        let shutdown_tx =
+            serve_grpc_server(listener, backend_immutable, backend_mutable, None).await;
 
         TestServer {
             url: format!("grpc://127.0.0.1:{}", addr.port()),

@@ -75,6 +75,16 @@ available_interval_seconds = 30
 available_timeout_seconds = 5
 store_health_check = false
 
+# Configure an OpenID Connect provider for authentication. The server verifies the
+# provider's tokens itself. Absent by default: an unconfigured server accepts
+# unauthenticated requests on every path, exactly as above. Set
+# authorize_all_repositories to true, and a verified token then lets its user reach
+# every repository on the server. See docs/proposals/2026-08-13-oidc-authentication.md.
+# [server.auth.oidc]
+# issuer = "https://id.example.com"
+# client_id = "lore"
+# authorize_all_repositories = true
+
 # =============================================================================
 # Store Configuration
 # =============================================================================

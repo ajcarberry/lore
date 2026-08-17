@@ -309,4 +309,55 @@ mod oidc_client_tests {
             })
             .await;
     }
+
+    /// The refresh grant: a stored refresh token yields a new ID token and a rotated
+    /// refresh token.
+    ///
+    /// Requires the compose stack (see above).
+    #[tokio::test]
+    async fn refresh_grant_yields_a_new_token_and_rotates_the_refresh_token() {
+        LORE_CONTEXT
+            .scope(setup_execution("test".to_string()), async move {
+                let (fixture, user, auth_url) =
+                    setup().await.expect("PocketID fixture setup failed");
+                let auth = OidcAuthentication::default();
+
+                let token = login_with_pkce(&auth, &fixture, &user, &auth_url)
+                    .await
+                    .expect("The PKCE login should complete");
+                let refresh_token = token
+                    .refresh_token
+                    .clone()
+                    .expect("The login issued no refresh token");
+
+                let refreshed = auth
+                    .refresh_authentication(&auth_url, &refresh_token, "")
+                    .await
+                    .expect("The refresh grant should succeed");
+
+                let claims = fixture
+                    .validate_token(&refreshed.token, CLIENT_ID)
+                    .await
+                    .expect("The refreshed credential did not verify against the issuer's JWKS")
+                    .claims;
+                assert_eq!(
+                    claims.sub, user.id,
+                    "Refreshed token is for another subject"
+                );
+                assert_eq!(refreshed.user_id, user.id);
+                assert_eq!(
+                    refreshed.recipients, token.recipients,
+                    "A refreshed token has the same recipients as the one it replaces"
+                );
+
+                let rotated = refreshed
+                    .refresh_token
+                    .expect("The refresh grant returned no new refresh token");
+                assert_ne!(
+                    rotated, refresh_token,
+                    "The refresh token was not rotated, so a stolen one stays usable"
+                );
+            })
+            .await;
+    }
 }

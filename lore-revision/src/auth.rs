@@ -28,3 +28,17 @@ pub struct LoreAuthUrlEventData {
     /// Authentication URL
     pub url: LoreString,
 }
+
+/// Event data carrying a device-grant user code for display.
+///
+/// RFC 8628 §3.3.1: the code is shown so the user can compare it with the one
+/// the provider shows — the remote-phishing mitigation of §5.4. A separate
+/// event rather than a field on the auth-url event data, whose layout existing
+/// consumers already depend on.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreAuthUserCodeEventData {
+    /// The code the user compares with the provider's.
+    pub user_code: LoreString,
+}

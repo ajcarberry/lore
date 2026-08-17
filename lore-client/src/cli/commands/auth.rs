@@ -125,6 +125,12 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
                     anstyle::Reset
                 );
             }
+            LoreEvent::AuthUserCode(data) => {
+                println!(
+                    "Confirm this code matches the one the provider shows: {}",
+                    data.user_code.as_str()
+                );
+            }
             LoreEvent::Complete(data) if data.status == 0 => {
                 println!(
                     "{}Authentication successful{}",

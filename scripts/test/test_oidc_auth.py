@@ -55,6 +55,10 @@ logger = logging.getLogger(__name__)
 # interval of approval without waiting that ceiling out on a hang.
 DEVICE_LOGIN_TIMEOUT = 60
 
+# The provider group the OIDC test server maps to elevated permissions in its
+# `local.toml` (see `oidc_lore_server`).
+ADMIN_GROUP = "lore-smoke-admins"
+
 
 @dataclasses.dataclass(frozen=True)
 class OidcServer:
@@ -103,6 +107,17 @@ def oidc_lore_server(request, tmp_path_factory, pocket_id, lore_server_executabl
     server_env["LORE__SERVER__AUTH__OIDC__ISSUER"] = pocket_id.issuer
     server_env["LORE__SERVER__AUTH__OIDC__CLIENT_ID"] = pocket_id.ensure_client()
     server_env["LORE__SERVER__AUTH__OIDC__AUTHORIZE_ALL_REPOSITORIES"] = "true"
+
+    # The permission mapping is a TOML table, which the LORE__ env overrides
+    # cannot express (scalars only), so it rides the `local.toml` layer.
+    local_toml = server_root / "lore-server" / "config" / "local.toml"
+    local_toml.write_text(
+        "[server.auth.oidc]\n"
+        'groups_claim = "groups"\n'
+        "\n"
+        "[server.auth.oidc.permission_groups]\n"
+        f'"{ADMIN_GROUP}" = ["obliterate", "migrate"]\n'
+    )
 
     server_proc, server_log_path, server_log_fd = launch_lore_server(
         server_root, server_env, lore_server_executable_path
@@ -282,6 +297,15 @@ class TestOidcAuth:
             repo.repository_info()
 
 
+@pytest.fixture(scope="module")
+def pocket_id_admin(pocket_id):
+    """A user in the admin group the OIDC test server maps to
+    `obliterate` and `migrate` (see the `local.toml` in `oidc_lore_server`)."""
+    user = pocket_id.create_user("loreadmin")
+    pocket_id.add_user_to_group(user, pocket_id.ensure_group(ADMIN_GROUP))
+    return user
+
+
 def _logged_in_repo(new_lore_repo, server, pocket_id, user, isolated_store=False):
     """A repo whose credential store holds `user`'s login."""
     repo = _oidc_repo(new_lore_repo, server, isolated_store=isolated_store)
@@ -356,6 +380,22 @@ class TestOidcAuthorizationBoundaries:
 
         with pytest.raises(LoreException):
             repo.file_obliterate(path=name)
+
+    def test_admin_group_member_can_obliterate(
+        self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_admin
+    ):
+        """Membership in the mapped provider group grants `obliterate` end to
+        end: PocketID puts the group in the ID token (via the scope the server
+        advertises), and the server maps it to the permission the admin
+        service checks."""
+        repo = _logged_in_repo(
+            new_lore_repo, oidc_lore_server, pocket_id, pocket_id_admin
+        )
+        repo.repository_create()
+        name = _commit_file(repo, "regrettable.txt", "rewrite me")
+
+        repo.file_obliterate(path=name)  # must not raise
+
     def test_lock_held_by_another_user_cannot_be_released(
         self, new_lore_repo, oidc_lore_server, pocket_id, pocket_id_user
     ):

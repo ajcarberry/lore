@@ -283,6 +283,78 @@ fn validate_oidc_config(settings: &Settings) -> Result<(), config::ConfigError> 
         ));
     }
 
+    match (
+        oidc.groups_claim.as_deref(),
+        oidc.permission_groups.as_ref(),
+    ) {
+        (None, None) => {
+            if oidc.groups_scope.is_some() {
+                return Err(config::ConfigError::Message(
+                    "server.auth.oidc.groups_scope does nothing without permission_groups \
+                     and groups_claim"
+                        .to_string(),
+                ));
+            }
+        }
+        (Some(claim), Some(groups)) => {
+            if claim.is_empty() {
+                return Err(config::ConfigError::Message(
+                    "server.auth.oidc.groups_claim must not be empty".to_string(),
+                ));
+            }
+            if oidc.groups_scope.as_deref() == Some("") {
+                return Err(config::ConfigError::Message(
+                    "server.auth.oidc.groups_scope must not be empty; omit it to request \
+                     the claim name as the scope"
+                        .to_string(),
+                ));
+            }
+            if groups.is_empty() {
+                return Err(config::ConfigError::Message(
+                    "server.auth.oidc.permission_groups must map at least one group when set"
+                        .to_string(),
+                ));
+            }
+            for (group, permissions) in groups {
+                if group.is_empty() {
+                    return Err(config::ConfigError::Message(
+                        "server.auth.oidc.permission_groups must not map an empty group name"
+                            .to_string(),
+                    ));
+                }
+                if permissions.is_empty() {
+                    return Err(config::ConfigError::Message(format!(
+                        "server.auth.oidc.permission_groups.{group:?} grants no permissions; \
+                         remove the group or grant it one of {GRANTABLE_PERMISSIONS:?}"
+                    )));
+                }
+                for permission in permissions {
+                    if !GRANTABLE_PERMISSIONS.contains(&permission.as_str()) {
+                        return Err(config::ConfigError::Message(format!(
+                            "server.auth.oidc.permission_groups.{group:?} grants unknown \
+                             permission {permission:?}; the grantable permissions are \
+                             {GRANTABLE_PERMISSIONS:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        (Some(_), None) => {
+            return Err(config::ConfigError::Message(
+                "server.auth.oidc.groups_claim grants nothing without \
+                 [server.auth.oidc.permission_groups] mapping groups to permissions"
+                    .to_string(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(config::ConfigError::Message(
+                "server.auth.oidc.permission_groups requires groups_claim: the server has \
+                 to know which ID-token claim names a user's groups"
+                    .to_string(),
+            ));
+        }
+    }
+
     if !oidc.authorize_all_repositories {
         return Err(config::ConfigError::Message(
             "server.auth.oidc.authorize_all_repositories must be set to true: \
@@ -339,6 +411,22 @@ pub struct OidcSettings {
     /// other mode is implemented.
     #[serde(default)]
     pub authorize_all_repositories: bool,
+    /// The ID-token claim naming the user's groups, read only when
+    /// `permission_groups` maps them to permissions. The provider must put the
+    /// claim in the ID token itself; nothing is fetched from the userinfo
+    /// endpoint.
+    #[serde(default)]
+    pub groups_claim: Option<String>,
+    /// The scope the login flows request so the provider includes the groups
+    /// claim. Defaults to the value of `groups_claim`; set it when the
+    /// provider names the scope differently.
+    #[serde(default)]
+    pub groups_scope: Option<String>,
+    /// Extra permissions for members of named provider groups, on top of the
+    /// all-repositories read/write grant: group name to a list drawn from
+    /// `obliterate`, `migrate`, `owner`, and `admin`. Requires `groups_claim`.
+    #[serde(default)]
+    pub permission_groups: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
 impl OidcSettings {
@@ -349,7 +437,21 @@ impl OidcSettings {
             .clone()
             .unwrap_or_else(|| vec![self.client_id.clone()])
     }
+
+    /// The scope the login flows should request so the provider includes the
+    /// groups claim: `groups_scope`, falling back to the claim name. `None`
+    /// when no permission mapping is configured.
+    pub fn requested_groups_scope(&self) -> Option<&str> {
+        self.permission_groups.as_ref()?;
+        self.groups_scope
+            .as_deref()
+            .or(self.groups_claim.as_deref())
+    }
 }
+
+/// The permission strings the authorization checks consume. Everything else in
+/// a `permission_groups` list is a typo, refused at startup.
+const GRANTABLE_PERMISSIONS: [&str; 4] = ["obliterate", "migrate", "owner", "admin"];
 
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
@@ -788,6 +890,9 @@ mod tests {
                 issuer: "https://id.example.com".to_string(),
                 client_id: "lore".to_string(),
                 audiences: None,
+                groups_claim: None,
+                groups_scope: None,
+                permission_groups: None,
                 authorize_all_repositories: true,
             };
             assert_eq!(oidc.verification_audiences(), vec!["lore".to_string()]);
@@ -800,6 +905,103 @@ mod tests {
                 rotating.verification_audiences(),
                 vec!["lore".to_string(), "lore-new".to_string()]
             );
+        }
+
+        /// The permission mapping is validated as a unit: each half without the
+        /// other is a misconfiguration, and a typo in a permission name must
+        /// fail startup rather than silently grant nothing.
+        #[test]
+        fn permission_group_validation_fails_closed() {
+            let cases = [
+                (r#"groups_claim = "groups""#, "grants nothing without"),
+                (
+                    r#"[server.auth.oidc.permission_groups]
+                       "lore-admins" = ["obliterate"]"#,
+                    "requires groups_claim",
+                ),
+                (
+                    r#"groups_claim = "groups"
+                       [server.auth.oidc.permission_groups]
+                       "lore-admins" = ["oblitorate"]"#,
+                    "unknown permission",
+                ),
+                (
+                    r#"groups_claim = "groups"
+                       [server.auth.oidc.permission_groups]
+                       "lore-admins" = []"#,
+                    "grants no permissions",
+                ),
+                (r#"groups_scope = "groups""#, "does nothing"),
+                (
+                    r#"groups_claim = "groups"
+                       groups_scope = ""
+                       [server.auth.oidc.permission_groups]
+                       "lore-admins" = ["obliterate"]"#,
+                    "groups_scope must not be empty",
+                ),
+            ];
+            for (block, expected) in cases {
+                let settings = settings_with_oidc(&format!(
+                    r#"
+                    [server.auth.oidc]
+                    issuer = "https://id.example.com"
+                    client_id = "lore"
+                    authorize_all_repositories = true
+                    {block}
+                    "#
+                ));
+                let error = validate_oidc_config(&settings).expect_err(expected);
+                assert!(error.to_string().contains(expected), "{block}: {error}");
+            }
+        }
+
+        #[test]
+        fn a_complete_permission_mapping_passes_validation() {
+            let settings = settings_with_oidc(
+                r#"
+                [server.auth.oidc]
+                issuer = "https://id.example.com"
+                client_id = "lore"
+                authorize_all_repositories = true
+                groups_claim = "groups"
+                [server.auth.oidc.permission_groups]
+                "lore-admins" = ["obliterate", "migrate"]
+                "#,
+            );
+            validate_oidc_config(&settings).expect("a valid mapping starts");
+        }
+
+        /// The requested scope falls back to the claim name, and is absent
+        /// entirely when no mapping is configured — a deployment without group
+        /// mapping never asks the provider for a scope it may not define.
+        #[test]
+        fn requested_groups_scope_derivation() {
+            let base = OidcSettings {
+                issuer: "https://id.example.com".to_string(),
+                client_id: "lore".to_string(),
+                audiences: None,
+                groups_claim: None,
+                groups_scope: None,
+                permission_groups: None,
+                authorize_all_repositories: true,
+            };
+            assert_eq!(base.requested_groups_scope(), None);
+
+            let mapped = OidcSettings {
+                groups_claim: Some("roles".to_string()),
+                permission_groups: Some(std::collections::HashMap::from([(
+                    "lore-admins".to_string(),
+                    vec!["obliterate".to_string()],
+                )])),
+                ..base.clone()
+            };
+            assert_eq!(mapped.requested_groups_scope(), Some("roles"));
+
+            let renamed = OidcSettings {
+                groups_scope: Some("profile-groups".to_string()),
+                ..mapped
+            };
+            assert_eq!(renamed.requested_groups_scope(), Some("profile-groups"));
         }
 
         /// An empty client id would build a verifier with audience `[""]` and an

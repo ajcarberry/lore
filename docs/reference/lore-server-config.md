@@ -217,13 +217,36 @@ The `oidc` block does not replace `jwt_issuer`, `jwt_audience`, and `[server.aut
 | `client_id` | none (required) | The public client id registered for Lore with the provider. |
 | `audiences` | `[client_id]` | Audiences a token's `aud` may satisfy (any one of them). Set it to widen acceptance during a client-id rotation — the old and new ids stay acceptable while logins move to the new `client_id` — then drop the old id when the rotation completes. |
 | `authorize_all_repositories` | none (required) | A configured block that omits this, or sets it to `false`, fails startup validation: a verified token authorizes every repository on the server, and per-repository authorization from provider claims is not implemented, so an operator has to say explicitly that the coarse grant is what they want. |
+| `groups_claim` | none | The ID-token claim naming a user's groups, read only to apply `permission_groups`. The provider must put the claim in the ID token itself (Lore fetches nothing from the userinfo endpoint); the two fields are validated together, each requiring the other. |
+| `groups_scope` | value of `groups_claim` | The scope the login flows request so the provider includes the groups claim. Set it only when the provider names the scope differently from the claim. |
+| `permission_groups` | none | Table mapping provider group names to extra permissions, drawn from `obliterate`, `migrate`, `owner`, and `admin`. Members of a mapped group get the union of the listed permissions on top of the all-repositories grant; everyone else, and any token without the claim, gets the ordinary grant and nothing more. An unknown permission name fails startup validation. |
 
 ```toml
 [server.auth.oidc]
 issuer = "https://id.example.com"
 client_id = "lore"
 authorize_all_repositories = true
+groups_claim = "groups"
+
+[server.auth.oidc.permission_groups]
+"lore-admins" = ["obliterate", "migrate"]
 ```
+
+### Claims read from a verified token
+
+Under `[server.auth.oidc]`, these are all the claims the server reads from a verified ID token — nothing else in the token affects any decision:
+
+| Claim | Required | Use |
+| --- | --- | --- |
+| `iss` | yes | Must equal the configured `issuer`, byte for byte. |
+| `sub` | yes | The user's identity — the value repository creators, lock owners, and log spans record. Never substituted with email or display claims. |
+| `aud` | yes | Must contain one of the configured `audiences` (`[client_id]` by default). String and array forms both accepted. |
+| `azp` | when `aud` names several audiences | Must name one of the configured audiences; a multi-audience token without it is refused. |
+| `exp` | yes | Expiry, enforced with 60 seconds of clock leeway. |
+| `iat` | yes | Issued-at, recorded on the in-process token. |
+| `name` | no | Display name, falling back to `sub`. |
+| `preferred_username` | no | Display username, falling back to `sub`. |
+| the `groups_claim` claim | no | Read only when `permission_groups` is configured; group membership maps to the extra permissions listed there. A missing or wrong-shaped claim grants nothing. |
 
 Configuring the OIDC block also fills in the `auth_url` the server advertises to clients (see [Environment discovery](#environment-discovery)), so an operator configures authentication in one place: a server that verifies OpenID Connect tokens also tells clients to log in with OpenID Connect. An explicit `environment.endpoint.auth_url` still wins.
 

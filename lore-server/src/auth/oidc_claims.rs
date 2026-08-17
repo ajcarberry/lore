@@ -32,6 +32,47 @@ pub(crate) struct OidcTokenClaims {
     authorized_party: Option<String>,
     name: Option<String>,
     preferred_username: Option<String>,
+    /// Every claim the named fields do not consume, kept so the configured
+    /// groups claim can be read without a second decode.
+    #[serde(flatten)]
+    additional: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `[server.auth.oidc.permission_groups]`: which ID-token claim names the
+/// user's groups, and the permissions each mapped group grants.
+#[derive(Clone, Debug)]
+pub(crate) struct GroupPermissions {
+    pub claim: String,
+    pub groups: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl GroupPermissions {
+    /// The union of the permissions granted to every mapped group the token's
+    /// claim names, in sorted order. A missing claim, a wrong-shaped claim, or
+    /// membership in no mapped group grants nothing — the token still carries
+    /// the ordinary all-repositories grant, never more.
+    fn granted(&self, claims: &OidcTokenClaims) -> Vec<String> {
+        let named = match claims.additional.get(&self.claim) {
+            // Core defines no shape for a groups claim; an array of strings is
+            // what providers emit, with a bare string as the collapsed form.
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            Some(serde_json::Value::String(value)) => vec![value.as_str()],
+            _ => return Vec::new(),
+        };
+
+        let mut granted: Vec<String> = named
+            .into_iter()
+            .filter_map(|group| self.groups.get(group))
+            .flatten()
+            .cloned()
+            .collect();
+        granted.sort();
+        granted.dedup();
+        granted
+    }
 }
 
 impl OidcTokenClaims {
@@ -45,38 +86,43 @@ impl OidcTokenClaims {
             None => self.audience.len() <= 1,
         }
     }
-}
 
-impl From<OidcTokenClaims> for AuthorizationToken {
     /// Maps a minimal provider-issued token onto the shape the rest of the
     /// server reads, with the display fields falling back to `sub`. `resources`
-    /// is always the all-repositories wildcard: this conversion is reachable
+    /// is always the all-repositories wildcard — this conversion is reachable
     /// only from a [`JwtVerifierMode::Oidc`] verifier, whose
-    /// `authorize_all_repositories` configuration is what the wildcard records.
+    /// `authorize_all_repositories` configuration is what the wildcard records —
+    /// carrying the permissions the verifier's group mapping granted, if any.
     ///
     /// [`JwtVerifierMode::Oidc`]: crate::auth::jwt::JwtVerifierMode::Oidc
-    fn from(claims: OidcTokenClaims) -> Self {
-        let display_name = claims.name.unwrap_or_else(|| claims.user_id.clone());
-        let preferred_username = claims
+    pub(crate) fn into_authorization_token(
+        self,
+        group_permissions: Option<&GroupPermissions>,
+    ) -> AuthorizationToken {
+        let permission = group_permissions
+            .map(|mapping| mapping.granted(&self))
+            .unwrap_or_default();
+        let display_name = self.name.unwrap_or_else(|| self.user_id.clone());
+        let preferred_username = self
             .preferred_username
-            .unwrap_or_else(|| claims.user_id.clone());
+            .unwrap_or_else(|| self.user_id.clone());
 
         AuthorizationToken {
-            user_id: claims.user_id,
-            issuer: claims.issuer.clone(),
-            issued_at: claims.issued_at,
-            expires: claims.expires,
-            audience: claims.audience,
+            user_id: self.user_id,
+            issuer: self.issuer.clone(),
+            issued_at: self.issued_at,
+            expires: self.expires,
+            audience: self.audience,
             env: String::default(),
             name: display_name,
             preferred_username,
             resources: Some(vec![ResourcePermission {
                 resource_id: "urc-*".to_string(),
-                permission: vec![],
+                permission,
             }]),
             groups: None,
             is_service_account: None,
-            idp: claims.issuer,
+            idp: self.issuer,
         }
     }
 }
@@ -411,6 +457,122 @@ mod oidc_decode {
         assert!(
             matches!(error, JwtVerifierError::AuthorizedPartyMismatch),
             "{error:?}"
+        );
+    }
+
+    fn mapped_verifier() -> JwtVerifier {
+        oidc_verifier().with_group_permissions(crate::auth::oidc_claims::GroupPermissions {
+            claim: "groups".to_string(),
+            groups: std::collections::HashMap::from([
+                (
+                    "lore-admins".to_string(),
+                    vec!["obliterate".to_string(), "migrate".to_string()],
+                ),
+                ("lore-operators".to_string(), vec!["migrate".to_string()]),
+            ]),
+        })
+    }
+
+    /// `[server.auth.oidc.permission_groups]`: membership in mapped groups
+    /// grants the union of their permission lists on the wildcard resource.
+    #[tokio::test]
+    async fn mapped_groups_grant_their_permissions() {
+        let mut claims = minimal_claims();
+        claims["groups"] = json!(["lore-operators", "unmapped-team"]);
+        let encoded = encode_jwt(&claims);
+
+        let token = mapped_verifier()
+            .verify_token(&encoded)
+            .await
+            .expect("a mapped member verifies");
+
+        let resources = token.resources.expect("wildcard resource is populated");
+        assert_eq!(resources[0].permission, vec!["migrate".to_string()]);
+
+        let mut claims = minimal_claims();
+        claims["groups"] = json!(["lore-admins", "lore-operators"]);
+        let token = mapped_verifier()
+            .verify_token(&encode_jwt(&claims))
+            .await
+            .expect("an admin member verifies");
+        assert_eq!(
+            token.resources.expect("wildcard")[0].permission,
+            vec!["migrate".to_string(), "obliterate".to_string()],
+            "the union of both groups, deduplicated and sorted"
+        );
+    }
+
+    /// Fail closed: a token with no groups claim, or membership in no mapped
+    /// group, carries the ordinary grant and nothing more.
+    #[tokio::test]
+    async fn unmapped_or_missing_groups_grant_nothing() {
+        let no_claim = mapped_verifier()
+            .verify_token(&encode_jwt(&minimal_claims()))
+            .await
+            .expect("a token without the claim still authenticates");
+        assert!(
+            no_claim.resources.expect("wildcard")[0]
+                .permission
+                .is_empty(),
+            "no claim grants nothing"
+        );
+
+        let mut claims = minimal_claims();
+        claims["groups"] = json!(["some-other-team"]);
+        let unmapped = mapped_verifier()
+            .verify_token(&encode_jwt(&claims))
+            .await
+            .expect("an unmapped member still authenticates");
+        assert!(
+            unmapped.resources.expect("wildcard")[0]
+                .permission
+                .is_empty(),
+            "unmapped membership grants nothing"
+        );
+
+        let mut claims = minimal_claims();
+        claims["groups"] = json!({"not": "a group list"});
+        let wrong_shape = mapped_verifier()
+            .verify_token(&encode_jwt(&claims))
+            .await
+            .expect("a wrong-shaped claim still authenticates");
+        assert!(
+            wrong_shape.resources.expect("wildcard")[0]
+                .permission
+                .is_empty(),
+            "a wrong-shaped claim grants nothing"
+        );
+    }
+
+    /// Providers differ over collapsing a single-element array to a bare
+    /// string, for a groups claim as for `aud`.
+    #[tokio::test]
+    async fn a_bare_string_groups_claim_is_read() {
+        let mut claims = minimal_claims();
+        claims["groups"] = json!("lore-admins");
+        let token = mapped_verifier()
+            .verify_token(&encode_jwt(&claims))
+            .await
+            .expect("a bare-string claim verifies");
+        assert_eq!(
+            token.resources.expect("wildcard")[0].permission,
+            vec!["migrate".to_string(), "obliterate".to_string()]
+        );
+    }
+
+    /// Without a configured mapping, a groups claim in the token changes
+    /// nothing — the provider cannot steer authorization uninvited.
+    #[tokio::test]
+    async fn groups_grant_nothing_without_a_configured_mapping() {
+        let mut claims = minimal_claims();
+        claims["groups"] = json!(["lore-admins"]);
+        let token = oidc_verifier()
+            .verify_token(&encode_jwt(&claims))
+            .await
+            .expect("verifies as an ordinary token");
+        assert!(
+            token.resources.expect("wildcard")[0].permission.is_empty(),
+            "an unconfigured server reads no groups claim"
         );
     }
 

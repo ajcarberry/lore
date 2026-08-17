@@ -66,6 +66,7 @@ use crate::auth::discovery;
 use crate::auth::jwk::JWKService;
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
+use crate::auth::oidc_claims::GroupPermissions;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -471,11 +472,13 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
             }
             service
         };
-        return Ok(Some(JwtVerifier::oidc(
-            jwk_service,
-            jwt_issuer,
-            jwt_audience,
-        )));
+        let mut verifier = JwtVerifier::oidc(jwk_service, jwt_issuer, jwt_audience);
+        if let (Some(claim), Some(groups)) =
+            (oidc.groups_claim.clone(), oidc.permission_groups.clone())
+        {
+            verifier = verifier.with_group_permissions(GroupPermissions { claim, groups });
+        }
+        return Ok(Some(verifier));
     }
 
     let Some(jwk) = auth.jwk.as_ref() else {
@@ -500,7 +503,15 @@ async fn build_jwt_verifier(auth: Option<&AuthSettings>) -> Result<Option<JwtVer
 fn derive_oidc_auth_url(oidc: &OidcSettings) -> String {
     let client_id: String =
         url::form_urlencoded::byte_serialize(oidc.client_id.as_bytes()).collect();
-    format!("oidc+{}?client_id={client_id}", oidc.issuer)
+    match oidc.requested_groups_scope() {
+        // Advertised only when group mapping is on, so a deployment without it
+        // never asks the provider for a scope it may not define.
+        Some(scope) => {
+            let scope: String = url::form_urlencoded::byte_serialize(scope.as_bytes()).collect();
+            format!("oidc+{}?client_id={client_id}&scope={scope}", oidc.issuer)
+        }
+        None => format!("oidc+{}?client_id={client_id}", oidc.issuer),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2237,6 +2248,9 @@ mod tests {
                 issuer: issuer.to_string(),
                 client_id: "lore".to_string(),
                 audiences: None,
+                groups_claim: None,
+                groups_scope: None,
+                permission_groups: None,
                 authorize_all_repositories: true,
             }
         }
@@ -2280,6 +2294,32 @@ mod tests {
             assert_eq!(
                 derive_oidc_auth_url(&oidc_client_id("lore studio&co")),
                 "oidc+https://id.example.com?client_id=lore+studio%26co"
+            );
+        }
+
+        /// The groups scope rides on the advertised URL only when a permission
+        /// mapping is configured, so an unmapped deployment never asks the
+        /// provider for a scope it may not define.
+        #[test]
+        fn groups_scope_is_advertised_only_with_a_mapping() {
+            let mut mapped = oidc("https://id.example.com");
+            mapped.groups_claim = Some("groups".to_string());
+            mapped.permission_groups = Some(std::collections::HashMap::from([(
+                "lore-admins".to_string(),
+                vec!["obliterate".to_string()],
+            )]));
+
+            assert_eq!(
+                derive_oidc_auth_url(&mapped),
+                "oidc+https://id.example.com?client_id=lore&scope=groups"
+            );
+
+            let mut unmapped = oidc("https://id.example.com");
+            unmapped.groups_claim = Some("groups".to_string());
+            assert_eq!(
+                derive_oidc_auth_url(&unmapped),
+                "oidc+https://id.example.com?client_id=lore",
+                "a claim with no mapping advertises nothing"
             );
         }
     }
@@ -2365,6 +2405,9 @@ mod tests {
                     issuer: format!("http://{address}"),
                     client_id: "lore".to_string(),
                     audiences: None,
+                    groups_claim: None,
+                    groups_scope: None,
+                    permission_groups: None,
                     authorize_all_repositories: true,
                 }),
             };
@@ -2396,6 +2439,9 @@ mod tests {
                     issuer: "http://127.0.0.1:1".to_string(),
                     client_id: "lore-client".to_string(),
                     audiences: None,
+                    groups_claim: None,
+                    groups_scope: None,
+                    permission_groups: None,
                     authorize_all_repositories: true,
                 }),
             };
@@ -2418,6 +2464,9 @@ mod tests {
                 issuer: issuer.clone(),
                 client_id: "lore-client".to_string(),
                 audiences: None,
+                groups_claim: None,
+                groups_scope: None,
+                permission_groups: None,
                 authorize_all_repositories: true,
             };
             let auth = AuthSettings {
@@ -2460,6 +2509,9 @@ mod tests {
                     issuer: issuer.clone(),
                     client_id: "lore-client".to_string(),
                     audiences: None,
+                    groups_claim: None,
+                    groups_scope: None,
+                    permission_groups: None,
                     authorize_all_repositories: true,
                 }),
             };
@@ -2508,6 +2560,9 @@ mod tests {
                 issuer: issuer.clone(),
                 client_id: "lore-client".to_string(),
                 audiences: None,
+                groups_claim: None,
+                groups_scope: None,
+                permission_groups: None,
                 authorize_all_repositories: true,
             };
             let auth = AuthSettings {

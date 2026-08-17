@@ -1,0 +1,898 @@
+---
+lep: 2026-08-13-oidc-authentication
+title: Direct in-server OpenID Connect authentication
+authors:
+  - Alex Carberry
+status: Draft
+created: 2026-08-13
+updated: 2026-08-16
+discussion: <LEP PR — to be opened>
+---
+
+# Direct in-server OpenID Connect authentication
+
+## Summary
+
+Self-hosted Lore deployments have no way to authenticate users: the only login backend in the tree
+speaks to an Epic-internal service, so every server outside Epic runs open. Operators are asking to
+put Lore behind the identity provider they already run — PocketID, Keycloak, Entra ID, Okta — and
+their users expect `lore login` to work the way `gh auth login` does.
+
+This proposal relies on that provider for authentication end to end, using only standard
+[OpenID Connect](https://openid.net/specs/openid-connect-core-1_0.html) and OAuth 2.0 mechanisms.
+The server verifies the provider's tokens directly: the operator names an issuer and a client id in
+configuration, the server finds the signing keys through
+[OIDC Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html), and from then on every
+repository operation — gRPC, HTTP, and QUIC alike — requires a valid token from that issuer.
+Authorization is deliberately simple: a verified identity may use every repository on the server;
+deciding who gets in is the provider's job. The CLI gains one new scheme in its existing
+authentication registry, implementing three standard flows — authorization code with PKCE
+([RFC 7636](https://www.rfc-editor.org/rfc/rfc7636)) where there's a browser, the device
+authorization grant ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) where there isn't, and the
+refresh grant so a session outlives its first token. Nothing new is deployed — no broker, no
+sidecar, no Lore-minted tokens — and a server that doesn't configure this is unchanged.
+
+## Motivation
+
+**An operator who self-hosts Lore wants it behind the identity provider they already run.** PocketID,
+Keycloak, Entra ID, Authentik — whichever one already holds their team's accounts, their offboarding
+procedure, and their second factor. They want Lore to be one more client registered there, not a
+system with its own idea of who exists. Their users want `lore login` to behave the way
+[`gh auth login`](https://cli.github.com/manual/gh_auth_login) and
+[kubectl's OpenID Connect support](https://kubernetes.io/docs/reference/access-authn-authz/authentication/)
+behave: approve in a browser, and the CLI works until the token expires.
+
+**No Lore deployment outside Epic can authenticate at all today.** The single client-side
+authentication scheme in the tree, `ucs-auth`, speaks to an Epic-internal service, and no shipped
+server configuration turns authentication on. Every self-hosted deployment therefore runs open, which
+is what the [quickstart](../tutorials/quickstart.md) tells operators to do and what the
+[FAQ](../faq.md) acknowledges when it lists OAuth integration among planned additions rather than
+present ones.
+
+**Operators are asking for exactly this, unprompted.** In
+[issue #60](https://github.com/EpicGames/lore/issues/60) an operator points Lore at a Microsoft Entra
+tenant; in [issue #161](https://github.com/EpicGames/lore/issues/161) another points it at a
+self-hosted provider and then tries to log in. Neither is a bug report about a feature Lore offers —
+both are operators reaching for a deployment Lore does not support.
+[Issue #59](https://github.com/EpicGames/lore/issues/59) asks for the headless half of the same
+story, credentials on a machine with no browser.
+
+**Why now.** Authentication is the first wall an adopter hits. A single user experimenting with Lore
+runs it open without noticing, but the moment the server holds anything a team shares, running it
+open stops being acceptable — so every evaluation that outgrows one person stalls here. It is the
+natural next step for anyone adopting Lore, not a niche request, and nothing in the tree meets it.
+
+## Goals / Non-Goals
+
+### Goals
+
+1. **An operator secures a Lore server with any conformant provider by naming an issuer and a client
+   id** — no other configuration, and nothing new to deploy or operate.
+2. **A standards-compliant OpenID Connect implementation, carrying no provider-specific code.**
+   Every endpoint and every key comes from the provider's own discovery document, and every flow is a
+   standard OAuth grant, so supporting a new provider is a configuration change, not a code change.
+3. **A verified token from the trusted issuer authorizes every repository on the server**, and the
+   configuration states the grant in terms of what it grants.
+4. **All three public protocols enforce it identically.** gRPC, HTTP, and QUIC reach the same
+   verifier and the same authorization decision.
+5. **A user logs in from the CLI with standard flows, and stays logged in** — authorization code with
+   PKCE where there is a browser, the device grant where there is not, and the refresh grant so the
+   session outlives the first token.
+6. **Tokens keep living in the existing credential store, and the token-recipient guard keeps
+   holding.** A token obtained for one remote is never sent to another.
+7. **An unconfigured server behaves exactly as it does today.** Absent settings mean no
+   authentication, on every path, with no new code between a request and its handler.
+
+### Non-Goals
+
+- **Per-repository authorization from provider claims or groups.** No standard claim carries it, and
+  mapping one is a design of its own; a follow-up LEP owns it.
+- **Deferring per-repository checks to an authorization service under OIDC.** Authentication (which
+  identity a token proves) and authorization (which repositories that identity may touch) are separate
+  axes: an OIDC deployment may still point `environment.endpoint.auth_url` at Epic's
+  relationship-based authorization service, and this proposal keeps `authorize_all_repositories = true`
+  the only supported OIDC mode. Extending `authorize_all_repositories = false` to route per-repository
+  checks to that service is a follow-up LEP; it is **not** implemented here.
+- **Replacing or removing `ucs-auth`.** The two schemes coexist in the registry, and Epic's
+  deployment is unaffected.
+- **Server-minted tokens or token exchange.** Lore issues nothing and signs nothing.
+- **SAML, LDAP, Kerberos, or a web interface.** OpenID Connect only, driven from the CLI.
+- **Several issuers on one server.** A deployment federating several identity sources does that in
+  the provider, which is what providers are for.
+
+## Proposed Design
+
+### Server configuration (Goal 1)
+
+`AuthSettings` gains one optional block:
+
+```toml
+[server.auth.oidc]
+issuer = "https://id.example.com"
+client_id = "lore"
+authorize_all_repositories = true
+```
+
+`issuer` is the provider's issuer identifier, exactly as the provider publishes it — the same string
+it puts in the `iss` claim — and `client_id` is the public client registered for Lore. Both are
+required when the block is present.
+
+An optional `audiences = [...]` widens what a token's `aud` may satisfy (any-of membership),
+defaulting to `[client_id]`. It exists for one operation: rotating the client id — which is also
+this proposal's mitigation for cross-deployment token confusion, so it has to be a routine change.
+With a scalar audience, rotation is a flag day: no moment exists where tokens minted for the old and
+new ids are both acceptable. Listing both during the rotation, then dropping the old id, removes the
+flag day; Kubernetes made the same scalar-to-list migration for the same reason.
+
+`authorize_all_repositories` must be written down explicitly: a block that omits it (the serde
+default fills in `false`) or sets it `false` fails start-up validation with a message saying
+per-repository authorization is not implemented — so no configuration starts without the operator
+having acknowledged the grant. This
+proposal offers one authorization mode and it is a coarse one, so an operator has to write down that
+they want it. Both defaults would be wrong — `true` grants every repository to every authenticated
+identity on the strength of an omission, and `false` starts a server that verifies every token and
+then refuses every request.
+
+The block supplies what the existing settings otherwise ask for twice: `jwt_issuer` and
+`jwt_audience` derive from `issuer` and `client_id`, and `[server.auth.jwk].endpoint` from discovery.
+An explicitly set value still wins, which keeps the `file://` key-set endpoint
+([issue #32](https://github.com/EpicGames/lore/issues/32),
+[PR #44](https://github.com/EpicGames/lore/pull/44)) reachable as an offline escape hatch.
+
+### Discovery (Goal 2)
+
+At start-up the server fetches `{issuer}/.well-known/openid-configuration`
+([OpenID Connect Discovery 1.0](https://openid.net/specs/openid-connect-discovery-1_0.html) §4) and
+reads exactly two members: `issuer`, which must equal the configured issuer byte for byte (§4.3), and
+`jwks_uri`, which becomes the endpoint the existing key-set service already fetches, caches,
+throttles, and rotates keys under. Nothing else. The endpoints a login flow uses are the client's
+business, and the client fetches the same document for itself, so the server never relays a
+provider's endpoints and cannot serve them stale. Three checks together make fetching a discovery
+URL safe, and each defends against a different substitution: the issuer equality check refuses a
+*different provider's genuine* document (the mix-up case — it cannot refuse a forged response,
+whose author simply echoes the configured issuer); the fetch follows no redirects, so the document
+must come from the issuer's own origin; and the returned `jwks_uri` is held to the same
+https-or-loopback rule as the issuer, so even a hostile document cannot point the key fetch at a
+plaintext endpoint or a local file.
+
+This is the whole answer to PR #22's coupling objection. The server holds one provider-specific
+string and it is configuration — no per-provider code path, no per-provider claim policy, no release
+coupled to a provider's behavior. The two provider quirks the tree has already met, Entra omitting
+the OPTIONAL `alg` member (issue #60, [PR #65](https://github.com/EpicGames/lore/pull/65)) and key
+rotation under an unchanged key id ([issue #78](https://github.com/EpicGames/lore/issues/78),
+[PR #99](https://github.com/EpicGames/lore/pull/99)), were both fixed as conformance to
+[RFC 7517](https://www.rfc-editor.org/rfc/rfc7517) rather than as provider special cases.
+
+### The token the server verifies
+
+The client presents the **ID token**
+([OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html) §2), because it is
+the only token OpenID Connect guarantees: guaranteed to exist, to be a signed JWT, and to carry the
+client id in `aud`, which is the value the server pins. Access tokens may be opaque
+([RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) §1.4), so requiring a verifiable access token
+would reintroduce exactly the provider coupling this proposal exists to avoid. **Drawbacks** records
+the cost, and **Future work** names the standards-track route out of it.
+
+Verification therefore needs a claim shape a conformant ID token satisfies. The verifier today tries
+two claim structs, both demanding the Lore-specific `env`, `name`, and `preferred_username`, so a
+correctly signed token naming the right audience is refused at deserialization before authorization
+is reached. A third and final decode reads only what
+[RFC 7519](https://www.rfc-editor.org/rfc/rfc7519) and Core guarantee — `iss`, `sub`, `aud`, `exp`,
+`iat` — treats `name` and `preferred_username` as optional, and falls back to `sub` for
+display. It tests `aud` for membership rather than equality, because Core §2 defines it as an array
+and providers differ over collapsing a single-element one to a bare string; when `aud` names more
+than one audience, Core §3.1.3.7 steps 4–5 apply, and a token whose `azp` is absent or names a
+different client is refused — without that check, a provider configured to put Lore's client id in
+another application's audience would make that application's tokens open every repository here. This is additive rather
+than a widening for two reasons: the new decode runs only once both existing decodes have failed,
+which today is an outright rejection, and it is gated on the OIDC block, so a `ucs-auth` deployment
+accepts exactly what it accepts today.
+
+The algorithm allowlist tightens in the same mode. The key-set loader already refuses to *infer* a
+symmetric algorithm and already refuses a key whose declared algorithm belongs to another key type —
+the algorithm-confusion forgery. What it still honors is a provider *declaring* `HS256` on an `oct`
+key in its published key set, which is a signing key for anyone who can read it. OIDC mode refuses
+symmetric algorithms outright, leaving `RS*`, `PS*`, `ES*`, and `EdDSA`. `alg: none` needs no
+separate narrowing: the decoder has no such variant in any mode.
+
+### One authorization mode, named for what it grants (Goal 3)
+
+When `authorize_all_repositories` is on and a token verifies against the pinned issuer, the verifier
+populates the resulting in-process `AuthorizationToken` with the wildcard resource the authorization
+model already carries, `urc-*`. `ResourcePermission` already treats that value as matching every
+repository, and `verify_authorization` already returns `Ok(())` for it under an existing test, so
+`verify_authorization` needs no new argument and no change.
+
+**Why the grant belongs on the token.** `verify_authorization` has seven callers, and only four are
+places the verifier or the server settings can reach: the gRPC interceptors, the HTTP middleware, and
+the two QUIC entry points. The other three hold only an `AuthorizationToken` recovered from request
+extensions or a connection's attribute map — both `copy` handlers, which authorize a *source*
+repository other than the connected one, and the link-read authorizer, which decides which linked
+repositories a read may traverse. A mode threaded as a per-call argument would have to reach those
+three through layers that have no business knowing about authentication settings, and a missed site
+would fail closed for `copy` and silently narrow link traversal. On the token, every consumer,
+present and future, is correct by construction.
+
+The wildcard exists only in the in-process token, for the duration of the request: nothing
+re-serializes it, nothing signs it, nothing returns it to a client, and no Lore signing key exists
+anywhere in this design. This is a degenerate case of the third option
+[ADR-00003](../developing/decisions/00003-auth-tokens-for-sub-repos.md) considered and rejected — one
+token that only identifies the user, with the server resolving authorization — which ADR-00003
+rejected because the server would perform authorization work per connection, possibly involving
+external I/O. That objection does not reach a constant read from configuration, but it does reach the
+per-repository follow-up, which is why that is a separate LEP replacing one function rather than
+revisiting seven call sites.
+
+**Repository delete is the one operation this mode does not reach.** It is the only repository
+operation whose authorization does not run through `verify_authorization`: it asks the
+relationship-based authorization service when one is configured, and otherwise checks that the
+caller is the repository's recorded creator. Under OIDC alone no authorization service is configured,
+so delete takes that second path and runs *narrower* than the grant — the safer of two answers rather
+than a designed one, since letting any verified identity delete any repository is wider than this
+proposal argues for anywhere else. **Unresolved Questions** asks which it should settle into.
+
+### Elevated permissions from provider groups
+
+Four operations run narrower than the all-repositories grant, each keying on a permission string
+the wildcard resource does not carry: obliterate (`obliterate`), locking as another user
+(`migrate`), releasing another user's lock (`owner`/`admin`), and repository delete's
+creator-ownership fallback. Without an assignment path, the first three are unreachable for every
+OIDC identity — not restricted but inaccessible, with no break-glass short of unsecuring the
+server. The assignment path is the operator's provider groups:
+
+```toml
+[server.auth.oidc]
+groups_claim = "groups"
+
+[server.auth.oidc.permission_groups]
+"lore-admins" = ["obliterate", "migrate"]
+```
+
+Members of a mapped group get the union of the listed permissions on the wildcard resource, on top
+of the ordinary grant. Everything about the mapping fails closed: a token without the claim, a
+wrong-shaped claim, or membership in no mapped group grants nothing; a permission name outside the
+enumerated set (`obliterate`, `migrate`, `owner`, `admin`) fails start-up validation, because a typo
+that silently grants nothing is how an operator discovers the mapping at the worst time; and the two
+fields are validated together, each requiring the other.
+
+The claim is read from the **verified ID token only** — the userinfo endpoint is deliberately not
+consulted, because a per-request fetch would end the design's statelessness and a cached one needs a
+caching design of its own (the per-repository follow-up LEP owns that trade, which every surveyed
+implementation eventually confronted: providers routinely omit group claims from ID tokens unless
+configured to include them). The operator's provider must therefore be configured to put the claim
+in the ID token, and the client has to request whatever scope makes that happen: the server
+advertises it on the auth URL (`oidc+https://…?client_id=lore&scope=groups`), derived from
+`groups_scope` and falling back to the claim name, so only a deployment that maps groups ever
+requests a scope the provider may not define, and the operator controls its spelling. The scope
+rides the existing advertisement mechanism; an older client ignores the parameter and its users
+simply carry no elevated permissions.
+
+This narrows one sentence in **Security Considerations**: with a mapping configured, the named
+claim steers the *enumerated elevated permissions* — an operator opt-in with a bounded blast
+radius, not a general claim policy. A deployment that maps no groups reads no claim beyond the
+required set, exactly as before.
+
+### The enforcement points (Goal 4)
+
+Every plug point that admits a request already holds a verifier, and this proposal adds and moves
+none. Three protocols, four entry points, because the QUIC storage protocol has two versions in
+service: the gRPC tonic interceptors, installed only when a verifier exists; the HTTP middleware; and
+QUIC's `Connect::handle_auth` and v4 `AuthorizeStart`, each verifying once per connection or session,
+following ADR-00003's one-token-per-connection shape. Because the grant travels on the token, all
+four admit a request identically and every downstream check reaches the same verdict from the same
+value. The same mechanism completes the `JWTAuthnInterceptor` placeholder, so the repository service
+stops being a hole in the model.
+
+The environment service stays unauthenticated, as its own documentation states: a client has to be
+able to ask how to authenticate before it can authenticate. The health check stays open.
+
+### Advertising the provider (Goal 2, and the shape of issue #161)
+
+The server advertises the provider through the existing `EnvironmentGet` `auth_url` string:
+
+```text
+oidc+https://id.example.com?client_id=lore
+oidc+https://id.example.com/realms/studio?client_id=lore
+```
+
+When the OIDC block is configured and `environment.endpoint.auth_url` is empty, the server derives
+this string rather than making the operator write the issuer down twice; an explicitly configured
+`auth_url` still wins. Verification and advertisement stop being two independent settings that can
+disagree, which is the trap issue #161 fell into: a server can verify tokens perfectly while telling
+every client it has no authentication.
+
+The scheme is the dispatch key. `authentication::find` splits on the first `://` and looks the prefix
+up in the registry, so `oidc+https` registers as one entry and `oidc+http` as another the
+implementation accepts only for a loopback issuer. The `+` composition follows Git's convention for
+transport-qualified remotes (`git+https`, `svn+ssh`), and stripping the prefix yields the issuer
+unchanged, which matters because issuer validation is a byte comparison. The `client_id` parameter is
+safe to append, an issuer identifier being forbidden a query or fragment component (Discovery §2),
+and is not a secret, this being a public client using PKCE.
+
+**Advertisement is the only thing that ever sees the derived URL.** The server also reads `auth_url`
+internally as a dial target for Epic's relationship-based authorization service — repository create,
+delete, and list each dial it — so an `oidc+https://…` string reaching any of those would point it at
+the identity provider and fail the operation. The design keeps that impossible by construction rather
+than by guarding each reader: the login URL is derived and applied *only* in the `EnvironmentGet`
+response, set on the outgoing `Environment` clone and never written back to the `environment` internal
+consumers read. For a deployment configuring OIDC and nothing else, that internal `auth_url` stays
+empty, so every consumer's dial target is `None` and no per-consumer scheme test exists. Authorization
+then keys on whether an authorization service is configured, not on how a URL is spelled: a configured
+`auth_url` is always a real authorization service, because the one string that is not — the derived
+OIDC login URL — appears at the response boundary and nowhere else.
+
+### The client implementation (Goal 5)
+
+One `Authentication` implementation registers for `oidc+https` and `oidc+http` beside `ucs-auth`. It
+parses the issuer and parameters out of the auth URL, fetches the same discovery document the server
+did — it needs `authorization_endpoint`, `token_endpoint`, and `device_authorization_endpoint`, none
+of which the server has reason to relay — and fits three standard flows onto the trait's existing
+start-and-poll shape, on the net runtime the
+[runtime-split LEP](2026-07-24-tokio-runtime-split-and-async-io.md) established. Those endpoints are
+remote input, held to the rule the auth URL is held to: https, or http only to a loopback host. The
+authorization endpoint in particular becomes the URL handed to `open::that`, which asks the desktop
+to launch whatever URI it names, so a `javascript:` or `file:` endpoint in a compromised provider's
+document would be a local-execution primitive rather than a failed login.
+
+**Browser login** is the authorization code flow with PKCE
+([RFC 7636](https://www.rfc-editor.org/rfc/rfc7636)) over a loopback redirect. `start_auth_session`
+binds a listener on `127.0.0.1:0`, generates the verifier, `state`, and `nonce`, and returns the
+provider's authorization URL; `poll_auth_session` waits for the redirect, checks `state`, exchanges
+the code, and validates the `nonce`. Redirecting to a kernel-assigned loopback port is the mechanism
+[RFC 8252](https://www.rfc-editor.org/rfc/rfc8252) §7.3 specifies for native applications, and the
+reason a native client needs no client secret and no registered public callback host.
+
+**Headless login** is the device authorization grant
+([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)), which `lore login --no-browser` is already
+shaped for: it emits the login URL as an event instead of opening a browser. PocketID 2.6.2, the
+provider this work validates against, completes the grant, so the headless path is proven rather than
+deferred; a provider advertising no device endpoint gets a typed `NotSupported` naming the missing
+capability, because the alternative — printing the authorization URL to open elsewhere — cannot
+complete when that flow's redirect goes to a loopback listener on *this* host. Selecting between the
+two ceremonies is the one trait change: `start_auth_session` gains a `LoginFlow` argument, whose
+value comes from the existing `--no-browser` flag, and `ucs-auth` ignores it.
+
+**Staying logged in** is the refresh grant, requested with the `offline_access` scope. The
+authorization request deliberately omits `prompt=consent`, which Core §11 names as the condition for
+offline access absent other provider policy: sending it would put a consent screen in front of every
+login, and the providers this targets issue refresh tokens to a public client without it. A provider
+that instead silently drops the scope leaves a session lasting one token lifetime — the assumption
+recorded under **Risks and Assumptions**.
+`AuthenticationToken.refresh_token` and the credential store's refresh-token slot already exist and
+already treat refresh tokens as separately stored and rotated, so this fills in an implementation
+rather than extending a mechanism. A refreshed response need not carry an ID token (Core §12.2), so
+the client treats it as optional there and refuses with a message naming what the provider omitted;
+at login it is never optional, because it is what the `nonce` travels on. The grant is consumed where
+an expired stored token would otherwise dead-end, in the authorization exchange, and it is
+best-effort in the strict sense: a revoked token, a provider that is down, and `ucs-auth`'s
+`NotSupported` all leave the caller holding exactly the expired token, so refreshing can spare a user
+a re-login but can never fail an operation that would otherwise have succeeded. One attempt per
+operation, single-flighted across concurrent callers, because the grant spends a single-use token.
+
+**What the implementation declines.** `exchange_for_repository` and `exchange_for_custom_resource`
+return the authentication token unchanged, because there is nothing to exchange it with and nothing
+to mint; ADR-00003's call shape survives, and this is the seam the per-repository follow-up works at.
+`exchange_external_token`, `get_user_info`, and `get_user_id` return `NotSupported`, because the
+provider owns identity resolution and this proposal reads no directory. One claim relaxes on the
+client to match the server's: `JWTUserInfo.name` becomes `Option<String>` falling back to `sub`,
+because `name` is an optional claim delivered with the `profile` scope, and requiring it makes a
+login fail after having succeeded, while rendering who logged in.
+
+The flows are implemented on `reqwest`, `jsonwebtoken`, `ring`, and `url`, all already workspace
+dependencies; **Alternatives Considered** states the trade-off against the `openidconnect` crate
+rather than dismissing it.
+
+### Keeping the token-recipient guard (Goal 6)
+
+The threat the guard exists for is written down in `lore-revision/src/auth.rs`: an attacker stands up
+a server whose environment names a trusted auth service, a user clones from it, and the CLI dutifully
+sends that service's token to the attacker. The defense is an acceptable-root-domain set stored
+beside each token and filtered on load.
+
+The orchestration layer derives that set today by decoding the token and concatenating `iss` and
+`aud`, which works for `ucs-auth`, where the auth service issues `aud` as a list of root domains. It
+cannot work for OpenID Connect, where `aud` carries a client id and `iss` is a URL rather than a bare
+host: both fail the domain comparison against any remote, so every OIDC login would refuse its own
+token. `AuthenticationToken` already carries an `acceptable_root_domains` field that `ucs_auth.rs`
+leaves empty, with a comment saying the orchestration layer fills it in from the JWT. This proposal
+makes that field authoritative when non-empty: the implementation knows its own tokens' audience
+semantics, and the orchestration layer stops guessing. `ucs-auth` returns an empty vector and keeps
+today's behavior exactly; the OIDC implementation returns the issuer's **host**, because a token can
+always go back to the party that issued it, and the orchestration layer adds the host of the remote
+the login was performed against, the only layer that knows it. An OIDC token is therefore usable at
+the remote you logged in to and at its issuer, nowhere else, without asking the operator to configure
+their own public hostname, and refreshing keeps the set recorded at login rather than the refreshed
+token's own.
+
+**Recording the set is half the guard.** The other half is refusing to load a token for a recipient
+the set does not name, and the authorization exchange has to do that itself: identity-resolving
+callers already load under a recipient filter, but `exchange` is also called directly, with an
+explicit identity, from the connection path. So `exchange` loads the authentication token only if it
+is acceptable both for the auth service it is about to be presented to and for the remote the
+resulting authorization token is destined for. Where the authorization token *is* the authentication
+token — exactly the OIDC passthrough — that check is the whole distance between a stored credential
+and any remote advertising the issuer it came from. Recording the recipient on the way out, rather
+than checking it on the way in, would record it just as obligingly for an attacker's remote. One
+consequence is visible to users: the store keys tokens by `(auth_url, identity)` and holds one per
+pair, so two deployments sharing an issuer and a client id share a bucket, and logging in to one
+evicts the other's token.
+
+### Goal tracing
+
+Goal 1 → **Server configuration**. Goal 2 → **Discovery** and **Advertising the provider**. Goal 3 →
+**One authorization mode**. Goal 4 → **The enforcement points**. Goal 5 → **The client
+implementation**. Goal 6 → **Keeping the token-recipient guard**. Goal 7 → **Compatibility**, below.
+
+## Compatibility
+
+- **Wire format** — N/A. No message, framing, serialization, or byte layout changes. The QUIC
+  `Connect` message already carries an optional token as its payload and carries the same one.
+
+- **Client/server protocols** — No new or changed RPC, and `lore-proto` has no diff: the provider
+  travels in the existing `EnvironmentEndpoint.auth_url` string. *An unconfigured server* behaves
+  exactly as today on every path — no verifier exists, so the HTTP middleware inserts no identity,
+  QUIC skips verification, the gRPC interceptors are never installed, the authorization mode never
+  comes into existence, and the third claim decode is gated off. *An old client against a new secured
+  server* reads `oidc+https://…`, finds no registered implementation, and fails immediately with an
+  error naming the scheme and listing the ones it has; a repository operation returns
+  `NotAuthenticated`. No path lets it reach a repository unauthenticated, because the server's
+  refusal does not depend on the client understanding the scheme. *A new client against an old or
+  unconfigured server* is unchanged: the advertised `auth_url` is empty or `ucs-auth://`, and the new
+  registry entry is inert.
+
+- **On-disk format** — N/A for repositories: no fragment flag, index, or schema change, and an
+  upgraded and a downgraded Lore read the same repositories. The credential store gains no field —
+  `acceptable_root_domains` and `refresh_token` both already exist, both `#[serde(default)]`.
+
+- **CLI and public API** — Additive. `lore login`, `lore auth login --no-browser`, `lore auth info`,
+  `list`, `logout`, and `clear` keep their syntax, exit codes, and output; against a secured server
+  they now succeed instead of failing. `lore auth info <user-id>` against a secured server reports
+  that the provider exposes no directory lookup, a new message on a path that does not work there
+  today. No `lore-capi` or JS binding surface changes, and no existing script breaks.
+
+- **Rust crate surfaces** — Five changes, one altering an existing behavior and none crossing the C
+  or JavaScript boundary. `JWTUserInfo.name` becomes `Option<String>`, strictly widening what
+  deserializes. `Authentication::start_auth_session` gains a `LoginFlow` argument whose value comes
+  from the existing `--no-browser` flag. The gRPC server builder gains a `with_advertised_auth_url`
+  step carrying the derived OIDC login URL, an `Option<String>` that is `None` for every deployment
+  today. `repository_authorizer` keeps both its signature and its rule — an authorization client for a
+  configured `auth_url`, allow-all without one — unchanged from today. And `user_permissions` now
+  unions permissions across every resource entry matching the repository, the `urc-*` wildcard among
+  them, where it previously returned the first exact match and lost the wildcard's list to a failed
+  id parse. That last one is the behavioral change: a token already carrying `urc-*` with a
+  non-empty permission list — a shape `has_required_permission` has always honored — now also
+  satisfies `can_obliterate` and `is_owner_or_admin` on every repository. An operator whose auth
+  service issues wildcard permission lists should audit what they grant before upgrading.
+
+- **Configuration** — Additive and backward-compatible. `[server.auth.oidc]` is a new optional block,
+  and the three existing `AuthSettings` fields keep their meanings when set explicitly. One new
+  start-up failure, by design: a block without `authorize_all_repositories = true` refuses to start.
+
+## Non-Functional Considerations
+
+- **Concurrency** — No new shared mutable state on the server beyond the once-resolved discovery
+  handle. Discovery is attempted at start-up and, if the provider is unreachable then, resolved on
+  first use — throttled the way key fetches are, because an unauthenticated caller can drive
+  attempts. Key fetches go through the existing key-set service, whose refresh mutex already collapses
+  concurrent misses into one outbound request and whose minimum refresh interval already bounds
+  fetches however many unknown key ids arrive — both tested, and both load-bearing here, because an
+  unauthenticated caller can present arbitrary key ids. Verification is a pure function of the token
+  and a cached key. On the client, a pending login is one task owning one listener.
+
+- **Memory** — Bounded and small, with nothing proportional to repository or file size. The key-set
+  and discovery documents are read under the existing 1 MiB cap, by an accumulating read that does
+  not trust `Content-Length`, and tokens are kilobytes. This proposal never touches a payload.
+
+- **Statelessness** — The server gains none. It holds the key cache it already holds, and every
+  authorization decision is a function of one token: no session, no nonce store, no replay cache, no
+  revocation list. That is what keeps a secured server as horizontally scalable as an unsecured one —
+  the property PR #22's design lists as an unresolved question for itself. On the client, pending
+  login state dies with the command; only tokens outlive it, in the store that already holds them.
+
+- **Determinism** — Unaffected, because nothing here enters repository content, addressing, or
+  history: two runs of the same operation against the same revision produce the same result whether
+  or not authentication is on. Token verification is not deterministic in the same sense and cannot
+  be, reading the clock for `exp` and the provider's current key set for the signature.
+
+- **Runtime placement and latency** — Discovery and key-set fetches are network I/O on the net
+  runtime the [runtime-split LEP](2026-07-24-tokio-runtime-split-and-async-io.md) established. This
+  proposal adds no blocking call and does not worsen the known `block_in_place` in the gRPC
+  interceptor, because the all-repositories path takes the identical cached-then-fallback route the
+  resource-claim path takes. The cost is one extra round trip attempted at start-up — the
+  server starts either way, with verification failing closed until discovery succeeds, so its
+  availability is never coupled to the provider's at boot (a self-hosted deployment restarting Lore
+  and its provider together would otherwise deadlock on boot order; Kubernetes resolves its OIDC
+  authenticator asynchronously for the same reason). Steady-state latency is unchanged,
+  verification on a warm cache being a signature check and claim comparisons with no I/O.
+
+## Migration Plan
+
+`N/A — no breaking changes, no migration required.`
+
+Turning it on is a configuration change and a restart; turning it off is the same in reverse — remove
+the block, restart, and the server is unsecured again with no state to clean up, because the design
+stores none. Tokens issued in the meantime expire on their own, and a client whose token is refused
+falls back to the same `NotAuthenticated` path it uses today.
+
+## Implementation Phases
+
+The implementation lands as a stacked series of pull requests, each dependency-ordered on the one
+before it, each compiling and passing its own tests in isolation, and each carrying a reviewer's
+guide plus links to the previous and next PR in its description. No phase changes behavior ahead of
+the phase that documents it; flows not yet landed report `NotSupported`.
+
+| # | Part | Scope | Proof |
+| --- | --- | --- | --- |
+| 1 | This LEP | Design, security model, prior art | n/a (prose) |
+| 2 | Server verification | `[server.auth.oidc]` settings and validation, discovery with pinning and resilient start-up, the OIDC verification mode (`azp`, symmetric refusal, audiences), wiring and the advertised auth URL; PocketID test infrastructure | Unit tests, plus the live-provider verification matrix over HTTP and gRPC |
+| 3 | Client login | Credential groundwork, `TokenRecipients`/`LoginFlow`, the `oidc+` schemes, PKCE over the loopback redirect, the device authorization grant with the displayed user code | Unit tests, plus live-provider login flows |
+| 4 | Session persistence | The refresh grant, and the single-flighted refresh on the exchange path | The `auth_exchange` battery, plus a live-provider refresh |
+| 5 | End to end | CLI smoke suite, CI job, operator how-to | Smoke suite in CI against a live provider |
+| 6 | Elevated permissions | `permission_groups` mapping, the advertised scope, and the wildcard-permission plumbing | Unit tests, plus a live grant/deny pair through the CLI |
+
+## Security Considerations
+
+**The trust model changes in one specific way: the operator's provider becomes a trust boundary.** An
+identity the provider admits is an identity Lore admits. That is the point of the feature, and a
+smaller change than it sounds — the server trusts the provider to *authenticate* and nothing more,
+reading no roles and, unless the operator maps `permission_groups`, no groups — absent that
+opt-in, it cannot be steered by any claim the provider chooses to add, and with it, a provider
+claim steers only the enumerated elevated permissions the operator mapped. The mapped group names
+are themselves part of that boundary: the mapping trusts the provider's group assignment, so a
+mapped name must be one only the provider's administrators can hand out — never a group users can
+create or join self-service.
+
+**Clock leeway is stated, not inherited:** verification allows 60 seconds on `exp`, written down as
+an explicit decision rather than left to the JWT library's default — a provider-issued token crosses
+two clocks the operator does not control, and no surveyed deployment defends a tighter tolerance.
+
+**Pinning is what keeps trusting one provider from meaning trusting any provider.** Four pins, each
+on a value the operator configured or the provider published: the discovery document's `issuer` must
+equal the configured issuer (Discovery §4.3), the token's `iss` must equal it too, the token's `aud`
+must contain the configured client id, and `exp` must not have passed. Discovery and key-set fetches
+go over TLS through the shared rustls-backed HTTP client. The verification algorithm comes from the
+key, never from the token header — the existing pin, tested against a forgery that signs with the
+public modulus as an HMAC secret — and OIDC mode refuses symmetric algorithms outright, closing the
+case of a provider publishing a symmetric secret in its own key set.
+
+None of these pins is configurable off, and the audience pin is paired with the `azp` rule for
+multi-audience tokens — worth stating as a posture, because the two deployed systems closest to
+this model shipped weaker: Argo CD accepted tokens minted for unrelated applications for four years
+([CVE-2023-22482](https://github.com/argoproj/argo-cd/security/advisories/GHSA-q9hr-j4rf-8fjc),
+CVSS 9.0), and Grafana's provider-JWT mode left issuer and audience as opt-in configuration that
+[silently failed open](https://github.com/grafana/grafana/issues/58231).
+
+**Identity is `sub`, and only `sub`.** The subject identifier is the one claim `OpenID` Connect
+guarantees stable and unique per issuer (Core §5.7); email and username claims are mutable,
+reusable, and in some providers attacker-influenced — Grafana keyed identity on the email claim and
+it was a CVSS 9.4 account takeover
+([CVE-2023-3128](https://github.com/grafana/bugbounty/security/advisories/GHSA-gxh2-6vvc-rrgp)).
+Here `sub` keys the credential store, the creator record, lock ownership, and the log span;
+`name`/`preferred_username` are display-only fallbacks that never enter a comparison. A future
+contributor "improving" display handling must not change that.
+
+**The all-repositories grant is the sharpest edge here, and it is stated plainly.** Every identity
+the provider admits can read and write every repository on the server: no per-repository distinction,
+no read-only identity, no administrative separation. Because the wildcard reaches every consumer, a
+`copy` may name any repository as its source, a link traversal may read any linked repository, and
+the repository service's check resolves to allow-all — each a restatement of the first sentence
+rather than an inconsistency for an operator to discover, and repository delete the one exception,
+running narrower. An operator whose repositories have different audiences needs the per-repository
+follow-up LEP or one server per trust boundary, and `authorize_all_repositories` has no default
+precisely so that nobody arrives here by omission. The grant introduces no new authorization
+primitive: `urc-*` is a value the permission type already implements, and PR #22's own reference
+implementation ships it as its default resource policy.
+
+**The login flows carry the risk the standards designed them around.** For the browser flow, the
+redirect goes to `127.0.0.1` on a port the kernel assigned to a listener this process holds, so the
+loopback interface binds the response to the process that started the flow (RFC 8252 §7.3); PKCE S256
+makes an intercepted code useless without the verifier, which never leaves the process; and `state`
+is checked before the code is used and `nonce` after, so neither a cross-session response nor a
+replayed token is accepted. The [OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700) is
+the shape of all of this. The device flow's surface is the user rather than the protocol — its
+premise, approving on one device something initiated on another, is the premise a phishing message
+needs too — and RFC 8628 §3.3.1 and §5.4's mitigations are limited to displaying the user code for
+comparison and honoring `interval` and `slow_down` (§3.5). It stays opt-in behind `--no-browser`.
+
+**Refresh tokens are the longest-lived secret this design stores**, and they go where Lore's tokens
+already go: the existing credential store, encrypted, with the OS keyring holding the key, and
+rotated on use. Failures stay non-oracular: the gRPC interceptor collapses every verification failure
+into a uniform `permission_denied`, and the OIDC path adds failure modes and no responses.
+
+**Two residual risks, named rather than buried.** *Token confusion between deployments* is inherent to
+ID-token verification. `aud` names the client id, which identifies the application rather than the
+server, so any deployment behind the same issuer and client id accepts any other's tokens, a harvested
+token opens all of them, and a malicious server advertising a real deployment's issuer and client id
+collects, from a user who points `lore login` at it, a token the real server would also accept. The
+recipient guard neither prevents this nor is meant to; it prevents the *stored* token from a different
+remote leaking, which it still does. The mitigation is a distinct `client_id` per deployment, which
+gives each its own audience and its own credential-store bucket. Binding a token to one deployment
+with RFC 8707/9068 would narrow the residual further — to the targeted variant alone, where an
+attacker advertises *your* identifier and the user still chooses to log in, which no audience
+restriction can distinguish from a legitimate login — and **Future work** describes that route and why
+it is deferred. *Presenting an ID token as a bearer credential to a resource server*, second, is a
+compromise the standards discourage, recorded in **Drawbacks** rather than argued away.
+
+## Privacy Considerations
+
+**The server sees an identity where it previously saw none.** For a token carrying only the required
+claims that is the provider's subject identifier, its issuer, and the client id — no email, no name,
+no group membership, because the server reads none of those and the provider need not send them.
+Where the provider does include `name`, `preferred_username`, or `email`, they are in the token the
+server verifies and so are visible to the operator. That is the same category of data a Lore token
+already carries, and it reaches Lore only because the operator's own provider put it there.
+
+**What reaches logs needs care, and one existing line is the reason.** The verifier logs the whole
+decoded claim set at `debug` — Lore's own claims under `ucs-auth`, but potentially an email address
+or anything else a provider chose to add under an ID token — so the implementation narrows that line
+to the fields Lore uses. Beyond it, `sub` is recorded as the user-id span field, which is what it is
+for. Tokens, authorization codes, code verifiers, device codes, and refresh tokens are never logged.
+
+**Deletion and expiry are unaffected, and slightly better.** The server persists no identity: no
+session table, no user store, nothing to delete when a user leaves. Revoking access is revoking it at
+the provider, and the next token fails to verify. On the client, `lore auth logout` and `lore auth
+clear` already remove stored tokens, and refresh tokens go with them.
+
+## Risks and Assumptions
+
+**Assumptions**
+
+- **Assumption:** the target provider serves a discovery document at
+  `{issuer}/.well-known/openid-configuration` whose `issuer` matches, and publishes asymmetric keys —
+  *invalidated if:* a deployment must use a provider with no discovery endpoint, which the explicit
+  `[server.auth.jwk].endpoint` covers, or one publishing only symmetric keys, which nothing covers.
+- **Assumption:** the ID token is a signed JWT whose `aud` contains the client id, per Core §2, and
+  is therefore verifiable by the existing verifier — *invalidated if:* a provider encrypts ID tokens
+  by default, or issues them with an `aud` the server cannot pin.
+- **Assumption:** providers grant `offline_access`, or issue refresh tokens by default, to a public
+  native client without `prompt=consent` (which this design omits to keep a consent screen out of
+  every login; Core §11) — *invalidated if:* a deployment's provider refuses, leaving a session that
+  lasts one ID-token lifetime and a user who re-runs `lore login`, which the CLI has to say clearly
+  rather than failing opaquely.
+- **Assumption:** an all-repositories grant is useful to real self-hosted operators, most of whom run
+  one team's repositories on one server — *invalidated if:* early feedback says the coarse grant is
+  unusable, which makes the per-repository follow-up a prerequisite rather than a successor.
+- **Assumption:** the larger auth overhaul the maintainers mentioned on PR #22 in June 2026, whose
+  details are undisclosed, does not preclude direct in-server verification — *invalidated if:*
+  maintainer feedback on this LEP reveals conflicting plans. Opening this proposal early is the
+  mitigation; implementation effort ahead of that signal is at risk.
+
+**Risks**
+
+- **Risk:** a server restarts while the provider is unreachable and comes up with no keys, refusing
+  every request — *mitigation:* the server starts regardless and resolves discovery on first use, so
+  the outage window is the provider's own rather than a boot-order deadlock; the explicit
+  `[server.auth.jwk].endpoint` accepts a `file://` key set (issue #32, PR #44) as the fully offline
+  escape hatch, and within a running process the existing cache means a provider outage does not
+  immediately break verification.
+- **Risk:** a consumer of `auth_url` other than the client registry is missed, and an `oidc+https`
+  URL reaches code expecting an authorization service, failing repository operations against a live
+  provider — *materialized during implementation:* the design assumed one such consumer and there are
+  six, because repository create and delete each have two independent implementations that dial the
+  service themselves, and repository list dials it to enumerate what a user may see. *Mitigation, as
+  shipped:* the derived URL is confined to the `EnvironmentGet` response boundary and never enters the
+  environment internal consumers read (see **Advertising the provider**), so no consumer can receive
+  it, however many there are; plus integration and end-to-end coverage against a live provider, which
+  is what turned a design assumption into a caught bug.
+- **Risk:** two deployments sharing an issuer and client id share one credential-store bucket, so
+  logging in to one evicts the other's token — *mitigation:* a distinct `client_id` per deployment
+  gives distinct auth URLs and distinct buckets; documented in the operator guide.
+- **Risk:** an unauthenticated caller drives outbound key-set fetches by cycling unknown key ids —
+  *mitigation:* already bounded and tested — the minimum refresh interval throttles fetches once any
+  key is cached, the refresh mutex collapses concurrent misses, and a failure no key could rescue
+  never asks for a refresh at all.
+- **Risk:** hand-rolled flow code gets a security detail wrong that a maintained crate would have got
+  right — *mitigation:* each mechanism is small, specified, and testable in isolation (PKCE challenge
+  derivation, `state` and `nonce` comparison, discovery parsing, the polling state machine), and the
+  device grant is scriptable end to end against PocketID 2.6.2, so CI covers the rejection matrix
+  without a browser and only the passkey ceremony stays verified by hand.
+
+## Drawbacks
+
+- The server depends on an external HTTP service being reachable at start-up to obtain the keys it
+  verifies with.
+- Lore owns the correctness of PKCE, the device flow, discovery parsing, and refresh handling instead
+  of a library maintainer.
+- The all-repositories grant is too coarse for any operator needing different access to different
+  repositories, and they must wait for the follow-up LEP.
+- Presenting an ID token as a bearer credential to a resource server is a compromise the standards
+  discourage, taken because it is the only token OpenID Connect guarantees is verifiable; **Future
+  work** names the standards-track alternative and why it is deferred.
+- A second authentication scheme means every `lore auth` subcommand has two implementations to behave
+  consistently across, and one of them cannot answer `get_user_info`.
+
+## Alternatives Considered
+
+### A token-minting broker service
+
+[PR #22](https://github.com/EpicGames/lore/pull/22) proposes `lore-auth-server`: a service that
+authenticates a user against a provider and mints a Lore JWT the existing verifier accepts unchanged.
+It is a good design for what it targets, a managed deployment, and one reviewer has approved it.
+
+*Rejected because:* it is a third process to deploy, put behind a TLS-terminating proxy, rate-limit,
+monitor, and upgrade, for an operator whose entire deployment today is one binary and a configuration
+file. It introduces a second token format where the provider already issues a perfectly good token.
+And it creates a second trust boundary the operator has to protect: the broker holds a signing key
+minting tokens the server trusts without question, so key storage, rotation, and the blast radius of
+a compromise all become the operator's problem — PR #22 itself lists a single key with no rotation
+procedure, process-local session state preventing a second replica, and no rate limiting as known
+gaps. In a managed deployment those are a team's operational backlog; in a self-hosted one they are a
+burden placed on someone who wanted to put their server behind the provider they already run.
+
+PR #22's stated objection to direct verification is that it "moves OIDC discovery, JWKS handling, and
+claim policy into Lore Server and every client, and ties Lore Server's releases to provider
+specifics". Key-set handling is not moved — it is already in the tree and is the actively maintained
+path there. Discovery is one document and two field reads, and it makes the coupling argument run the
+other way, because the server holds an issuer URL from configuration and no provider-specific code.
+Claim policy is not moved either, because this proposal has none. And the two designs compose rather
+than compete: to a server doing direct verification a broker is just another issuer, so a managed
+deployment that wants `lore-auth-server` points `issuer` at it and gets exactly the design PR #22
+describes, while a self-hosted deployment points `issuer` at its own provider and deploys nothing.
+
+### The `openidconnect` or `oauth2` crates
+
+Adopt `openidconnect`, or `oauth2` plus manual ID-token validation, for the client flows instead of
+building on `reqwest` and `jsonwebtoken`. The trade-off is genuine: the crates are well maintained,
+rustls-compatible, and license-clean, and they supply discovery, PKCE, the device flow, and refresh
+with their edge cases already handled.
+
+*Rejected because:* what Lore needs is a strict subset — one grant-type family, one client type, no
+dynamic registration, no ID-token encryption, no session management — while the crates bring their
+own HTTP client abstraction and type-state builders that would have to be threaded onto the net
+runtime and onto the `Authentication` trait's start-and-poll shape, and every added dependency and
+its tree has to clear `deny.toml` and the `notices/` requirements. This is the weakest rejection in
+this list, and the decision reverses in either direction, because the flows sit behind one trait
+implementation.
+
+### The status quo — pointing the key-set endpoint at the provider by hand
+
+Configure `jwt_issuer` and `[server.auth.jwk].endpoint` against the provider's own endpoints, which
+is what issues #60 and #161 show operators already doing.
+
+*Rejected because:* it verifies signatures and nothing else works. A conformant ID token is refused
+at deserialization for lacking `env`, `name`, and `preferred_username`; past that, the authorization
+check refuses it for lacking a `resources` claim; and the client is never told there is a provider to
+log in to. It is not a lighter version of this proposal — it is the part of it already in the tree,
+which is why the two issues exist.
+
+### Front Lore with a reverse proxy or `oauth2-proxy`
+
+Terminate authentication in front of the server, as `oauth2-proxy` does for HTTP applications.
+
+*Rejected because:* Lore's primary transport is QUIC, not HTTP, so a proxy cannot cover the protocol
+most traffic uses — the gRPC and HTTP paths would be secured while the QUIC path stayed open, the
+worst possible split. The server would still need the identity for its span fields and for lock
+ownership, so it would have to trust a header the proxy injects, a weaker boundary than a signature
+it verifies itself. And it does nothing for the client, which would still have no way to obtain a
+credential.
+
+### A new proto field for provider advertisement
+
+Add a dedicated field or message to `EnvironmentGet` describing the provider, rather than encoding it
+in `auth_url`.
+
+*Rejected because:* the scheme registry exists to dispatch on exactly this string, and `auth_url` is
+already documented as stored verbatim and interpreted by the client. A new field is also worse on
+compatibility: proto3 makes an old client ignore an unknown field silently, so it would report "no
+authentication configured" — issue #161's confusing failure all over again — where an unknown scheme
+produces an error naming the scheme and listing the ones the client knows.
+
+## Prior Art
+
+- **kubectl and OpenID Connect.** Kubernetes verifies provider-issued ID tokens directly in the API
+  server, configured with an issuer URL and a client id and nothing provider-specific
+  ([authentication reference](https://kubernetes.io/docs/reference/access-authn-authz/authentication/)),
+  and pushes the flows out to the client — the same split, at a much larger scale, and the strongest
+  evidence that direct verification does not couple a server to providers. Worth avoiding: the group
+  and username claim mapping bolted on top, and the configuration surface that grew around it. Two
+  of its migrations are adopted here directly: audiences as a list, because
+  [KEP-3331](https://github.com/kubernetes/enhancements/blob/master/keps/sig-auth/3331-structured-authentication-configuration/README.md)
+  spent multiple releases escaping a scalar audience that made client-id rotation a flag day, and
+  asynchronous authenticator initialization, because coupling the API server's startup to the
+  provider's availability proved wrong in operation.
+- **Argo CD — the cautionary tale for this exact model.** Argo CD also accepts the provider's ID
+  token as its bearer credential, and shipped without audience validation:
+  [CVE-2023-22482](https://github.com/argoproj/argo-cd/security/advisories/GHSA-q9hr-j4rf-8fjc)
+  (CVSS 9.0) meant a token minted for *any other application* at the same provider was accepted.
+  The mandatory audience pin, the `azp` rule, and the refusal to make either configurable-off are
+  this proposal's answer. Two smaller contrasts: Argo CD's loopback listener hardcodes a port the
+  operator must pre-register, where RFC 8252 §7.3's kernel-assigned port needs no registration
+  beyond the loopback address; and lacking a device grant, its headless fallback is a locally-minted
+  API key whose default lifetime is *never* — the credential shape this proposal's device grant
+  exists to avoid.
+- **Grafana's `auth.jwt`.** The closest precedent for provider-JWT-as-bearer-credential — and its
+  issuer and audience checks are opt-in configuration, which
+  [failed open](https://github.com/grafana/grafana/issues/58231) when a config key was misspelled
+  in the defaults. Pins that cannot be turned off, and validation that refuses unknown
+  configuration, are the lesson taken.
+- **MinIO — the exchange model.** MinIO never lets the provider's token touch the data path: one
+  STS exchange mints temporary native credentials
+  ([AssumeRoleWithWebIdentity](https://github.com/minio/minio/blob/master/docs/sts/web-identity.md)).
+  That is the principled alternative to this proposal's ID-token-as-bearer compromise, at the cost
+  of a minting endpoint and its key discipline — the same trade rejected with the broker. Adopted
+  from it instead: reactive key-set refresh on verification failure rather than polling, which this
+  tree already did.
+- **Gitea and Forgejo.** OIDC there is a login source minting a session, never an API credential —
+  the model a web application wants and a stateless multi-protocol server does not. Their issue
+  history is the strongest argument for two choices here. Issuer strings are compared byte for byte
+  and never normalized, because a slash is a difference: trimming the trailing slash from Gitea's
+  advertised issuer broke existing logins
+  ([go-gitea/gitea#35830](https://github.com/go-gitea/gitea/issues/35830)), and Forgejo shipped the
+  same trim, called for impact reports
+  ([forgejo#8634](https://codeberg.org/forgejo/forgejo/issues/8634)), and reverted it
+  ([forgejo#8631](https://codeberg.org/forgejo/forgejo/pulls/8631)). And claim mapping is the
+  dominant source of operational pain — scope changes needed for a groups claim silently not taking
+  effect ([go-gitea/gitea#25617](https://github.com/go-gitea/gitea/issues/25617)), group-claim
+  settings that never applied ([go-gitea/gitea#18388](https://github.com/go-gitea/gitea/issues/18388))
+  — which is why this proposal reads no claims beyond the required set unless an operator maps
+  `permission_groups`, and why that mapping enumerates its permissions and fails closed.
+- **`gh`, and the device grant as the headless default.** GitHub's CLI logs in with the device
+  authorization grant, printing a code to enter on another device
+  ([gh auth login](https://cli.github.com/manual/gh_auth_login)) — the closest analogue to
+  `lore login --no-browser`, and the reason this proposal treats that grant as the headless path
+  rather than as an exotic option.
+- **Git credential helpers.** Git owns no authentication code and delegates to helpers
+  ([gitcredentials](https://git-scm.com/docs/gitcredentials)). Lore's scheme registry arrives at the
+  same place — a dispatch point rather than a policy — which is why adding a scheme is the whole of
+  the client-side change here.
+- **Dex and `oauth2-proxy`.** [Dex](https://dexidp.io/) brokers upstream identity into its own
+  tokens; [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/) terminates authentication in
+  front of an HTTP application. Both are shapes this proposal declines and composes with: Dex in
+  front of a Lore server is just the configured issuer.
+- **PocketID as the first validated provider.** [PocketID](https://github.com/pocket-id/pocket-id) is
+  a small self-hosted provider aimed at exactly this deployment, and a provider a self-hoster would
+  actually run is a better conformance test than one from a large cloud provider.
+
+## Unresolved Questions
+
+- Should repository delete under `authorize_all_repositories` follow the grant — any authenticated
+  identity may delete any repository, consistent with every other operation — or keep the
+  creator-ownership check it currently falls back to? A mode that says "every repository, every
+  authenticated identity" and then makes delete the one exception is an asymmetry an operator learns
+  by hitting it; against that, delete is the one irreversible operation here. What is not defensible
+  is the status quo's provenance: the current behavior is what a scheme check happened to produce.
+- Is `authorize_all_repositories` the right name and shape, or should the mode be an enum from the
+  start, so the per-repository follow-up extends a setting instead of replacing one?
+- Should a single server be able to trust more than one issuer, and if so, does anything here need to
+  change now to keep that from being a breaking addition later?
+- Should `login::with_token` accept a provider-issued token? Its recipient domains come from the
+  token's own claims, which for an ID token are a client id and an issuer URL, so the recipient guard
+  refuses it and an OIDC deployment has no non-interactive credential path — which is what issue #59
+  asks for. The answer is either making the implementation-supplied domains authoritative on this
+  path too, as they now are at login and at exchange, or the client credentials grant.
+- What should a CLI login do when the credential store's keychain blocks on a user prompt? On macOS a
+  rebuilt `lore` faces an authorization prompt on the next read and the store waits with no timeout.
+  This is not new, but OIDC login is the first flow putting a store read in front of ordinary
+  self-hosted users, where an indefinite wait is indistinguishable from a hung login.
+
+## Future work
+
+**Repository-level access from provider groups.** `permission_groups` is deliberately shaped to
+grow into the per-repository follow-up LEP: today a group maps to server-wide permission strings on
+the wildcard resource; the natural extension maps a group to resource-scoped grants — repository
+ids or patterns with per-resource permission lists — which is the same `ResourcePermission` shape
+the authorization model already evaluates, populated from configuration instead of a Lore-minted
+token. The follow-up LEP owns three questions this proposal defers: reading groups from the
+userinfo endpoint with a cache (for providers that will not put them in the ID token), nested claim
+paths (`realm_access.roles`), and whether resource-scoped grants replace or refine
+`authorize_all_repositories`.
+
+**Binding tokens to one deployment ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) /
+[RFC 9068](https://www.rfc-editor.org/rfc/rfc9068)).** The design is an opt-in `resource` setting
+naming this deployment's own identifier: the client asks the provider for a token bound to that
+resource (RFC 8707 resource indicators, sent on every grant leg), the provider issues an RFC 9068
+`at+jwt` access token whose `aud` is that identifier, and the server accepts only that token,
+audience-pinned to itself rather than to the client id. The security value is real but narrow — it
+retires cross-deployment interchange and untargeted replay of a harvested token, narrowing the
+audience-confusion residual named in **Security Considerations** to the targeted-phishing variant
+alone, which no audience restriction can prevent.
+
+It is deferred because the value is unrealizable today: the mechanism lands entirely on the provider,
+and no provider a self-hoster is likely to run supports RFC 8707 — PocketID 2.6.2 ignores the
+parameter (verified 2026-08-13), and neither Okta nor Auth0 implements it; Keycloak is adding it, and
+the Model Context Protocol's adoption of RFC 8707 for its own authorization is the ecosystem forcing
+function. A provider that ignores the parameter says nothing, so a mandatory mode would be
+unshippable and an opt-in one would protect no deployment an operator actually runs. When provider
+support is common, this becomes the standards-track answer to the audience-confusion residual, layered
+on the shipped ID-token mode without changing it. Until then the mitigation is a distinct `client_id`
+per deployment.

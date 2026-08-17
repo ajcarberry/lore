@@ -208,8 +208,38 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo mount -o remount,size=12G /dev/shm
 
+      # The OIDC smoke tests need a real provider; the `pocket_id` fixture
+      # skips them gracefully everywhere else, but here Docker is available so
+      # they must actually run — LORE_TEST_REQUIRE_POCKET_ID (set on the test
+      # step below) turns the fixture's skip into a failure, so a provider that
+      # never comes up cannot silently pass as green.
+      - name: Start PocketID
+        if: runner.os == 'Linux'
+        run: docker compose --file lore-integration-tests/compose.yaml up --detach pocket-id
+
+      - name: Wait for PocketID to be ready
+        if: runner.os == 'Linux'
+        run: |
+          # The fixture's readiness contract: /healthz answering is not enough,
+          # the static admin's API key has to be accepted too.
+          for i in $(seq 1 30); do
+            status=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "X-API-KEY: lorelocaltestapikeylorelocaltestapikey" \
+              http://127.0.0.1:1411/api/oidc/clients || true)
+            if [ "$status" != "000" ] && [ "$status" != "401" ]; then
+              echo "PocketID ready (admin API answered $status)"
+              exit 0
+            fi
+            echo "waiting for PocketID (attempt $i, status $status)..."
+            sleep 2
+          done
+          echo "PocketID did not become ready in time"
+          exit 1
+
       # `uv run` installs the test dependencies from uv.lock.
       - name: Smoke tests
+        env:
+          LORE_TEST_REQUIRE_POCKET_ID: ${{ runner.os == 'Linux' && '1' || '' }}
         run: >
           uv run pytest scripts/test -m smoke -n 4
           --lore-client-binary release
